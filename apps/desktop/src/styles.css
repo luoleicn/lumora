@@ -176,6 +176,7 @@ button {
 }
 
 .workspace-panel > .library-sidebar,
+.workspace-panel > .workspace-tabs,
 .workspace-panel > .paper-list,
 .workspace-panel > .reader,
 .workspace-panel > .sync-panel {
@@ -426,6 +427,91 @@ button {
   background: #ffffff;
 }
 
+.workspace-tabs {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  background: #ffffff;
+}
+
+.workspace-tab-bar {
+  display: flex;
+  min-height: 38px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border-bottom: 1px solid #cfd7df;
+  background: #e9eef3;
+  padding: 4px 5px 0;
+}
+
+.workspace-tab {
+  display: inline-flex;
+  align-items: center;
+  min-width: 112px;
+  max-width: 260px;
+  height: 34px;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: 7px 7px 0 0;
+  color: #59636f;
+}
+
+.workspace-tab.active {
+  border-color: #c4ced8;
+  background: #ffffff;
+  color: #202226;
+}
+
+.workspace-tab-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0 8px;
+}
+
+.workspace-tab-select span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-tab-close {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  margin-right: 4px;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #6b7480;
+  padding: 0;
+}
+
+.workspace-tab-close:hover {
+  background: #e3e9ee;
+  color: #26313a;
+}
+
+.workspace-tab-content {
+  min-height: 0;
+  flex: 1;
+}
+
+.workspace-tab-content > .paper-list,
+.workspace-tab-content > .reader,
+.workspace-tab-content > .notebook-panel {
+  width: 100%;
+  height: 100%;
+}
+
 .search-box {
   display: flex;
   flex: 1;
@@ -494,6 +580,11 @@ button {
   overflow: auto;
 }
 
+.paper-table-wrap.resizing-columns {
+  cursor: col-resize;
+  user-select: none;
+}
+
 .paper-table {
   width: 100%;
   border-collapse: collapse;
@@ -501,36 +592,41 @@ button {
   font-size: 12px;
 }
 
+.paper-table.resizing-columns {
+  cursor: col-resize;
+}
+
 .paper-table th {
   position: sticky;
   z-index: 2;
   top: 0;
+  overflow: visible;
   height: 29px;
   border-bottom: 1px solid #cfd7df;
   background: #eef2f5;
   color: #4c5661;
   font-weight: 700;
   text-align: left;
+  user-select: none;
+}
+
+.paper-table th.resizing-column {
+  background: #e5ecef;
 }
 
 .paper-table th:nth-child(1),
 .paper-table th:nth-child(2),
 .paper-table td:nth-child(1),
 .paper-table td:nth-child(2) {
-  width: 30px;
   text-align: center;
 }
 
-.paper-table th:nth-child(3) {
-  width: 28%;
-}
-
-.paper-table th:nth-child(5) {
-  width: 58px;
-}
-
-.paper-table th:nth-child(7) {
-  width: 78px;
+.paper-table-header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  height: 100%;
 }
 
 .paper-table th button {
@@ -539,11 +635,67 @@ button {
   gap: 4px;
   width: 100%;
   height: 28px;
+  min-width: 0;
   border: 0;
   background: transparent;
   color: inherit;
-  padding: 0 8px;
+  padding: 0 16px 0 8px;
   text-align: left;
+}
+
+.paper-table th button span:first-child {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.paper-table-static-header {
+  display: inline-grid;
+  width: 100%;
+  height: 28px;
+  min-width: 0;
+  align-items: center;
+  color: #69737f;
+  padding: 0 16px 0 8px;
+}
+
+.paper-table th:nth-child(1) .paper-table-static-header,
+.paper-table th:nth-child(2) .paper-table-static-header {
+  justify-content: center;
+  padding: 0 12px 0 0;
+}
+
+.paper-column-resizer {
+  position: absolute;
+  z-index: 4;
+  top: 0;
+  right: -4px;
+  width: 8px;
+  height: 100%;
+  cursor: col-resize;
+  outline: 0;
+  touch-action: none;
+}
+
+.paper-column-resizer::after {
+  position: absolute;
+  top: 5px;
+  right: 3px;
+  bottom: 5px;
+  width: 1px;
+  background: transparent;
+  content: "";
+}
+
+.paper-column-resizer:hover::after,
+.paper-column-resizer:focus-visible::after,
+.paper-column-resizer.active::after {
+  background: #287d65;
+}
+
+.paper-column-resizer:focus-visible {
+  box-shadow: inset 0 0 0 2px rgba(40, 125, 101, 0.28);
 }
 
 .paper-table td {

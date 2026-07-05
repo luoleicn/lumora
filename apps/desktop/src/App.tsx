@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { Annotation, Collection, LibraryState, Paper } from "@lumora/shared";
+import type { Annotation, Collection, FileAsset, LibraryState, Paper } from "@lumora/shared";
+import { FileText, X } from "lucide-react";
 import { AppToolbar } from "./components/AppToolbar";
 import { LibrarySidebar } from "./components/LibrarySidebar";
 import { ManualReferenceModal, type ManualReferenceDraft } from "./components/ManualReferenceModal";
@@ -29,7 +30,7 @@ const settingsKey = "lumora:sync-settings";
 const workspaceLayoutKey = "lumora:workspace-layout";
 const collapseThreshold = 82;
 
-type MainPanelKey = "library" | "papers" | "reader" | "sync";
+type MainPanelKey = "library" | "workspace" | "sync";
 
 type WorkspaceLayout = {
   widths: Record<MainPanelKey, number>;
@@ -47,19 +48,24 @@ type ResizeDrag = {
 const defaultWorkspaceLayout: WorkspaceLayout = {
   widths: {
     library: 236,
-    papers: 360,
-    reader: 760,
+    workspace: 1040,
     sync: 280
   },
   visible: {
     library: true,
-    papers: true,
-    reader: true,
+    workspace: true,
     sync: true
   }
 };
 
-const panelOrder: MainPanelKey[] = ["library", "papers", "reader", "sync"];
+const panelOrder: MainPanelKey[] = ["library", "workspace", "sync"];
+
+type WorkspaceTab =
+  | { id: "documents"; kind: "documents"; title: "Documents" }
+  | { id: "notebook"; kind: "notebook"; title: "Notebook" }
+  | { id: string; kind: "paper"; paperId: string; title: string };
+
+const documentsTab: WorkspaceTab = { id: "documents", kind: "documents", title: "Documents" };
 
 export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -69,7 +75,8 @@ export default function App() {
   const [selectedAuthor, setSelectedAuthor] = useState<string>();
   const [selectedTag, setSelectedTag] = useState<string>();
   const [selectedPaperId, setSelectedPaperId] = useState<string>();
-  const [readerMode, setReaderMode] = useState<"reader" | "notebook">("reader");
+  const [workspaceTabs, setWorkspaceTabs] = useState<WorkspaceTab[]>([documentsTab]);
+  const [activeWorkspaceTabId, setActiveWorkspaceTabId] = useState(documentsTab.id);
   const [search, setSearch] = useState("");
   const [fileData, setFileData] = useState<Uint8Array>();
   const [settings, setSettings] = useState<SyncSettings>(() => loadSyncSettings());
@@ -259,7 +266,6 @@ export default function App() {
     setSelectedCollectionId("all");
     setSelectedAuthor(undefined);
     setSelectedTag(undefined);
-    setReaderMode("reader");
     setStatus(`Imported ${file.name}.`);
   }
 
@@ -294,7 +300,6 @@ export default function App() {
       setSelectedAuthor(undefined);
       setSelectedTag(undefined);
       setSelectedPaperId(papers[0]?.id);
-      setReaderMode("reader");
       setStatus(`Imported ${papers.length} references from ${file.name}.`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Failed to import references.");
@@ -345,7 +350,6 @@ export default function App() {
     setSelectedAuthor(undefined);
     setSelectedTag(undefined);
     setSelectedPaperId(paper.id);
-    setReaderMode("reader");
     setStatus("Manual entry added.");
   }
 
@@ -383,7 +387,6 @@ export default function App() {
 
   function handleSelectPaper(paperId: string) {
     setSelectedPaperId(paperId);
-    setReaderMode("reader");
     setLibrary((current) => {
       const paper = current.papers.find((item) => item.id === paperId);
       if (!paper?.unread) {
@@ -396,6 +399,52 @@ export default function App() {
           item.id === paperId ? { ...item, unread: false, updatedAt: new Date().toISOString() } : item
         )
       };
+    });
+  }
+
+  function handleOpenPaperTab(paperId: string) {
+    const paper = library.papers.find((item) => item.id === paperId && !item.deletedAt);
+    if (!paper) {
+      return;
+    }
+
+    handleSelectPaper(paperId);
+    const tabId = `paper:${paperId}`;
+    setWorkspaceTabs((current) => {
+      if (current.some((tab) => tab.id === tabId)) {
+        return current;
+      }
+
+      return [...current, { id: tabId, kind: "paper", paperId, title: paper.title }];
+    });
+    setActiveWorkspaceTabId(tabId);
+  }
+
+  function handleOpenNotebookTab() {
+    setWorkspaceTabs((current) => current.some((tab) => tab.id === "notebook")
+      ? current
+      : [...current, { id: "notebook", kind: "notebook", title: "Notebook" }]
+    );
+    setActiveWorkspaceTabId("notebook");
+  }
+
+  function handleCloseWorkspaceTab(tabId: string) {
+    if (tabId === documentsTab.id) {
+      return;
+    }
+
+    setWorkspaceTabs((current) => {
+      const index = current.findIndex((tab) => tab.id === tabId);
+      const next = current.filter((tab) => tab.id !== tabId);
+      if (activeWorkspaceTabId === tabId) {
+        const fallback = next[Math.max(0, index - 1)] ?? documentsTab;
+        setActiveWorkspaceTabId(fallback.id);
+        if (fallback.kind === "paper") {
+          handleSelectPaper(fallback.paperId);
+        }
+      }
+
+      return next;
     });
   }
 
@@ -486,7 +535,7 @@ export default function App() {
         onAddPdf={() => fileInputRef.current?.click()}
         onAddManual={() => setManualModalOpen(true)}
         onImportReferences={() => referenceInputRef.current?.click()}
-        onOpenNotebook={() => setReaderMode("notebook")}
+        onOpenNotebook={handleOpenNotebookTab}
         onCreateCollection={handleCreateCollection}
         onSync={handleSync}
         onConnectMendeley={handleConnectMendeley}
@@ -518,33 +567,34 @@ export default function App() {
             />
           )}
 
-          {panel === "papers" && (
-            <PaperList
-              state={library}
-              papers={filteredPapers}
-              selectedPaperId={selectedPaperId}
-              onSelectPaper={handleSelectPaper}
-              onUpdatePaper={handleUpdatePaper}
-            />
-          )}
-
-          {panel === "reader" && (
-            readerMode === "notebook" ? (
-              <NotebookPanel
-                papers={library.papers.filter((paper) => !paper.deletedAt)}
-                annotations={library.annotations}
-                onOpenPaper={handleSelectPaper}
-              />
-            ) : (
-              <PdfReader
-                paper={selectedPaper}
-                fileAsset={selectedFile}
+          {panel === "workspace" && (
+            <WorkspaceTabs
+              tabs={workspaceTabs}
+              activeTabId={activeWorkspaceTabId}
+              onSelectTab={(tab) => {
+                setActiveWorkspaceTabId(tab.id);
+                if (tab.kind === "paper") {
+                  handleSelectPaper(tab.paperId);
+                }
+              }}
+              onCloseTab={handleCloseWorkspaceTab}
+            >
+              <WorkspaceTabContent
+                activeTab={workspaceTabs.find((tab) => tab.id === activeWorkspaceTabId) ?? documentsTab}
+                library={library}
+                filteredPapers={filteredPapers}
+                selectedPaperId={selectedPaperId}
+                selectedPaper={selectedPaper}
+                selectedFile={selectedFile}
                 fileData={fileData}
-                annotations={selectedAnnotations}
+                selectedAnnotations={selectedAnnotations}
+                onSelectPaper={handleSelectPaper}
+                onOpenPaper={handleOpenPaperTab}
+                onUpdatePaper={handleUpdatePaper}
                 onCreateAnnotation={handleCreateAnnotation}
                 onDeleteAnnotation={handleDeleteAnnotation}
               />
-            )
+            </WorkspaceTabs>
           )}
 
           {panel === "sync" && (
@@ -617,7 +667,7 @@ function PanelFragment({
   onRestorePanel: (panel: MainPanelKey) => void;
   children: React.ReactNode;
 }) {
-  const flex = panel === "reader" ? `1 1 ${width}px` : `0 0 ${width}px`;
+  const flex = panel === "workspace" ? `1 1 ${width}px` : `0 0 ${width}px`;
 
   return (
     <>
@@ -637,6 +687,126 @@ function PanelFragment({
         />
       )}
     </>
+  );
+}
+
+function WorkspaceTabs({
+  tabs,
+  activeTabId,
+  onSelectTab,
+  onCloseTab,
+  children
+}: {
+  tabs: WorkspaceTab[];
+  activeTabId: string;
+  onSelectTab: (tab: WorkspaceTab) => void;
+  onCloseTab: (tabId: string) => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="workspace-tabs">
+      <div className="workspace-tab-bar" role="tablist" aria-label="Open documents">
+        {tabs.map((tab) => (
+          <div
+            key={tab.id}
+            className={tab.id === activeTabId ? "workspace-tab active" : "workspace-tab"}
+            title={tab.title}
+          >
+            <button
+              type="button"
+              className="workspace-tab-select"
+              onClick={() => onSelectTab(tab)}
+              role="tab"
+              aria-selected={tab.id === activeTabId}
+            >
+              {tab.kind === "paper" && <FileText size={14} />}
+              <span>{tab.title}</span>
+            </button>
+            {tab.id !== documentsTab.id && (
+              <button
+                type="button"
+                className="workspace-tab-close"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onCloseTab(tab.id);
+                }}
+                aria-label={`Close ${tab.title}`}
+                title={`Close ${tab.title}`}
+              >
+                <X size={13} />
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+      <div className="workspace-tab-content">
+        {children}
+      </div>
+    </section>
+  );
+}
+
+function WorkspaceTabContent({
+  activeTab,
+  library,
+  filteredPapers,
+  selectedPaperId,
+  selectedPaper,
+  selectedFile,
+  fileData,
+  selectedAnnotations,
+  onSelectPaper,
+  onOpenPaper,
+  onUpdatePaper,
+  onCreateAnnotation,
+  onDeleteAnnotation
+}: {
+  activeTab: WorkspaceTab;
+  library: LibraryState;
+  filteredPapers: Paper[];
+  selectedPaperId?: string;
+  selectedPaper?: Paper;
+  selectedFile?: FileAsset;
+  fileData?: Uint8Array;
+  selectedAnnotations: Annotation[];
+  onSelectPaper: (paperId: string) => void;
+  onOpenPaper: (paperId: string) => void;
+  onUpdatePaper: (paper: Paper) => void;
+  onCreateAnnotation: (annotation: Annotation) => void;
+  onDeleteAnnotation: (annotation: Annotation) => void;
+}) {
+  if (activeTab.kind === "documents") {
+    return (
+      <PaperList
+        state={library}
+        papers={filteredPapers}
+        selectedPaperId={selectedPaperId}
+        onSelectPaper={onSelectPaper}
+        onOpenPaper={onOpenPaper}
+        onUpdatePaper={onUpdatePaper}
+      />
+    );
+  }
+
+  if (activeTab.kind === "notebook") {
+    return (
+      <NotebookPanel
+        papers={library.papers.filter((paper) => !paper.deletedAt)}
+        annotations={library.annotations}
+        onOpenPaper={onOpenPaper}
+      />
+    );
+  }
+
+  return (
+    <PdfReader
+      paper={selectedPaper}
+      fileAsset={selectedFile}
+      fileData={fileData}
+      annotations={selectedAnnotations}
+      onCreateAnnotation={onCreateAnnotation}
+      onDeleteAnnotation={onDeleteAnnotation}
+    />
   );
 }
 

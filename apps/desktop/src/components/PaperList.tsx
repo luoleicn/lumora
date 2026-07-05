@@ -1,14 +1,45 @@
 import { AlertCircle, FileText, Star } from "lucide-react";
 import type { FileAsset, LibraryState, Paper } from "@lumora/shared";
-import { useMemo, useState } from "react";
+import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type SortKey = "authors" | "title" | "year" | "venue" | "added";
+type PaperColumnKey = "favorite" | "review" | SortKey;
+
+type PaperColumn = {
+  key: PaperColumnKey;
+  label: string;
+  sortKey?: SortKey;
+  defaultWidth: number;
+  minWidth: number;
+  maxWidth: number;
+};
+
+type PaperColumnWidths = Record<PaperColumnKey, number>;
+
+type ColumnResizeDrag = {
+  key: PaperColumnKey;
+  startX: number;
+  startWidth: number;
+};
+
+const columnWidthsKey = "lumora:documents-column-widths";
+
+const paperColumns: PaperColumn[] = [
+  { key: "favorite", label: "Favorite", defaultWidth: 32, minWidth: 28, maxWidth: 72 },
+  { key: "review", label: "Review status", defaultWidth: 32, minWidth: 28, maxWidth: 72 },
+  { key: "authors", label: "Authors", sortKey: "authors", defaultWidth: 178, minWidth: 96, maxWidth: 520 },
+  { key: "title", label: "Title", sortKey: "title", defaultWidth: 310, minWidth: 150, maxWidth: 760 },
+  { key: "year", label: "Year", sortKey: "year", defaultWidth: 62, minWidth: 52, maxWidth: 120 },
+  { key: "venue", label: "Published In", sortKey: "venue", defaultWidth: 178, minWidth: 104, maxWidth: 520 },
+  { key: "added", label: "Added", sortKey: "added", defaultWidth: 82, minWidth: 72, maxWidth: 160 }
+];
 
 type PaperListProps = {
   state: LibraryState;
   papers: Paper[];
   selectedPaperId?: string;
   onSelectPaper: (id: string) => void;
+  onOpenPaper: (id: string) => void;
   onUpdatePaper: (paper: Paper) => void;
 };
 
@@ -17,14 +48,26 @@ export function PaperList({
   papers,
   selectedPaperId,
   onSelectPaper,
+  onOpenPaper,
   onUpdatePaper
 }: PaperListProps) {
   const [sortKey, setSortKey] = useState<SortKey>("added");
   const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
+  const [columnWidths, setColumnWidths] = useState<PaperColumnWidths>(() => loadColumnWidths());
+  const [resizingColumn, setResizingColumn] = useState<PaperColumnKey>();
+  const columnResizeRef = useRef<ColumnResizeDrag | undefined>(undefined);
   const sortedPapers = useMemo(
     () => [...papers].sort((a, b) => comparePapers(a, b, sortKey, sortDirection)),
     [papers, sortDirection, sortKey]
   );
+  const tableMinWidth = useMemo(
+    () => paperColumns.reduce((total, column) => total + columnWidths[column.key], 0),
+    [columnWidths]
+  );
+
+  useEffect(() => {
+    localStorage.setItem(columnWidthsKey, JSON.stringify(columnWidths));
+  }, [columnWidths]);
 
   function handleSort(nextSortKey: SortKey) {
     if (nextSortKey === sortKey) {
@@ -36,6 +79,62 @@ export function PaperList({
     setSortDirection(nextSortKey === "added" ? "desc" : "asc");
   }
 
+  function handleColumnResizeStart(event: ReactPointerEvent<HTMLSpanElement>, key: PaperColumnKey) {
+    event.preventDefault();
+    event.stopPropagation();
+    columnResizeRef.current = {
+      key,
+      startX: event.clientX,
+      startWidth: columnWidths[key]
+    };
+    setResizingColumn(key);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function handleColumnResizeMove(event: ReactPointerEvent<HTMLSpanElement>) {
+    const drag = columnResizeRef.current;
+    if (!drag) {
+      return;
+    }
+
+    const column = paperColumns.find((item) => item.key === drag.key);
+    if (!column) {
+      return;
+    }
+
+    const nextWidth = clamp(drag.startWidth + event.clientX - drag.startX, column.minWidth, column.maxWidth);
+    setColumnWidths((current) => current[drag.key] === nextWidth
+      ? current
+      : { ...current, [drag.key]: nextWidth }
+    );
+  }
+
+  function handleColumnResizeEnd(event: ReactPointerEvent<HTMLSpanElement>) {
+    if (columnResizeRef.current && event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    columnResizeRef.current = undefined;
+    setResizingColumn(undefined);
+  }
+
+  function handleColumnResizeKeyDown(event: React.KeyboardEvent<HTMLSpanElement>, key: PaperColumnKey) {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") {
+      return;
+    }
+
+    event.preventDefault();
+    const column = paperColumns.find((item) => item.key === key);
+    if (!column) {
+      return;
+    }
+
+    const delta = event.key === "ArrowLeft" ? -12 : 12;
+    setColumnWidths((current) => ({
+      ...current,
+      [key]: clamp(current[key] + delta, column.minWidth, column.maxWidth)
+    }));
+  }
+
   return (
     <section className="paper-list">
       <header className="paper-table-title">
@@ -43,23 +142,35 @@ export function PaperList({
         <span>{papers.length} shown</span>
       </header>
 
-      <div className="paper-table-wrap">
+      <div className={resizingColumn ? "paper-table-wrap resizing-columns" : "paper-table-wrap"}>
         {sortedPapers.length === 0 ? (
           <div className="empty-list">
             <FileText size={24} />
             <p>No papers in this collection.</p>
           </div>
         ) : (
-          <table className="paper-table">
+          <table className={resizingColumn ? "paper-table resizing-columns" : "paper-table"} style={{ minWidth: tableMinWidth }}>
+            <colgroup>
+              {paperColumns.map((column) => (
+                <col key={column.key} style={{ width: columnWidths[column.key] }} />
+              ))}
+            </colgroup>
             <thead>
               <tr>
-                <th aria-label="Favorite" />
-                <th aria-label="Review status" />
-                <SortableHeader label="Authors" sortKey="authors" activeSortKey={sortKey} direction={sortDirection} onSort={handleSort} />
-                <SortableHeader label="Title" sortKey="title" activeSortKey={sortKey} direction={sortDirection} onSort={handleSort} />
-                <SortableHeader label="Year" sortKey="year" activeSortKey={sortKey} direction={sortDirection} onSort={handleSort} />
-                <SortableHeader label="Published In" sortKey="venue" activeSortKey={sortKey} direction={sortDirection} onSort={handleSort} />
-                <SortableHeader label="Added" sortKey="added" activeSortKey={sortKey} direction={sortDirection} onSort={handleSort} />
+                {paperColumns.map((column) => (
+                  <ResizableHeader
+                    key={column.key}
+                    column={column}
+                    activeSortKey={sortKey}
+                    direction={sortDirection}
+                    resizing={resizingColumn === column.key}
+                    onSort={handleSort}
+                    onResizeStart={handleColumnResizeStart}
+                    onResizeMove={handleColumnResizeMove}
+                    onResizeEnd={handleColumnResizeEnd}
+                    onResizeKeyDown={handleColumnResizeKeyDown}
+                  />
+                ))}
               </tr>
             </thead>
             <tbody>
@@ -70,6 +181,7 @@ export function PaperList({
                   fileAsset={state.fileAssets.find((file) => file.paperId === paper.id && !file.deletedAt)}
                   active={paper.id === selectedPaperId}
                   onClick={() => onSelectPaper(paper.id)}
+                  onDoubleClick={() => onOpenPaper(paper.id)}
                   onUpdatePaper={onUpdatePaper}
                 />
               ))}
@@ -81,25 +193,56 @@ export function PaperList({
   );
 }
 
-function SortableHeader({
-  label,
-  sortKey,
+function ResizableHeader({
+  column,
   activeSortKey,
   direction,
-  onSort
+  resizing,
+  onSort,
+  onResizeStart,
+  onResizeMove,
+  onResizeEnd,
+  onResizeKeyDown
 }: {
-  label: string;
-  sortKey: SortKey;
+  column: PaperColumn;
   activeSortKey: SortKey;
   direction: "asc" | "desc";
+  resizing: boolean;
   onSort: (sortKey: SortKey) => void;
+  onResizeStart: (event: ReactPointerEvent<HTMLSpanElement>, key: PaperColumnKey) => void;
+  onResizeMove: (event: ReactPointerEvent<HTMLSpanElement>) => void;
+  onResizeEnd: (event: ReactPointerEvent<HTMLSpanElement>) => void;
+  onResizeKeyDown: (event: React.KeyboardEvent<HTMLSpanElement>, key: PaperColumnKey) => void;
 }) {
+  const sortableKey = column.sortKey;
+
   return (
-    <th>
-      <button type="button" onClick={() => onSort(sortKey)}>
-        {label}
-        {activeSortKey === sortKey && <span>{direction === "asc" ? "▲" : "▼"}</span>}
-      </button>
+    <th aria-label={column.label} className={resizing ? "resizing-column" : undefined}>
+      <div className="paper-table-header">
+        {sortableKey ? (
+          <button type="button" onClick={() => onSort(sortableKey)}>
+            <span>{column.label}</span>
+            {activeSortKey === sortableKey && <span>{direction === "asc" ? "▲" : "▼"}</span>}
+          </button>
+        ) : (
+          <span className="paper-table-static-header" aria-hidden="true">
+            {column.key === "favorite" && <Star size={13} />}
+            {column.key === "review" && <AlertCircle size={13} />}
+          </span>
+        )}
+        <span
+          className={resizing ? "paper-column-resizer active" : "paper-column-resizer"}
+          role="separator"
+          aria-label={`Resize ${column.label} column`}
+          aria-orientation="vertical"
+          tabIndex={0}
+          onPointerDown={(event) => onResizeStart(event, column.key)}
+          onPointerMove={onResizeMove}
+          onPointerUp={onResizeEnd}
+          onPointerCancel={onResizeEnd}
+          onKeyDown={(event) => onResizeKeyDown(event, column.key)}
+        />
+      </div>
     </th>
   );
 }
@@ -109,18 +252,24 @@ function PaperRow({
   fileAsset,
   active,
   onClick,
+  onDoubleClick,
   onUpdatePaper
 }: {
   paper: Paper;
   fileAsset?: FileAsset;
   active: boolean;
   onClick: () => void;
+  onDoubleClick: () => void;
   onUpdatePaper: (paper: Paper) => void;
 }) {
   const authorLine = paper.authors.map((author) => author.fullName).join(", ");
 
   return (
-    <tr className={`${active ? "active " : ""}${paper.unread ? "unread" : ""}`} onClick={onClick}>
+    <tr
+      className={`${active ? "active " : ""}${paper.unread ? "unread" : ""}`}
+      onClick={onClick}
+      onDoubleClick={onDoubleClick}
+    >
       <td>
         <button
           type="button"
@@ -192,4 +341,27 @@ function formatDate(value: string) {
     month: "2-digit",
     day: "2-digit"
   }).format(new Date(value));
+}
+
+function loadColumnWidths(): PaperColumnWidths {
+  try {
+    const raw = localStorage.getItem(columnWidthsKey);
+    const parsed = raw ? JSON.parse(raw) as Partial<Record<PaperColumnKey, unknown>> : {};
+    return paperColumns.reduce((widths, column) => {
+      const savedWidth = parsed[column.key];
+      widths[column.key] = typeof savedWidth === "number" && Number.isFinite(savedWidth)
+        ? clamp(savedWidth, column.minWidth, column.maxWidth)
+        : column.defaultWidth;
+      return widths;
+    }, {} as PaperColumnWidths);
+  } catch {
+    return paperColumns.reduce((widths, column) => {
+      widths[column.key] = column.defaultWidth;
+      return widths;
+    }, {} as PaperColumnWidths);
+  }
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(Math.round(value), min), max);
 }
