@@ -1,0 +1,33 @@
+{
+  "name": "@lumora/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npm run build --workspace @lumora/shared && vite",
+    "build": "npm run build --workspace @lumora/shared && tsc -b && vite build",
+    "preview": "vite preview",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build --bundles app",
+    "typecheck": "tsc -b --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@lumora/shared": "0.1.0",
+    "@tauri-apps/api": "^2.6.0",
+    "lucide-react": "^0.468.0",
+    "pdfjs-dist": "5.4.296",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-pdf": "^10.0.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.6.2",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.6.0",
+    "typescript": "^5.8.3",
+    "vite": "^7.0.2",
+    "vitest": "^3.2.4"
+  }
+}

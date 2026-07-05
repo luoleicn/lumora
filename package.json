@@ -1,0 +1,29 @@
+{
+  "name": "lumora",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lumora — light up your literature.",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace @lumora/desktop",
+    "dev:desktop": "npm run dev --workspace @lumora/desktop",
+    "dev:server": "npm run dev --workspace @lumora/server",
+    "build": "npm run build --workspace @lumora/shared && npm run build --workspace @lumora/server && npm run build --workspace @lumora/desktop",
+    "typecheck": "npm run build --workspace @lumora/shared && npm run typecheck --workspace @lumora/server && npm run typecheck --workspace @lumora/desktop",
+    "test": "npm run test --workspace @lumora/shared && npm run test --workspace @lumora/server --if-present && npm run test --workspace @lumora/desktop --if-present",
+    "prisma:generate": "npm run prisma:generate --workspace @lumora/server",
+    "prisma:migrate": "npm run prisma:migrate --workspace @lumora/server"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.10",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

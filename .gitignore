@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+.DS_Store
+.env
+.env.local
+.idea/
+.vscode/
+*.log
+*.tsbuildinfo
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+apps/server/prisma/dev.db
+coverage/
