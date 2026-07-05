@@ -2,7 +2,7 @@ import { AlertCircle, FileText, Star } from "lucide-react";
 import type { FileAsset, LibraryState, Paper } from "@lumora/shared";
 import { useMemo, useState } from "react";
 
-type SortKey = "authors" | "title" | "type" | "year" | "venue" | "tags" | "added";
+type SortKey = "authors" | "title" | "year" | "venue" | "added";
 
 type PaperListProps = {
   state: LibraryState;
@@ -57,10 +57,8 @@ export function PaperList({
                 <th aria-label="Review status" />
                 <SortableHeader label="Authors" sortKey="authors" activeSortKey={sortKey} direction={sortDirection} onSort={handleSort} />
                 <SortableHeader label="Title" sortKey="title" activeSortKey={sortKey} direction={sortDirection} onSort={handleSort} />
-                <SortableHeader label="Type" sortKey="type" activeSortKey={sortKey} direction={sortDirection} onSort={handleSort} />
                 <SortableHeader label="Year" sortKey="year" activeSortKey={sortKey} direction={sortDirection} onSort={handleSort} />
                 <SortableHeader label="Published In" sortKey="venue" activeSortKey={sortKey} direction={sortDirection} onSort={handleSort} />
-                <SortableHeader label="Tags" sortKey="tags" activeSortKey={sortKey} direction={sortDirection} onSort={handleSort} />
                 <SortableHeader label="Added" sortKey="added" activeSortKey={sortKey} direction={sortDirection} onSort={handleSort} />
               </tr>
             </thead>
@@ -120,7 +118,6 @@ function PaperRow({
   onUpdatePaper: (paper: Paper) => void;
 }) {
   const authorLine = paper.authors.map((author) => author.fullName).join(", ");
-  const tags = paper.tags?.join(", ") ?? "";
 
   return (
     <tr className={`${active ? "active " : ""}${paper.unread ? "unread" : ""}`} onClick={onClick}>
@@ -155,10 +152,8 @@ function PaperRow({
         {fileAsset && <FileText size={14} />}
         <span>{paper.title}</span>
       </td>
-      <td>{documentTypeLabel(paper.documentType)}</td>
       <td>{paper.year ?? ""}</td>
       <td title={paper.venue || fileAsset?.fileName || "PDF"}>{paper.venue || fileAsset?.fileName || "PDF"}</td>
-      <td title={tags}>{tags}</td>
       <td>{formatDate(paper.createdAt)}</td>
     </tr>
   );
@@ -182,36 +177,12 @@ function sortValue(paper: Paper, sortKey: SortKey) {
       return paper.authors.map((author) => author.fullName).join(", ");
     case "title":
       return paper.title;
-    case "type":
-      return documentTypeLabel(paper.documentType);
     case "year":
       return paper.year ?? 0;
     case "venue":
       return paper.venue ?? "";
-    case "tags":
-      return paper.tags?.join(", ") ?? "";
     case "added":
       return new Date(paper.createdAt).getTime();
-  }
-}
-
-function documentTypeLabel(value?: string) {
-  switch (value) {
-    case "book":
-      return "Book";
-    case "bookSection":
-      return "Book Section";
-    case "conferencePaper":
-      return "Conference";
-    case "preprint":
-      return "Preprint";
-    case "thesis":
-      return "Thesis";
-    case "report":
-      return "Report";
-    case "journalArticle":
-    default:
-      return "Journal";
   }
 }
 
