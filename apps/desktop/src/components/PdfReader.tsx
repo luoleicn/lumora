@@ -31,6 +31,7 @@ type ExistingAnnotationContextMenu = {
   annotation: Annotation;
   mode: "actions" | "note" | "viewNote";
   noteText: string;
+  selectionBased?: boolean;
 };
 
 type AnnotationContextMenu = NewAnnotationContextMenu | ExistingAnnotationContextMenu;
@@ -147,6 +148,47 @@ export function PdfReader({
     });
   }
 
+  function handleSelectionPointerUp(event: React.PointerEvent) {
+    if (event.button !== 0) {
+      return;
+    }
+
+    window.setTimeout(() => {
+      const selection = readCurrentSelection(scrollRef.current);
+      if (!selection) {
+        return;
+      }
+
+      const existingAnnotation = findAnnotationForSelection(selection, visibleAnnotations);
+      const position = getSelectionMenuPosition(scrollRef.current);
+      if (!position) {
+        return;
+      }
+
+      if (existingAnnotation) {
+        setContextMenu({
+          kind: "existing",
+          x: position.x,
+          y: position.y,
+          annotation: existingAnnotation,
+          mode: "actions",
+          noteText: existingAnnotation.comment ?? "",
+          selectionBased: true
+        });
+        return;
+      }
+
+      setContextMenu({
+        kind: "new",
+        x: position.x,
+        y: position.y,
+        selection,
+        mode: "actions",
+        noteText: ""
+      });
+    }, 0);
+  }
+
   function createAnnotation(kind: Annotation["kind"], selection: PendingSelection, comment?: string) {
     if (!paper || !fileAsset) {
       return;
@@ -184,6 +226,17 @@ export function PdfReader({
       comment: trimmed,
       updatedAt: new Date().toISOString()
     });
+    setContextMenu(undefined);
+  }
+
+  function removeNoteFromAnnotation(annotation: Annotation) {
+    onCreateAnnotation({
+      ...annotation,
+      kind: "highlight",
+      comment: undefined,
+      updatedAt: new Date().toISOString()
+    });
+    window.getSelection()?.removeAllRanges();
     setContextMenu(undefined);
   }
 
@@ -228,7 +281,7 @@ export function PdfReader({
       </header>
 
       <div className="reader-body">
-        <div ref={scrollRef} className="pdf-scroll" onContextMenu={handleContextMenu}>
+        <div ref={scrollRef} className="pdf-scroll" onContextMenu={handleContextMenu} onPointerUp={handleSelectionPointerUp}>
           <Document
             file={documentFile}
             loading={<div className="pdf-status">Loading PDF...</div>}
@@ -276,8 +329,10 @@ export function PdfReader({
             }}
             onDeleteAnnotation={(annotation) => {
               onDeleteAnnotation(annotation);
+              window.getSelection()?.removeAllRanges();
               setContextMenu(undefined);
             }}
+            onDeleteNote={removeNoteFromAnnotation}
             onSaveNote={(noteText) => {
               if (contextMenu.kind === "existing") {
                 updateAnnotationWithNote(contextMenu.annotation, noteText);
@@ -382,6 +437,7 @@ function AnnotationContextMenu({
   onShowNote,
   onHighlight,
   onDeleteAnnotation,
+  onDeleteNote,
   onSaveNote
 }: {
   menu: AnnotationContextMenu;
@@ -393,6 +449,7 @@ function AnnotationContextMenu({
   onShowNote: () => void;
   onHighlight: () => void;
   onDeleteAnnotation: (annotation: Annotation) => void;
+  onDeleteNote: (annotation: Annotation) => void;
   onSaveNote: (noteText: string) => void;
 }) {
   const title = getContextMenuTitle(menu);
@@ -444,6 +501,13 @@ function AnnotationContextMenu({
           />
           <span>Click outside to save</span>
         </div>
+      ) : menu.kind === "existing" && menu.selectionBased && menu.annotation.kind === "note" ? (
+        <div className="button-row vertical">
+          <button type="button" className="danger" onClick={() => onDeleteNote(menu.annotation)}>
+            <Trash2 size={16} />
+            Delete Note
+          </button>
+        </div>
       ) : menu.mode === "viewNote" && menu.kind === "existing" ? (
         <div className="context-note-view">
           <blockquote>{menu.annotation.comment || "No note content."}</blockquote>
@@ -467,7 +531,7 @@ function AnnotationContextMenu({
           )}
           <button type="button" className="danger" onClick={() => onDeleteAnnotation(menu.annotation)}>
             <Trash2 size={16} />
-            Delete Annotation
+            {menu.selectionBased ? "Delete Highlight" : "Delete Annotation"}
           </button>
         </div>
       ) : (
@@ -534,6 +598,52 @@ function findAnnotationAtPoint(
   }
 
   return undefined;
+}
+
+function findAnnotationForSelection(selection: PendingSelection, annotations: Annotation[]) {
+  const samePageAnnotations = annotations.filter((annotation) => annotation.pageIndex === selection.pageIndex);
+  return samePageAnnotations.find((annotation) =>
+    annotation.rects.some((annotationRect) =>
+      selection.rects.some((selectionRect) => rectsOverlap(annotationRect, selectionRect))
+    )
+  );
+}
+
+function getSelectionMenuPosition(container: HTMLElement | null) {
+  if (!container) {
+    return undefined;
+  }
+
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0) {
+    return undefined;
+  }
+
+  const rects = Array.from(selection.getRangeAt(0).getClientRects()).filter((rect) => rect.width > 2 && rect.height > 2);
+  const containerRect = container.getBoundingClientRect();
+  const usableRects = rects.filter((rect) =>
+    rect.right >= containerRect.left &&
+    rect.left <= containerRect.right &&
+    rect.bottom >= containerRect.top &&
+    rect.top <= containerRect.bottom
+  );
+  const firstRect = usableRects[0];
+  if (!firstRect) {
+    return undefined;
+  }
+
+  return {
+    x: Math.min(window.innerWidth - 280, Math.max(12, firstRect.left + firstRect.width / 2 - 120)),
+    y: Math.min(window.innerHeight - 160, Math.max(12, firstRect.bottom + 8))
+  };
+}
+
+function rectsOverlap(a: Annotation["rects"][number], b: Annotation["rects"][number]) {
+  const left = Math.max(a.x, b.x);
+  const right = Math.min(a.x + a.width, b.x + b.width);
+  const top = Math.max(a.y, b.y);
+  const bottom = Math.min(a.y + a.height, b.y + b.height);
+  return right > left && bottom > top;
 }
 
 function readCurrentSelection(container: HTMLElement | null): PendingSelection | undefined {
