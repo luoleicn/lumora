@@ -1,8 +1,8 @@
-# Lumora
+# lumora
 
-Lumora — light up your literature.
+lumora — light up your literature.
 
-Lumora combines Lumos and Aurora: a quiet desktop research library that feels like an aurora lighting up knowledge. It is a local-first literature reading app with PDF import, right-click highlights and notes, collection organization, cloud sync, and Mendeley import plumbing.
+lumora combines Lumos and Aurora: a quiet desktop research library that feels like an aurora lighting up knowledge. It is a local-first literature reading app with PDF import, right-click highlights and notes, collection organization, cloud sync, and Mendeley import plumbing.
 
 ## What Is Implemented
 
@@ -49,7 +49,7 @@ Build the native macOS app bundle:
 npm run tauri:build --workspace @lumora/desktop
 ```
 
-The app bundle is written to `apps/desktop/src-tauri/target/release/bundle/macos/Lumora.app`.
+The app bundle is written to `apps/desktop/src-tauri/target/release/bundle/macos/lumora.app`.
 
 ## Run The Backend
 

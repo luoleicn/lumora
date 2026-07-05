@@ -1,8 +1,8 @@
 [package]
 name = "lumora"
 version = "0.1.0"
-description = "Lumora — light up your literature."
-authors = ["Lumora"]
+description = "lumora — light up your literature."
+authors = ["lumora"]
 edition = "2021"
 
 [lib]

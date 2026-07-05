@@ -59,8 +59,8 @@ export function LibrarySidebar({
           <img src={lumoraLogoUrl} alt="" />
         </span>
         <div>
-          <h1>Lumora</h1>
-          <p>Lumora — light up your literature.</p>
+          <h1>lumora</h1>
+          <p>lumora — light up your literature.</p>
           <small>{state.papers.filter((paper) => !paper.deletedAt).length} papers</small>
         </div>
       </div>

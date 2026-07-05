@@ -24,4 +24,4 @@ await resize(64, frontendLogo64);
 await resize(64, publicLogo64);
 await resize(512, tauriIcon);
 
-console.log("Updated Lumora logo assets.");
+console.log("Updated lumora logo assets.");

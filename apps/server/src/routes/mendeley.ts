@@ -85,7 +85,7 @@ export async function mendeleyRoutes(app: FastifyInstance) {
     return reply.type("text/html").send(`
       <html>
         <body>
-          <p>Mendeley connected. You can close this window and start the import in Lumora.</p>
+          <p>Mendeley connected. You can close this window and start the import in lumora.</p>
           <script>setTimeout(() => window.close(), 1000)</script>
         </body>
       </html>
