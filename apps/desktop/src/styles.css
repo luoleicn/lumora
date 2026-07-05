@@ -1362,12 +1362,20 @@ button {
 
 .details-title-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
 }
 
-.details-title-row button {
+.details-title-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+}
+
+.details-title-actions button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1383,8 +1391,13 @@ button {
   white-space: nowrap;
 }
 
-.details-title-row button:hover {
+.details-title-actions button:hover {
   background: #dff1eb;
+}
+
+.details-title-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .metadata-lookup-status {

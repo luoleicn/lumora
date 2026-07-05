@@ -1,4 +1,4 @@
-import { Cloud, DatabaseZap, LogIn, RefreshCw, Search, Send, Trash2 } from "lucide-react";
+import { Cloud, DatabaseZap, FileSearch, LogIn, RefreshCw, Search, Send, Trash2 } from "lucide-react";
 import { useState } from "react";
 import type { Annotation, ArxivMetadata, FileAsset, Paper } from "@lumora/shared";
 import { searchArxivMetadata, type SyncSettings } from "../lib/syncClient";
@@ -9,6 +9,7 @@ type SyncPanelProps = {
   status?: string;
   paper?: Paper;
   fileAsset?: FileAsset;
+  fileData?: Uint8Array;
   annotations: Annotation[];
   onSettingsChange: (settings: SyncSettings) => void;
   onLogin: () => void;
@@ -25,6 +26,7 @@ export function SyncPanel({
   status,
   paper,
   fileAsset,
+  fileData,
   annotations,
   onSettingsChange,
   onLogin,
@@ -56,6 +58,7 @@ export function SyncPanel({
           settings={settings}
           paper={paper}
           fileAsset={fileAsset}
+          fileData={fileData}
           onUpdatePaper={onUpdatePaper}
         />
       )}
@@ -129,15 +132,19 @@ function DetailsTab({
   settings,
   paper,
   fileAsset,
+  fileData,
   onUpdatePaper
 }: {
   settings: SyncSettings;
   paper?: Paper;
   fileAsset?: FileAsset;
+  fileData?: Uint8Array;
   onUpdatePaper: (paper: Paper) => void;
 }) {
   const [arxivLookupStatus, setArxivLookupStatus] = useState<string>();
   const [arxivLookupBusy, setArxivLookupBusy] = useState(false);
+  const [pdfMetadataStatus, setPdfMetadataStatus] = useState<string>();
+  const [pdfMetadataBusy, setPdfMetadataBusy] = useState(false);
 
   if (!paper) {
     return <p className="inspector-empty">No document selected.</p>;
@@ -176,15 +183,47 @@ function DetailsTab({
     }
   }
 
+  async function handlePdfMetadataExtract() {
+    if (!fileData) {
+      setPdfMetadataStatus("No local PDF file available.");
+      return;
+    }
+
+    setPdfMetadataBusy(true);
+    setPdfMetadataStatus(undefined);
+    try {
+      const { extractPdfMetadataPatch } = await import("../lib/pdfMetadata");
+      const result = await extractPdfMetadataPatch(fileData, fileAsset?.fileName);
+      if (result.fields.length === 0) {
+        setPdfMetadataStatus("No usable PDF metadata found.");
+        return;
+      }
+
+      updatePaper(result.patch);
+      setPdfMetadataStatus(`Updated ${result.fields.join(", ")} from PDF.`);
+    } catch (error) {
+      setPdfMetadataStatus(error instanceof Error ? error.message : "PDF metadata extraction failed.");
+    } finally {
+      setPdfMetadataBusy(false);
+    }
+  }
+
   return (
     <div className="details-tab">
       <div className="details-title-row">
         <h3>Details</h3>
-        <button type="button" onClick={handleArxivLookup} disabled={arxivLookupBusy || !paper.title.trim()}>
-          <Search size={15} />
-          {arxivLookupBusy ? "Searching..." : "Search arXiv"}
-        </button>
+        <div className="details-title-actions">
+          <button type="button" onClick={handlePdfMetadataExtract} disabled={pdfMetadataBusy || !fileData}>
+            <FileSearch size={15} />
+            {pdfMetadataBusy ? "Extracting..." : "Extract PDF"}
+          </button>
+          <button type="button" onClick={handleArxivLookup} disabled={arxivLookupBusy || !paper.title.trim()}>
+            <Search size={15} />
+            {arxivLookupBusy ? "Searching..." : "Search arXiv"}
+          </button>
+        </div>
       </div>
+      {pdfMetadataStatus && <p className="metadata-lookup-status">{pdfMetadataStatus}</p>}
       {arxivLookupStatus && <p className="metadata-lookup-status">{arxivLookupStatus}</p>}
       <label>
         Type

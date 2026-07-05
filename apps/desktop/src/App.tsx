@@ -447,6 +447,9 @@ export default function App() {
   }
 
   function handleUpdatePaper(paper: Paper) {
+    setWorkspaceTabs((current) => current.map((tab) =>
+      tab.kind === "paper" && tab.paperId === paper.id ? { ...tab, title: paper.title } : tab
+    ));
     setLibrary((current) => ({
       ...current,
       papers: upsertById(current.papers, {
@@ -602,6 +605,7 @@ export default function App() {
               status={status}
               paper={selectedPaper}
               fileAsset={selectedFile}
+              fileData={fileData}
               annotations={selectedAnnotations}
               onSettingsChange={setSettings}
               onLogin={handleLogin}
