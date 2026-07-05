@@ -42,6 +42,21 @@ export type Paper = {
   deletedAt?: string;
 };
 
+export type ArxivMetadata = {
+  arxivId: string;
+  title: string;
+  authors: Author[];
+  year?: number;
+  abstract?: string;
+  doi?: string;
+  url?: string;
+  publishedAt?: string;
+  updatedAt?: string;
+  venue?: string;
+  categories?: string[];
+  score?: number;
+};
+
 export type FileAsset = {
   id: EntityId;
   paperId: EntityId;

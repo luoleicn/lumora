@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Document, Page, pdfjs } from "react-pdf";
-import { MessageSquare, Minus, Plus, StickyNote, X } from "lucide-react";
+import { MessageSquare, Minus, Plus, StickyNote, Trash2, X } from "lucide-react";
 import type { Annotation, FileAsset, Paper } from "@lumora/shared";
 import { mergeNearbyRects, normalizeRect } from "@lumora/shared";
 import { createId } from "../lib/id";
@@ -15,7 +15,8 @@ type PendingSelection = {
   quote: string;
 };
 
-type AnnotationContextMenu = {
+type NewAnnotationContextMenu = {
+  kind: "new";
   x: number;
   y: number;
   selection: PendingSelection;
@@ -23,12 +24,24 @@ type AnnotationContextMenu = {
   noteText: string;
 };
 
+type ExistingAnnotationContextMenu = {
+  kind: "existing";
+  x: number;
+  y: number;
+  annotation: Annotation;
+  mode: "actions" | "note" | "viewNote";
+  noteText: string;
+};
+
+type AnnotationContextMenu = NewAnnotationContextMenu | ExistingAnnotationContextMenu;
+
 type PdfReaderProps = {
   paper?: Paper;
   fileAsset?: FileAsset;
   fileData?: Uint8Array;
   annotations: Annotation[];
   onCreateAnnotation: (annotation: Annotation) => void;
+  onDeleteAnnotation: (annotation: Annotation) => void;
 };
 
 const colors = ["#ffe45c", "#8ee6a8", "#82cfff", "#ffadad"];
@@ -38,7 +51,8 @@ export function PdfReader({
   fileAsset,
   fileData,
   annotations,
-  onCreateAnnotation
+  onCreateAnnotation,
+  onDeleteAnnotation
 }: PdfReaderProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [numPages, setNumPages] = useState(0);
@@ -101,6 +115,21 @@ export function PdfReader({
   }, [fileData]);
 
   function handleContextMenu(event: React.MouseEvent) {
+    const existingAnnotation = findAnnotationAtPoint(scrollRef.current, event.clientX, event.clientY, visibleAnnotations);
+    if (existingAnnotation) {
+      event.preventDefault();
+      window.getSelection()?.removeAllRanges();
+      setContextMenu({
+        kind: "existing",
+        x: event.clientX,
+        y: event.clientY,
+        annotation: existingAnnotation,
+        mode: "actions",
+        noteText: existingAnnotation.comment ?? ""
+      });
+      return;
+    }
+
     const selection = readCurrentSelection(scrollRef.current);
     if (!selection) {
       setContextMenu(undefined);
@@ -109,6 +138,7 @@ export function PdfReader({
 
     event.preventDefault();
     setContextMenu({
+      kind: "new",
       x: event.clientX,
       y: event.clientY,
       selection,
@@ -138,6 +168,22 @@ export function PdfReader({
     });
 
     window.getSelection()?.removeAllRanges();
+    setContextMenu(undefined);
+  }
+
+  function updateAnnotationWithNote(annotation: Annotation, comment: string) {
+    const trimmed = comment.trim();
+    if (!trimmed) {
+      setContextMenu(undefined);
+      return;
+    }
+
+    onCreateAnnotation({
+      ...annotation,
+      kind: "note",
+      comment: trimmed,
+      updatedAt: new Date().toISOString()
+    });
     setContextMenu(undefined);
   }
 
@@ -195,6 +241,18 @@ export function PdfReader({
                 <Page pageNumber={index + 1} width={pageWidth * zoom} renderAnnotationLayer renderTextLayer />
                 <AnnotationOverlay
                   annotations={visibleAnnotations.filter((annotation) => annotation.pageIndex === index)}
+                  onOpenAnnotationMenu={(annotation, event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setContextMenu({
+                      kind: "existing",
+                      x: event.clientX,
+                      y: event.clientY,
+                      annotation,
+                      mode: "actions",
+                      noteText: annotation.comment ?? ""
+                    });
+                  }}
                 />
               </div>
             ))}
@@ -208,9 +266,22 @@ export function PdfReader({
             onClose={() => setContextMenu(undefined)}
             onChangeNote={(noteText) => setContextMenu((current) => current ? { ...current, noteText } : current)}
             onStartNote={() => setContextMenu((current) => current ? { ...current, mode: "note" } : current)}
-            onHighlight={() => createAnnotation("highlight", contextMenu.selection)}
+            onShowNote={() => setContextMenu((current) =>
+              current?.kind === "existing" ? { ...current, mode: "viewNote" } : current
+            )}
+            onHighlight={() => {
+              if (contextMenu.kind === "new") {
+                createAnnotation("highlight", contextMenu.selection);
+              }
+            }}
+            onDeleteAnnotation={(annotation) => {
+              onDeleteAnnotation(annotation);
+              setContextMenu(undefined);
+            }}
             onSaveNote={(noteText) => {
-              if (noteText.trim()) {
+              if (contextMenu.kind === "existing") {
+                updateAnnotationWithNote(contextMenu.annotation, noteText);
+              } else if (noteText.trim()) {
                 createAnnotation("note", contextMenu.selection, noteText);
               } else {
                 window.getSelection()?.removeAllRanges();
@@ -224,7 +295,13 @@ export function PdfReader({
   );
 }
 
-function AnnotationOverlay({ annotations }: { annotations: Annotation[] }) {
+function AnnotationOverlay({
+  annotations,
+  onOpenAnnotationMenu
+}: {
+  annotations: Annotation[];
+  onOpenAnnotationMenu: (annotation: Annotation, event: React.MouseEvent) => void;
+}) {
   const [openNoteId, setOpenNoteId] = useState<string>();
   const openNote = annotations.find((annotation) => annotation.id === openNoteId && annotation.kind === "note");
   const openNoteRect = openNote?.rects[0];
@@ -266,6 +343,7 @@ function AnnotationOverlay({ annotations }: { annotations: Annotation[] }) {
               event.stopPropagation();
               setOpenNoteId((current) => current === annotation.id ? undefined : annotation.id);
             }}
+            onContextMenu={(event) => onOpenAnnotationMenu(annotation, event)}
             aria-label="Show note"
             title="Show note"
           >
@@ -301,7 +379,9 @@ function AnnotationContextMenu({
   onClose,
   onChangeNote,
   onStartNote,
+  onShowNote,
   onHighlight,
+  onDeleteAnnotation,
   onSaveNote
 }: {
   menu: AnnotationContextMenu;
@@ -310,9 +390,14 @@ function AnnotationContextMenu({
   onClose: () => void;
   onChangeNote: (noteText: string) => void;
   onStartNote: () => void;
+  onShowNote: () => void;
   onHighlight: () => void;
+  onDeleteAnnotation: (annotation: Annotation) => void;
   onSaveNote: (noteText: string) => void;
 }) {
+  const title = getContextMenuTitle(menu);
+  const quote = menu.kind === "new" ? menu.selection.quote : menu.annotation.quote;
+
   return (
     <div
       className="pdf-context-menu"
@@ -322,7 +407,7 @@ function AnnotationContextMenu({
       aria-label="Annotation actions"
     >
       <header>
-        <span>{menu.mode === "note" ? "Add note" : "Annotate selection"}</span>
+        <span>{title}</span>
         <button
           type="button"
           onPointerDown={(event) => event.preventDefault()}
@@ -332,8 +417,8 @@ function AnnotationContextMenu({
           <X size={14} />
         </button>
       </header>
-      <p>{menu.selection.quote}</p>
-      {menu.mode === "actions" && (
+      {quote && <p>{quote}</p>}
+      {menu.kind === "new" && menu.mode === "actions" && (
         <div className="context-swatches" aria-label="Annotation color">
           {colors.map((item) => (
             <button
@@ -359,6 +444,32 @@ function AnnotationContextMenu({
           />
           <span>Click outside to save</span>
         </div>
+      ) : menu.mode === "viewNote" && menu.kind === "existing" ? (
+        <div className="context-note-view">
+          <blockquote>{menu.annotation.comment || "No note content."}</blockquote>
+          <button type="button" className="danger" onClick={() => onDeleteAnnotation(menu.annotation)}>
+            <Trash2 size={16} />
+            Delete Annotation
+          </button>
+        </div>
+      ) : menu.kind === "existing" ? (
+        <div className="button-row vertical">
+          {menu.annotation.kind === "note" ? (
+            <button type="button" onClick={onShowNote}>
+              <MessageSquare size={16} />
+              Show Note
+            </button>
+          ) : (
+            <button type="button" onClick={onStartNote}>
+              <MessageSquare size={16} />
+              Add Note
+            </button>
+          )}
+          <button type="button" className="danger" onClick={() => onDeleteAnnotation(menu.annotation)}>
+            <Trash2 size={16} />
+            Delete Annotation
+          </button>
+        </div>
       ) : (
         <div className="button-row">
           <button type="button" onClick={onHighlight}>
@@ -373,6 +484,56 @@ function AnnotationContextMenu({
       )}
     </div>
   );
+}
+
+function getContextMenuTitle(menu: AnnotationContextMenu) {
+  if (menu.kind === "new") {
+    return menu.mode === "note" ? "Add note" : "Annotate selection";
+  }
+
+  if (menu.mode === "note") {
+    return "Add note to highlight";
+  }
+
+  if (menu.mode === "viewNote") {
+    return "Note";
+  }
+
+  return menu.annotation.kind === "note" ? "Note annotation" : "Highlight annotation";
+}
+
+function findAnnotationAtPoint(
+  container: HTMLElement | null,
+  clientX: number,
+  clientY: number,
+  annotations: Annotation[]
+): Annotation | undefined {
+  if (!container) {
+    return undefined;
+  }
+
+  const pages = Array.from(container.querySelectorAll<HTMLElement>("[data-page-index]"));
+  for (const page of pages) {
+    const pageRect = page.getBoundingClientRect();
+    if (clientX < pageRect.left || clientX > pageRect.right || clientY < pageRect.top || clientY > pageRect.bottom) {
+      continue;
+    }
+
+    const pageIndex = Number(page.dataset.pageIndex);
+    const x = (clientX - pageRect.left) / pageRect.width;
+    const y = (clientY - pageRect.top) / pageRect.height;
+    return annotations.find((annotation) =>
+      annotation.pageIndex === pageIndex &&
+      annotation.rects.some((rect) =>
+        x >= rect.x &&
+        x <= rect.x + rect.width &&
+        y >= rect.y &&
+        y <= rect.y + rect.height
+      )
+    );
+  }
+
+  return undefined;
 }
 
 function readCurrentSelection(container: HTMLElement | null): PendingSelection | undefined {

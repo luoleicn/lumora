@@ -1,7 +1,7 @@
-import { Cloud, DatabaseZap, LogIn, RefreshCw, Send, Trash2 } from "lucide-react";
+import { Cloud, DatabaseZap, LogIn, RefreshCw, Search, Send, Trash2 } from "lucide-react";
 import { useState } from "react";
-import type { Annotation, FileAsset, Paper } from "@lumora/shared";
-import type { SyncSettings } from "../lib/syncClient";
+import type { Annotation, ArxivMetadata, FileAsset, Paper } from "@lumora/shared";
+import { searchArxivMetadata, type SyncSettings } from "../lib/syncClient";
 
 type SyncPanelProps = {
   settings: SyncSettings;
@@ -51,7 +51,14 @@ export function SyncPanel({
         </button>
       </div>
 
-      {activeTab === "details" && <DetailsTab paper={paper} fileAsset={fileAsset} onUpdatePaper={onUpdatePaper} />}
+      {activeTab === "details" && (
+        <DetailsTab
+          settings={settings}
+          paper={paper}
+          fileAsset={fileAsset}
+          onUpdatePaper={onUpdatePaper}
+        />
+      )}
       {activeTab === "notes" && <NotesTab annotations={visibleAnnotations} onDeleteAnnotation={onDeleteAnnotation} />}
       {activeTab === "sync" && (
         <>
@@ -111,6 +118,7 @@ export function SyncPanel({
 const documentTypes = [
   ["journalArticle", "Journal Article"],
   ["conferencePaper", "Conference Paper"],
+  ["preprint", "Preprint"],
   ["book", "Book"],
   ["bookSection", "Book Section"],
   ["thesis", "Thesis"],
@@ -118,31 +126,66 @@ const documentTypes = [
 ];
 
 function DetailsTab({
+  settings,
   paper,
   fileAsset,
   onUpdatePaper
 }: {
+  settings: SyncSettings;
   paper?: Paper;
   fileAsset?: FileAsset;
   onUpdatePaper: (paper: Paper) => void;
 }) {
+  const [arxivLookupStatus, setArxivLookupStatus] = useState<string>();
+  const [arxivLookupBusy, setArxivLookupBusy] = useState(false);
+
   if (!paper) {
     return <p className="inspector-empty">No document selected.</p>;
   }
 
-  const authors = paper.authors.map((author) => author.fullName).join(", ") || "No authors";
+  const currentPaper = paper;
+  const authors = currentPaper.authors.map((author) => author.fullName).join(", ") || "No authors";
   const editableAuthors = authors === "No authors" ? "" : authors;
 
   function updatePaper(patch: Partial<Paper>) {
-    if (!paper) {
+    onUpdatePaper({ ...currentPaper, ...patch });
+  }
+
+  async function handleArxivLookup() {
+    if (!currentPaper.title.trim()) {
+      setArxivLookupStatus("Title is required for arXiv lookup.");
       return;
     }
-    onUpdatePaper({ ...paper, ...patch });
+
+    setArxivLookupBusy(true);
+    setArxivLookupStatus(undefined);
+    try {
+      const results = await searchArxivMetadata(settings, currentPaper.title);
+      const bestMatch = results[0];
+      if (!bestMatch) {
+        setArxivLookupStatus("No arXiv match found.");
+        return;
+      }
+
+      updatePaper(arxivMetadataToPaperPatch(bestMatch));
+      setArxivLookupStatus(`Matched arXiv:${bestMatch.arxivId}`);
+    } catch (error) {
+      setArxivLookupStatus(error instanceof Error ? error.message : "arXiv lookup failed.");
+    } finally {
+      setArxivLookupBusy(false);
+    }
   }
 
   return (
     <div className="details-tab">
-      <h3>Details</h3>
+      <div className="details-title-row">
+        <h3>Details</h3>
+        <button type="button" onClick={handleArxivLookup} disabled={arxivLookupBusy || !paper.title.trim()}>
+          <Search size={15} />
+          {arxivLookupBusy ? "Searching..." : "Search arXiv"}
+        </button>
+      </div>
+      {arxivLookupStatus && <p className="metadata-lookup-status">{arxivLookupStatus}</p>}
       <label>
         Type
         <select value={paper.documentType ?? "journalArticle"} onChange={(event) => updatePaper({ documentType: event.target.value })}>
@@ -156,6 +199,10 @@ function DetailsTab({
       <label>
         Title
         <input value={paper.title} onChange={(event) => updatePaper({ title: event.target.value })} />
+      </label>
+      <label>
+        arXiv ID
+        <input value={paper.arxiv ?? ""} onChange={(event) => updatePaper({ arxiv: clean(event.target.value) })} />
       </label>
       <label>
         Authors
@@ -235,6 +282,22 @@ function DetailsTab({
       <p className="details-file">File: {fileAsset?.fileName ?? "No file attached"}</p>
     </div>
   );
+}
+
+function arxivMetadataToPaperPatch(metadata: ArxivMetadata): Partial<Paper> {
+  return {
+    arxiv: metadata.arxivId,
+    title: metadata.title,
+    authors: metadata.authors,
+    year: metadata.year,
+    venue: metadata.venue ?? "arXiv",
+    doi: metadata.doi,
+    abstract: metadata.abstract,
+    url: metadata.url,
+    documentType: "preprint",
+    keywords: metadata.categories ?? [],
+    needsReview: false
+  };
 }
 
 function parseAuthors(value: string) {

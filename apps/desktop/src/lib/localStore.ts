@@ -9,11 +9,8 @@ import type {
 import { createId } from "./id";
 
 const libraryKey = "lumora:library-state";
-const legacyLibraryKey = "paper-reader:library-state";
 const clientIdKey = "lumora:client-id";
-const legacyClientIdKey = "paper-reader:client-id";
 const dbName = "lumora-files";
-const legacyDbName = "paper-reader-files";
 const dbVersion = 1;
 const fileStoreName = "files";
 
@@ -27,12 +24,6 @@ export function getClientId() {
   const existing = localStorage.getItem(clientIdKey);
   if (existing) {
     return existing;
-  }
-
-  const legacy = localStorage.getItem(legacyClientIdKey);
-  if (legacy) {
-    localStorage.setItem(clientIdKey, legacy);
-    return legacy;
   }
 
   const id = createId("client");
@@ -61,7 +52,7 @@ export function createDefaultState(): LibraryState {
 }
 
 export function loadLibraryState(): LibraryState {
-  const raw = localStorage.getItem(libraryKey) ?? localStorage.getItem(legacyLibraryKey);
+  const raw = localStorage.getItem(libraryKey);
   if (!raw) {
     return createDefaultState();
   }
@@ -184,11 +175,7 @@ export async function putFileBlob(fileAssetId: string, file: Blob): Promise<void
 }
 
 export async function getFileBlob(fileAssetId: string): Promise<Blob | undefined> {
-  return await getFileBlobFromDb(dbName, fileAssetId) ?? await getFileBlobFromDb(legacyDbName, fileAssetId);
-}
-
-async function getFileBlobFromDb(name: string, fileAssetId: string): Promise<Blob | undefined> {
-  const db = await openFilesDb(name);
+  const db = await openFilesDb();
   const blob = await new Promise<Blob | undefined>((resolve, reject) => {
     const transaction = db.transaction(fileStoreName, "readonly");
     const request = transaction.objectStore(fileStoreName).get(fileAssetId);

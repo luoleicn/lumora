@@ -203,6 +203,8 @@ function documentTypeLabel(value?: string) {
       return "Book Section";
     case "conferencePaper":
       return "Conference";
+    case "preprint":
+      return "Preprint";
     case "thesis":
       return "Thesis";
     case "report":

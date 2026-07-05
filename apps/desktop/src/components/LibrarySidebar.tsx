@@ -12,6 +12,7 @@ import {
   type LucideIcon
 } from "lucide-react";
 import type { Collection, LibraryState } from "@lumora/shared";
+import lumoraLogoUrl from "../assets/lumora-logo-64.png";
 
 type LibrarySidebarProps = {
   state: LibraryState;
@@ -50,7 +51,9 @@ export function LibrarySidebar({
   return (
     <aside className="library-sidebar">
       <div className="app-title">
-        <span className="brand-mark">LU</span>
+        <span className="brand-mark">
+          <img src={lumoraLogoUrl} alt="" />
+        </span>
         <div>
           <h1>Lumora</h1>
           <p>Lumora — light up your literature.</p>

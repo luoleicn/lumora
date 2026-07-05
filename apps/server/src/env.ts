@@ -1,8 +1,8 @@
 export const env = {
   port: Number(process.env.PORT ?? 3838),
   jwtSecret: process.env.JWT_SECRET ?? "dev-change-me",
-  bootstrapEmail: process.env.LUMORA_BOOTSTRAP_EMAIL ?? process.env.PAPER_READER_BOOTSTRAP_EMAIL ?? "reader@example.com",
-  bootstrapPassword: process.env.LUMORA_BOOTSTRAP_PASSWORD ?? process.env.PAPER_READER_BOOTSTRAP_PASSWORD ?? "change-me",
+  bootstrapEmail: process.env.LUMORA_BOOTSTRAP_EMAIL ?? "reader@example.com",
+  bootstrapPassword: process.env.LUMORA_BOOTSTRAP_PASSWORD ?? "change-me",
   appBaseUrl: process.env.APP_BASE_URL ?? "http://localhost:3838",
   clientBaseUrl: process.env.CLIENT_BASE_URL ?? "http://localhost:5173",
   s3Endpoint: process.env.S3_ENDPOINT ?? "http://localhost:9000",

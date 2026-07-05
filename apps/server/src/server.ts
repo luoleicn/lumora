@@ -4,6 +4,7 @@ import { ensureBootstrapUser } from "./auth.js";
 import { prisma } from "./db.js";
 import { authRoutes } from "./routes/auth.js";
 import { fileRoutes } from "./routes/files.js";
+import { metadataRoutes } from "./routes/metadata.js";
 import { mendeleyRoutes } from "./routes/mendeley.js";
 import { syncRoutes } from "./routes/sync.js";
 
@@ -22,6 +23,7 @@ export async function buildServer() {
   await app.register(authRoutes);
   await app.register(syncRoutes);
   await app.register(fileRoutes);
+  await app.register(metadataRoutes);
   await app.register(mendeleyRoutes);
 
   app.addHook("onClose", async () => {

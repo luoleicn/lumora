@@ -1,5 +1,6 @@
 import type {
   Annotation,
+  ArxivMetadata,
   Collection,
   FileAsset,
   InitUploadRequest,
@@ -77,6 +78,20 @@ export async function startMendeleyImport(settings: SyncSettings) {
   }
 
   return response.json();
+}
+
+export async function searchArxivMetadata(settings: SyncSettings, title: string): Promise<ArxivMetadata[]> {
+  const url = new URL(`${settings.serverUrl}/metadata/arxiv`);
+  url.searchParams.set("title", title);
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => undefined) as { error?: string } | undefined;
+    throw new Error(body?.error ?? "arXiv lookup failed");
+  }
+
+  const data = await response.json() as { results: ArxivMetadata[] };
+  return data.results;
 }
 
 async function pushChanges(settings: SyncSettings, state: LibraryState): Promise<SyncPushResponse> {

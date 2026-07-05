@@ -26,9 +26,7 @@ import {
 } from "./lib/syncClient";
 
 const settingsKey = "lumora:sync-settings";
-const legacySettingsKey = "paper-reader:sync-settings";
 const workspaceLayoutKey = "lumora:workspace-layout";
-const legacyWorkspaceLayoutKey = "paper-reader:workspace-layout";
 const collapseThreshold = 82;
 
 type MainPanelKey = "library" | "papers" | "reader" | "sync";
@@ -544,6 +542,7 @@ export default function App() {
                 fileData={fileData}
                 annotations={selectedAnnotations}
                 onCreateAnnotation={handleCreateAnnotation}
+                onDeleteAnnotation={handleDeleteAnnotation}
               />
             )
           )}
@@ -669,7 +668,7 @@ function loadSyncSettings(): SyncSettings {
     password: "change-me"
   };
 
-  const raw = localStorage.getItem(settingsKey) ?? localStorage.getItem(legacySettingsKey);
+  const raw = localStorage.getItem(settingsKey);
   if (!raw) {
     return fallback;
   }
@@ -684,7 +683,7 @@ function loadSyncSettings(): SyncSettings {
 }
 
 function loadWorkspaceLayout(): WorkspaceLayout {
-  const raw = localStorage.getItem(workspaceLayoutKey) ?? localStorage.getItem(legacyWorkspaceLayoutKey);
+  const raw = localStorage.getItem(workspaceLayoutKey);
   if (!raw) {
     return defaultWorkspaceLayout;
   }
