@@ -16,6 +16,21 @@ type PdfMetadataResult = {
   fields: string[];
 };
 
+type PdfTextLine = {
+  text: string;
+  x: number;
+  y: number;
+  right: number;
+  height: number;
+};
+
+type PdfTextItem = {
+  str: string;
+  transform: number[];
+  width?: number;
+  height?: number;
+};
+
 export async function extractPdfMetadataPatch(fileData: Uint8Array, fileName?: string): Promise<PdfMetadataResult> {
   const loadingTask = getDocument({ data: fileData.slice().buffer });
   const document = await loadingTask.promise;
@@ -23,10 +38,12 @@ export async function extractPdfMetadataPatch(fileData: Uint8Array, fileName?: s
   try {
     const metadata = await document.getMetadata().catch(() => undefined);
     const info = metadata?.info as PdfInfo | undefined;
-    const firstPageText = await readFirstPageText(document).catch(() => "");
-    const title = cleanTitle(readString(info?.Title)) ?? inferTitleFromFirstPage(firstPageText) ?? inferTitleFromFileName(fileName);
-    const authors = parseAuthors(readString(info?.Author) ?? inferAuthorsFromFirstPage(firstPageText));
-    const abstract = readString(info?.Subject);
+    const firstPageLines = await readFirstPageLines(document).catch(() => []);
+    const firstPageText = linesToText(firstPageLines);
+    const inferredTitle = inferTitleFromFirstPageLines(firstPageLines);
+    const title = cleanTitle(readString(info?.Title)) ?? inferredTitle ?? inferTitleFromFileName(fileName);
+    const authors = parseAuthors(readString(info?.Author)) || inferAuthorsFromFirstPageLines(firstPageLines, inferredTitle ?? title);
+    const abstract = readString(info?.Subject) ?? inferAbstractFromFirstPageLines(firstPageLines);
     const keywords = parseKeywords(readString(info?.Keywords));
     const combinedText = `${title ?? ""}\n${abstract ?? ""}\n${firstPageText}`;
     const year = inferYear(readString(info?.CreationDate), combinedText);
@@ -75,19 +92,58 @@ export async function extractPdfMetadataPatch(fileData: Uint8Array, fileName?: s
   }
 }
 
-async function readFirstPageText(document: Awaited<ReturnType<typeof getDocument>["promise"]>) {
+async function readFirstPageLines(document: Awaited<ReturnType<typeof getDocument>["promise"]>) {
   if (document.numPages < 1) {
-    return "";
+    return [];
   }
 
   const page = await document.getPage(1);
   const content = await page.getTextContent();
-  return content.items
-    .map((item) => "str" in item ? item.str : "")
-    .filter(Boolean)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
+  const textItems: PdfTextItem[] = (content.items as unknown[])
+    .filter(isPdfTextItem)
+    .filter((item) => item.str.trim());
+  const items = textItems
+    .map((item) => {
+      const [, , , , x, y] = item.transform;
+      return {
+        text: item.str.trim(),
+        x,
+        y,
+        right: x + (item.width ?? 0),
+        height: item.height || Math.abs(item.transform[3]) || 10
+      };
+    })
+    .sort((a, b) => b.y - a.y || a.x - b.x);
+
+  const lines: PdfTextLine[] = [];
+
+  for (const item of items) {
+    const existing = lines.find((line) => Math.abs(line.y - item.y) <= Math.max(2.5, item.height * 0.35));
+    if (!existing) {
+      lines.push({
+        text: item.text,
+        x: item.x,
+        y: item.y,
+        right: item.right,
+        height: item.height
+      });
+      continue;
+    }
+
+    const separator = item.x - existing.right > 7 ? "; " : " ";
+    existing.text = `${existing.text}${separator}${item.text}`.replace(/\s+/g, " ").trim();
+    existing.x = Math.min(existing.x, item.x);
+    existing.right = Math.max(existing.right, item.right);
+    existing.height = Math.max(existing.height, item.height);
+  }
+
+  return lines
+    .sort((a, b) => b.y - a.y || a.x - b.x)
+    .map((line) => ({
+      ...line,
+      text: normalizeLineText(line.text)
+    }))
+    .filter((line) => line.text);
 }
 
 function readString(value: unknown) {
@@ -106,45 +162,73 @@ function cleanTitle(value?: string) {
 
   const cleaned = value
     .replace(/\.pdf$/i, "")
-    .replace(/[_-]+/g, " ")
+    .replace(/_/g, " ")
+    .replace(/\s+-\s+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
   return cleaned && !looksLikePdfProducer(cleaned) ? cleaned : undefined;
 }
 
-function inferTitleFromFirstPage(text: string) {
-  const firstSentence = text
-    .split(/\s{2,}|\n/)
-    .map((line) => line.trim())
-    .find((line) => line.length >= 12 && line.length <= 220 && !/^arxiv:/i.test(line));
-  return cleanTitle(firstSentence);
+function inferTitleFromFirstPageLines(lines: PdfTextLine[]) {
+  const candidateLines = lines
+    .slice(0, 12)
+    .filter((line) => line.text.length >= 4 && !isFrontMatterNoise(line.text));
+  const maxHeight = Math.max(...candidateLines.map((line) => line.height), 0);
+  const titleLines = candidateLines
+    .filter((line) => line.height >= Math.max(11, maxHeight * 0.82))
+    .slice(0, 6);
+  const title = joinHyphenatedLines(titleLines.map((line) => line.text));
+  return title.length >= 12 && title.length <= 260 ? cleanTitle(title) : undefined;
 }
 
 function inferTitleFromFileName(fileName?: string) {
   return cleanTitle(fileName);
 }
 
-function parseAuthors(value?: string): Author[] {
+function parseAuthors(value?: string): Author[] | undefined {
   if (!value) {
-    return [];
-  }
-
-  return value
-    .split(/\s*(?:,|;|\band\b|&)\s*/i)
-    .map((fullName) => fullName.trim())
-    .filter((fullName) => fullName.length > 1 && !looksLikePdfProducer(fullName))
-    .map((fullName) => ({ fullName }));
-}
-
-function inferAuthorsFromFirstPage(text: string) {
-  const title = inferTitleFromFirstPage(text);
-  if (!title) {
     return undefined;
   }
 
-  const afterTitle = text.slice(text.indexOf(title) + title.length, text.indexOf(title) + title.length + 360);
-  const match = afterTitle.match(/([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3}(?:\s*(?:,|and|&)\s*[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3}){0,8})/);
-  return match?.[1];
+  const authors = value
+    .split(/\s*(?:,|;|\band\b|&)\s*/i)
+    .flatMap((chunk) => splitAdjacentNames(chunk))
+    .map((fullName) => fullName.trim())
+    .map((fullName) => fullName.replace(/[∗*†‡§¶]+/g, "").replace(/\d+$/g, "").trim())
+    .filter((fullName) => isLikelyAuthorName(fullName))
+    .map((fullName) => ({ fullName }));
+  return authors.length > 0 ? authors : undefined;
+}
+
+function inferAuthorsFromFirstPageLines(lines: PdfTextLine[], title?: string): Author[] {
+  const titleLineCount = title ? findTitleLineCount(lines, title) : 0;
+  const abstractIndex = lines.findIndex((line) => /^abstract$/i.test(line.text));
+  const endIndex = abstractIndex >= 0 ? abstractIndex : Math.min(lines.length, titleLineCount + 12);
+  const authorLines = lines
+    .slice(titleLineCount, endIndex)
+    .filter((line) => !isFrontMatterNoise(line.text))
+    .filter((line) => line.height <= 14)
+    .map((line) => line.text);
+  const authors = parseAuthors(authorLines.join(", "));
+  return authors ?? [];
+}
+
+function inferAbstractFromFirstPageLines(lines: PdfTextLine[]) {
+  const abstractIndex = lines.findIndex((line) => /^abstract$/i.test(line.text));
+  if (abstractIndex < 0) {
+    return undefined;
+  }
+
+  const collected: string[] = [];
+  for (const line of lines.slice(abstractIndex + 1)) {
+    if (/^\d+\.?\s+[A-Z]/.test(line.text) || /^1\s*$/.test(line.text)) {
+      break;
+    }
+    collected.push(line.text);
+  }
+
+  const abstract = joinHyphenatedLines(collected).replace(/\s+/g, " ").trim();
+  return abstract.length > 40 ? abstract : undefined;
 }
 
 function parseKeywords(value?: string) {
@@ -173,6 +257,71 @@ function inferArxivId(text: string) {
   }
 
   return text.match(/\barXiv:\s*([a-z-]+\/\d{7}(?:v\d+)?)\b/i)?.[1];
+}
+
+function linesToText(lines: PdfTextLine[]) {
+  return lines.map((line) => line.text).join("\n");
+}
+
+function normalizeLineText(value: string) {
+  return value.replace(/\s+/g, " ").replace(/\s+([,.;:])/g, "$1").trim();
+}
+
+function isPdfTextItem(item: unknown): item is PdfTextItem {
+  if (!item || typeof item !== "object") {
+    return false;
+  }
+
+  const candidate = item as Partial<PdfTextItem>;
+  return typeof candidate.str === "string" && Array.isArray(candidate.transform);
+}
+
+function joinHyphenatedLines(lines: string[]) {
+  return lines.reduce((text, line) => {
+    if (!text) {
+      return line;
+    }
+    return text.endsWith("-") ? `${text.slice(0, -1)}${line}` : `${text} ${line}`;
+  }, "").replace(/\s+/g, " ").trim();
+}
+
+function findTitleLineCount(lines: PdfTextLine[], title: string) {
+  let accumulated = "";
+  for (let index = 0; index < lines.length; index += 1) {
+    accumulated = joinHyphenatedLines([accumulated, lines[index].text].filter(Boolean));
+    if (normalizeComparable(accumulated) === normalizeComparable(title)) {
+      return index + 1;
+    }
+    if (accumulated.length > title.length + 60) {
+      return index + 1;
+    }
+  }
+  return 0;
+}
+
+function splitAdjacentNames(value: string) {
+  const matches = value.match(/[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3}/g);
+  return matches && matches.length > 1 ? matches : [value];
+}
+
+function isLikelyAuthorName(value: string) {
+  if (value.length < 3 || value.length > 80 || looksLikePdfProducer(value)) {
+    return false;
+  }
+  if (/\b(abstract|university|institute|department|laboratory|lab|github|http|www|\.io|\.com)\b/i.test(value)) {
+    return false;
+  }
+  return /^[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3}$/.test(value);
+}
+
+function isFrontMatterNoise(value: string) {
+  return /^(\d+|abstract|keywords?|index terms?)$/i.test(value)
+    || /^(https?:\/\/|www\.|\S+\.(?:io|com|org|edu))/i.test(value)
+    || /\b(university|institute|department|laboratory|lab|school|college|corporation|inc\.?|ltd\.?)\b/i.test(value);
+}
+
+function normalizeComparable(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
 function looksLikePdfProducer(value: string) {
