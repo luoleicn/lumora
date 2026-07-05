@@ -183,8 +183,6 @@ export default function App() {
             return true;
           case "favorites":
             return Boolean(paper.favorite);
-          case "needs_review":
-            return Boolean(paper.needsReview);
           case "unsorted":
             return !library.paperCollections.some((item) => item.paperId === paper.id && !item.deletedAt);
           case "trash":
@@ -326,7 +324,7 @@ export default function App() {
       issue: draft.issue,
       publisher: draft.publisher,
       favorite: false,
-      needsReview: true,
+      needsReview: false,
       unread: true,
       createdAt: now,
       updatedAt: now

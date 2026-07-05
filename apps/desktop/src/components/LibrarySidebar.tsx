@@ -1,6 +1,7 @@
 import {
-  AlertCircle,
   Archive,
+  ChevronDown,
+  ChevronRight,
   Clock,
   FileText,
   Folder,
@@ -12,6 +13,7 @@ import {
   type LucideIcon
 } from "lucide-react";
 import type { Collection, LibraryState } from "@lumora/shared";
+import { useState } from "react";
 import lumoraLogoUrl from "../assets/lumora-logo-64.png";
 
 type LibrarySidebarProps = {
@@ -35,6 +37,8 @@ export function LibrarySidebar({
   onSelectTag,
   onCreateCollection
 }: LibrarySidebarProps) {
+  const [authorsExpanded, setAuthorsExpanded] = useState(true);
+  const [tagsExpanded, setTagsExpanded] = useState(true);
   const collections = state.collections
     .filter((collection) => !collection.deletedAt)
     .sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
@@ -86,13 +90,6 @@ export function LibrarySidebar({
             onClick={() => onSelectCollection("favorites")}
           />
           <NavButton
-            icon={AlertCircle}
-            label="Needs Review"
-            active={selectedCollectionId === "needs_review"}
-            count={activePapers.filter((paper) => paper.needsReview).length}
-            onClick={() => onSelectCollection("needs_review")}
-          />
-          <NavButton
             icon={Archive}
             label="Unsorted"
             active={selectedCollectionId === "unsorted"}
@@ -130,56 +127,76 @@ export function LibrarySidebar({
         </div>
       </nav>
 
-      <section className="author-filter">
-        <header>
+      <section className={authorsExpanded ? "author-filter" : "author-filter collapsed"}>
+        <button
+          type="button"
+          className="filter-header-button"
+          onClick={() => setAuthorsExpanded((current) => !current)}
+          aria-expanded={authorsExpanded}
+        >
+          {authorsExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
           <UserRound size={15} />
           <span>Filter by Authors</span>
-        </header>
-        <button
-          type="button"
-          className={!selectedAuthor ? "author-filter-button active" : "author-filter-button"}
-          onClick={() => onSelectAuthor(undefined)}
-        >
-          All
         </button>
-        <div className="author-filter-list">
-          {authors.map((author) => (
+        {authorsExpanded && (
+          <>
             <button
-              key={author}
               type="button"
-              className={selectedAuthor === author ? "author-filter-button active" : "author-filter-button"}
-              onClick={() => onSelectAuthor(author)}
+              className={!selectedAuthor ? "author-filter-button active" : "author-filter-button"}
+              onClick={() => onSelectAuthor(undefined)}
             >
-              {author}
+              All
             </button>
-          ))}
-        </div>
+            <div className="author-filter-list">
+              {authors.map((author) => (
+                <button
+                  key={author}
+                  type="button"
+                  className={selectedAuthor === author ? "author-filter-button active" : "author-filter-button"}
+                  onClick={() => onSelectAuthor(author)}
+                >
+                  {author}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
       </section>
 
-      <section className="tag-filter">
-        <header>
-          <Tags size={15} />
-          <span>Filter by Tags</span>
-        </header>
+      <section className={tagsExpanded ? "tag-filter" : "tag-filter collapsed"}>
         <button
           type="button"
-          className={!selectedTag ? "author-filter-button active" : "author-filter-button"}
-          onClick={() => onSelectTag(undefined)}
+          className="filter-header-button"
+          onClick={() => setTagsExpanded((current) => !current)}
+          aria-expanded={tagsExpanded}
         >
-          All
+          {tagsExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          <Tags size={15} />
+          <span>Filter by Tags</span>
         </button>
-        <div className="author-filter-list">
-          {tags.map((tag) => (
+        {tagsExpanded && (
+          <>
             <button
-              key={tag}
               type="button"
-              className={selectedTag === tag ? "author-filter-button active" : "author-filter-button"}
-              onClick={() => onSelectTag(tag)}
+              className={!selectedTag ? "author-filter-button active" : "author-filter-button"}
+              onClick={() => onSelectTag(undefined)}
             >
-              {tag}
+              All
             </button>
-          ))}
-        </div>
+            <div className="author-filter-list">
+              {tags.map((tag) => (
+                <button
+                  key={tag}
+                  type="button"
+                  className={selectedTag === tag ? "author-filter-button active" : "author-filter-button"}
+                  onClick={() => onSelectTag(tag)}
+                >
+                  {tag}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
       </section>
     </aside>
   );

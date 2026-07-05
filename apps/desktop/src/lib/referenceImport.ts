@@ -197,7 +197,7 @@ function toPaper(fields: ReferenceFields): Paper {
     issue: clean(fields.issue),
     publisher: clean(fields.publisher),
     favorite: false,
-    needsReview: true,
+    needsReview: false,
     unread: true,
     createdAt: now,
     updatedAt: now

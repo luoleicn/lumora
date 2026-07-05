@@ -1,9 +1,9 @@
-import { AlertCircle, FileText, Star } from "lucide-react";
+import { FileText, Star } from "lucide-react";
 import type { FileAsset, LibraryState, Paper } from "@lumora/shared";
 import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type SortKey = "authors" | "title" | "year" | "venue" | "added";
-type PaperColumnKey = "favorite" | "review" | SortKey;
+type PaperColumnKey = "favorite" | SortKey;
 
 type PaperColumn = {
   key: PaperColumnKey;
@@ -26,7 +26,6 @@ const columnWidthsKey = "lumora:documents-column-widths";
 
 const paperColumns: PaperColumn[] = [
   { key: "favorite", label: "Favorite", defaultWidth: 32, minWidth: 28, maxWidth: 72 },
-  { key: "review", label: "Review status", defaultWidth: 32, minWidth: 28, maxWidth: 72 },
   { key: "authors", label: "Authors", sortKey: "authors", defaultWidth: 178, minWidth: 96, maxWidth: 520 },
   { key: "title", label: "Title", sortKey: "title", defaultWidth: 310, minWidth: 150, maxWidth: 760 },
   { key: "year", label: "Year", sortKey: "year", defaultWidth: 62, minWidth: 52, maxWidth: 120 },
@@ -227,7 +226,6 @@ function ResizableHeader({
         ) : (
           <span className="paper-table-static-header" aria-hidden="true">
             {column.key === "favorite" && <Star size={13} />}
-            {column.key === "review" && <AlertCircle size={13} />}
           </span>
         )}
         <span
@@ -281,19 +279,6 @@ function PaperRow({
           aria-label={paper.favorite ? "Remove from favorites" : "Add to favorites"}
         >
           <Star size={15} fill={paper.favorite ? "currentColor" : "none"} />
-        </button>
-      </td>
-      <td>
-        <button
-          type="button"
-          className={paper.needsReview ? "table-icon-button review active" : "table-icon-button review"}
-          onClick={(event) => {
-            event.stopPropagation();
-            onUpdatePaper({ ...paper, needsReview: !paper.needsReview });
-          }}
-          aria-label={paper.needsReview ? "Mark reviewed" : "Mark needs review"}
-        >
-          <AlertCircle size={15} />
         </button>
       </td>
       <td title={authorLine || "No authors"}>{authorLine || "No authors"}</td>

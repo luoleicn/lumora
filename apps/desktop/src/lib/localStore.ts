@@ -90,7 +90,7 @@ export async function importPdfFile(current: LibraryState, file: File): Promise<
     tags: [],
     keywords: [],
     favorite: false,
-    needsReview: true,
+    needsReview: false,
     unread: true,
     createdAt: now,
     updatedAt: now

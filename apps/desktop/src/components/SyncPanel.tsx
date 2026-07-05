@@ -270,14 +270,6 @@ function DetailsTab({
           <input type="checkbox" checked={Boolean(paper.favorite)} onChange={(event) => updatePaper({ favorite: event.target.checked })} />
           Favorite
         </label>
-        <label>
-          <input
-            type="checkbox"
-            checked={Boolean(paper.needsReview)}
-            onChange={(event) => updatePaper({ needsReview: event.target.checked })}
-          />
-          Needs Review
-        </label>
       </div>
       <p className="details-file">File: {fileAsset?.fileName ?? "No file attached"}</p>
     </div>
