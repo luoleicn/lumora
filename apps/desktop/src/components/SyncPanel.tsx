@@ -143,6 +143,8 @@ function DetailsTab({
 }) {
   const [arxivLookupStatus, setArxivLookupStatus] = useState<string>();
   const [arxivLookupBusy, setArxivLookupBusy] = useState(false);
+  const [arxivResults, setArxivResults] = useState<ArxivMetadata[]>([]);
+  const [arxivResultsOpen, setArxivResultsOpen] = useState(false);
   const [pdfMetadataStatus, setPdfMetadataStatus] = useState<string>();
   const [pdfMetadataBusy, setPdfMetadataBusy] = useState(false);
 
@@ -166,21 +168,29 @@ function DetailsTab({
 
     setArxivLookupBusy(true);
     setArxivLookupStatus(undefined);
+    setArxivResults([]);
+    setArxivResultsOpen(false);
     try {
       const results = await searchArxivMetadata(settings, currentPaper.title);
-      const bestMatch = results[0];
-      if (!bestMatch) {
+      if (results.length === 0) {
         setArxivLookupStatus("No arXiv match found.");
         return;
       }
 
-      updatePaper(arxivMetadataToPaperPatch(bestMatch));
-      setArxivLookupStatus(`Matched arXiv:${bestMatch.arxivId}`);
+      setArxivResults(results);
+      setArxivResultsOpen(true);
+      setArxivLookupStatus(`${results.length} arXiv matches found. Choose one to fill metadata.`);
     } catch (error) {
       setArxivLookupStatus(error instanceof Error ? error.message : "arXiv lookup failed.");
     } finally {
       setArxivLookupBusy(false);
     }
+  }
+
+  function handleSelectArxivResult(metadata: ArxivMetadata) {
+    updatePaper(arxivMetadataToPaperPatch(metadata));
+    setArxivResultsOpen(false);
+    setArxivLookupStatus(`Applied arXiv:${metadata.arxivId}`);
   }
 
   async function handlePdfMetadataExtract() {
@@ -225,6 +235,31 @@ function DetailsTab({
       </div>
       {pdfMetadataStatus && <p className="metadata-lookup-status">{pdfMetadataStatus}</p>}
       {arxivLookupStatus && <p className="metadata-lookup-status">{arxivLookupStatus}</p>}
+      {arxivResultsOpen && (
+        <div className="arxiv-results-popover">
+          <header>
+            <strong>arXiv matches</strong>
+            <button type="button" onClick={() => setArxivResultsOpen(false)} aria-label="Close arXiv results">
+              ×
+            </button>
+          </header>
+          <div className="arxiv-results-list">
+            {arxivResults.map((result) => (
+              <article key={result.arxivId} className="arxiv-result">
+                <button type="button" onClick={() => handleSelectArxivResult(result)}>
+                  <span>{result.title}</span>
+                  <small>
+                    arXiv:{result.arxivId}
+                    {result.year ? ` · ${result.year}` : ""}
+                    {result.authors.length > 0 ? ` · ${formatAuthorPreview(result.authors.map((author) => author.fullName))}` : ""}
+                  </small>
+                  {result.abstract && <p>{result.abstract}</p>}
+                </button>
+              </article>
+            ))}
+          </div>
+        </div>
+      )}
       <label>
         Type
         <select value={paper.documentType ?? "journalArticle"} onChange={(event) => updatePaper({ documentType: event.target.value })}>
@@ -352,6 +387,14 @@ function clean(value: string) {
 
 function splitList(value: string) {
   return value.split(/[,;]/).map((item) => item.trim()).filter(Boolean);
+}
+
+function formatAuthorPreview(authors: string[]) {
+  if (authors.length <= 3) {
+    return authors.join(", ");
+  }
+
+  return `${authors.slice(0, 3).join(", ")} et al.`;
 }
 
 function NotesTab({
