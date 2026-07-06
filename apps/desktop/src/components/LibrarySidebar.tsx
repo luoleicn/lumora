@@ -25,6 +25,7 @@ type LibrarySidebarProps = {
   onSelectAuthor: (author?: string) => void;
   onSelectTag: (tag?: string) => void;
   onCreateCollection: (parentId?: string) => void;
+  onDeleteCollection: (collectionId: string) => void;
 };
 
 export function LibrarySidebar({
@@ -35,7 +36,8 @@ export function LibrarySidebar({
   onSelectCollection,
   onSelectAuthor,
   onSelectTag,
-  onCreateCollection
+  onCreateCollection,
+  onDeleteCollection
 }: LibrarySidebarProps) {
   const [authorsExpanded, setAuthorsExpanded] = useState(true);
   const [tagsExpanded, setTagsExpanded] = useState(true);
@@ -116,6 +118,7 @@ export function LibrarySidebar({
                 }}
                 onSelectCollection={onSelectCollection}
                 onCreateCollection={onCreateCollection}
+                onDeleteCollection={onDeleteCollection}
               />
             ))}
           </div>
@@ -225,7 +228,8 @@ function CollectionTreeNode({
   getCount,
   onToggle,
   onSelectCollection,
-  onCreateCollection
+  onCreateCollection,
+  onDeleteCollection
 }: {
   node: CollectionNode;
   depth: number;
@@ -235,6 +239,7 @@ function CollectionTreeNode({
   onToggle: (collectionId: string) => void;
   onSelectCollection: (id: string) => void;
   onCreateCollection: (parentId?: string) => void;
+  onDeleteCollection: (collectionId: string) => void;
 }) {
   const { collection, children } = node;
   const collapsed = Boolean(collapsedCollections[collection.id]);
@@ -275,6 +280,19 @@ function CollectionTreeNode({
         >
           <FolderPlus size={14} />
         </button>
+        {collection.id !== "collection_inbox" ? (
+          <button
+            className="collection-delete-button"
+            type="button"
+            onClick={() => onDeleteCollection(collection.id)}
+            aria-label={`Delete ${collection.name}`}
+            title={`Delete ${collection.name}`}
+          >
+            <Trash2 size={14} />
+          </button>
+        ) : (
+          <span className="collection-action-spacer" />
+        )}
       </div>
       {hasChildren && !collapsed && children.map((child) => (
         <CollectionTreeNode
@@ -287,6 +305,7 @@ function CollectionTreeNode({
           onToggle={onToggle}
           onSelectCollection={onSelectCollection}
           onCreateCollection={onCreateCollection}
+          onDeleteCollection={onDeleteCollection}
         />
       ))}
     </>

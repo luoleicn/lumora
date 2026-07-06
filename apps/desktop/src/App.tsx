@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Annotation, Collection, FileAsset, LibraryState, Paper } from "@lumora/shared";
 import { FileText, X } from "lucide-react";
 import { AppToolbar } from "./components/AppToolbar";
-import { CollectionModal } from "./components/CollectionModal";
+import { CollectionModal, DeleteCollectionModal } from "./components/CollectionModal";
 import { LibrarySidebar } from "./components/LibrarySidebar";
 import { ManualReferenceModal, type ManualReferenceDraft } from "./components/ManualReferenceModal";
 import { NotebookPanel } from "./components/NotebookPanel";
@@ -86,6 +86,7 @@ export default function App() {
   const [manualModalOpen, setManualModalOpen] = useState(false);
   const [collectionModalParentId, setCollectionModalParentId] = useState<string | undefined>();
   const [collectionModalOpen, setCollectionModalOpen] = useState(false);
+  const [deleteCollectionId, setDeleteCollectionId] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string>();
 
@@ -389,6 +390,73 @@ export default function App() {
     setStatus(parent ? `Created folder in ${parent.name}.` : "Created folder.");
   }
 
+  function handleRequestDeleteCollection(collectionId: string) {
+    if (collectionId === "collection_inbox") {
+      setStatus("Inbox is a system folder and cannot be deleted.");
+      return;
+    }
+
+    setDeleteCollectionId(collectionId);
+  }
+
+  function handleDeleteCollection() {
+    if (!deleteCollectionId) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const target = library.collections.find((collection) => collection.id === deleteCollectionId && !collection.deletedAt);
+    if (!target || target.id === "collection_inbox") {
+      setDeleteCollectionId(undefined);
+      return;
+    }
+
+    const parentId = target.parentId;
+    setLibrary((current) => {
+      const activeParentPaperIds = new Set(
+        parentId
+          ? current.paperCollections
+            .filter((item) => !item.deletedAt && item.collectionId === parentId)
+            .map((item) => item.paperId)
+          : []
+      );
+
+      return {
+        ...current,
+        collections: current.collections.map((collection) => {
+          if (collection.id === target.id) {
+            return { ...collection, deletedAt: now, updatedAt: now };
+          }
+
+          if (!collection.deletedAt && collection.parentId === target.id) {
+            return { ...collection, parentId, updatedAt: now };
+          }
+
+          return collection;
+        }),
+        paperCollections: current.paperCollections.map((paperCollection) => {
+          if (paperCollection.deletedAt || paperCollection.collectionId !== target.id) {
+            return paperCollection;
+          }
+
+          if (!parentId || activeParentPaperIds.has(paperCollection.paperId)) {
+            return { ...paperCollection, deletedAt: now, updatedAt: now };
+          }
+
+          activeParentPaperIds.add(paperCollection.paperId);
+          return { ...paperCollection, collectionId: parentId, updatedAt: now };
+        })
+      };
+    });
+
+    if (selectedCollectionId === target.id) {
+      setSelectedCollectionId(parentId ?? "unsorted");
+    }
+
+    setDeleteCollectionId(undefined);
+    setStatus(parentId ? "Deleted folder and moved papers to parent folder." : "Deleted folder and moved papers to Unsorted.");
+  }
+
   function handleCreateAnnotation(annotation: Annotation) {
     setLibrary((current) => ({
       ...current,
@@ -582,6 +650,7 @@ export default function App() {
               onSelectAuthor={setSelectedAuthor}
               onSelectTag={setSelectedTag}
               onCreateCollection={handleCreateCollection}
+              onDeleteCollection={handleRequestDeleteCollection}
             />
           )}
 
@@ -671,6 +740,15 @@ export default function App() {
           setCollectionModalParentId(undefined);
         }}
         onSave={handleSaveCollection}
+      />
+      <DeleteCollectionModal
+        open={Boolean(deleteCollectionId)}
+        collectionName={library.collections.find((collection) => collection.id === deleteCollectionId)?.name}
+        parentName={library.collections.find((collection) =>
+          collection.id === library.collections.find((item) => item.id === deleteCollectionId)?.parentId
+        )?.name}
+        onClose={() => setDeleteCollectionId(undefined)}
+        onDelete={handleDeleteCollection}
       />
     </main>
   );

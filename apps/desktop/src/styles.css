@@ -343,7 +343,7 @@ button {
 
 .collection-tree-row {
   display: grid;
-  grid-template-columns: 18px minmax(0, 1fr) 28px;
+  grid-template-columns: 18px minmax(0, 1fr) 28px 28px;
   align-items: center;
   gap: 3px;
 }
@@ -370,7 +370,8 @@ button {
 }
 
 .collection-toggle,
-.collection-child-button {
+.collection-child-button,
+.collection-delete-button {
   display: grid;
   width: 26px;
   height: 30px;
@@ -382,6 +383,11 @@ button {
   padding: 0;
 }
 
+.collection-action-spacer {
+  width: 26px;
+  height: 30px;
+}
+
 .collection-toggle-spacer {
   width: 18px;
   height: 30px;
@@ -391,6 +397,11 @@ button {
 .collection-child-button:hover {
   background: #33414f;
   color: #ffffff;
+}
+
+.collection-delete-button:hover {
+  background: #5b2d32;
+  color: #ffd6d6;
 }
 
 .collection-button strong {
@@ -1837,6 +1848,13 @@ button:disabled {
   padding: 0 10px;
 }
 
+.modal-copy {
+  margin: 0;
+  color: #3e4852;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .manual-modal footer {
   border-top: 1px solid #dce3ea;
   border-bottom: 0;
@@ -1859,6 +1877,12 @@ button:disabled {
 .manual-modal footer button.primary {
   border-color: #287d65;
   background: #287d65;
+  color: #ffffff;
+}
+
+.manual-modal footer button.danger {
+  border-color: #b84a4a;
+  background: #b84a4a;
   color: #ffffff;
 }
 

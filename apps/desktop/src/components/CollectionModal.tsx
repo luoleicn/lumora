@@ -1,4 +1,4 @@
-import { FolderPlus, X } from "lucide-react";
+import { FolderPlus, Trash2, X } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 
 type CollectionModalProps = {
@@ -61,6 +61,52 @@ export function CollectionModal({ open, parentName, onClose, onSave }: Collectio
           </button>
         </footer>
       </form>
+    </div>
+  );
+}
+
+type DeleteCollectionModalProps = {
+  open: boolean;
+  collectionName?: string;
+  parentName?: string;
+  onClose: () => void;
+  onDelete: () => void;
+};
+
+export function DeleteCollectionModal({ open, collectionName, parentName, onClose, onDelete }: DeleteCollectionModalProps) {
+  if (!open) {
+    return null;
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <div className="manual-modal collection-modal" role="dialog" aria-modal="true" aria-label="Delete folder">
+        <header>
+          <div>
+            <h2>Delete Folder</h2>
+            <p>{collectionName ? `Delete ${collectionName}` : "Delete this folder"}</p>
+          </div>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Close">
+            <X size={16} />
+          </button>
+        </header>
+
+        <div className="collection-modal-body">
+          <p className="modal-copy">
+            Papers in this folder will move to {parentName ? parentName : "Unsorted"}. Nested folders will move up one level.
+          </p>
+        </div>
+
+        <footer>
+          <button type="button" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="button" className="danger" onClick={onDelete}>
+            <Trash2 size={16} />
+            Delete
+          </button>
+        </footer>
+      </div>
     </div>
   );
 }
