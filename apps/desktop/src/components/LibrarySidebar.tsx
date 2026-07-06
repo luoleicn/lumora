@@ -24,7 +24,7 @@ type LibrarySidebarProps = {
   onSelectCollection: (id: string) => void;
   onSelectAuthor: (author?: string) => void;
   onSelectTag: (tag?: string) => void;
-  onCreateCollection: () => void;
+  onCreateCollection: (parentId?: string) => void;
 };
 
 export function LibrarySidebar({
@@ -39,9 +39,11 @@ export function LibrarySidebar({
 }: LibrarySidebarProps) {
   const [authorsExpanded, setAuthorsExpanded] = useState(true);
   const [tagsExpanded, setTagsExpanded] = useState(true);
+  const [collapsedCollections, setCollapsedCollections] = useState<Record<string, boolean>>({});
   const collections = state.collections
     .filter((collection) => !collection.deletedAt)
     .sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
+  const collectionTree = buildCollectionTree(collections);
   const activePapers = state.papers.filter((paper) => !paper.deletedAt);
   const deletedPapers = state.papers.filter((paper) => paper.deletedAt);
   const unfiledPaperCount = activePapers.filter(
@@ -100,18 +102,26 @@ export function LibrarySidebar({
 
         <div className="nav-section">
           <h2>Folders</h2>
-        {collections.map((collection) => (
-          <CollectionButton
-            key={collection.id}
-            collection={collection}
-            active={selectedCollectionId === collection.id}
-            count={state.paperCollections.filter((item) => item.collectionId === collection.id && !item.deletedAt).length}
-            onClick={() => onSelectCollection(collection.id)}
-          />
-        ))}
-          <button className="new-folder-button inline" type="button" onClick={onCreateCollection}>
+          <div className="collection-tree">
+            {collectionTree.map((node) => (
+              <CollectionTreeNode
+                key={node.collection.id}
+                node={node}
+                depth={0}
+                selectedCollectionId={selectedCollectionId}
+                collapsedCollections={collapsedCollections}
+                getCount={(collectionId) => getCollectionPaperCount(state, collections, collectionId)}
+                onToggle={(collectionId) => {
+                  setCollapsedCollections((current) => ({ ...current, [collectionId]: !current[collectionId] }));
+                }}
+                onSelectCollection={onSelectCollection}
+                onCreateCollection={onCreateCollection}
+              />
+            ))}
+          </div>
+          <button className="new-folder-button inline" type="button" onClick={() => onCreateCollection()}>
             <FolderPlus size={16} />
-            Create Folder...
+            Create Top Folder...
           </button>
         </div>
 
@@ -202,24 +212,143 @@ export function LibrarySidebar({
   );
 }
 
-function CollectionButton({
-  collection,
-  active,
-  count,
-  onClick
-}: {
+type CollectionNode = {
   collection: Collection;
-  active: boolean;
-  count: number;
-  onClick: () => void;
+  children: CollectionNode[];
+};
+
+function CollectionTreeNode({
+  node,
+  depth,
+  selectedCollectionId,
+  collapsedCollections,
+  getCount,
+  onToggle,
+  onSelectCollection,
+  onCreateCollection
+}: {
+  node: CollectionNode;
+  depth: number;
+  selectedCollectionId: string;
+  collapsedCollections: Record<string, boolean>;
+  getCount: (collectionId: string) => number;
+  onToggle: (collectionId: string) => void;
+  onSelectCollection: (id: string) => void;
+  onCreateCollection: (parentId?: string) => void;
 }) {
+  const { collection, children } = node;
+  const collapsed = Boolean(collapsedCollections[collection.id]);
+  const hasChildren = children.length > 0;
+
   return (
-    <button className={active ? "collection-button active" : "collection-button"} type="button" onClick={onClick}>
-      <Folder size={16} />
-      <span>{collection.name}</span>
-      <strong>{count}</strong>
-    </button>
+    <>
+      <div className="collection-tree-row" style={{ paddingLeft: `${depth * 14}px` }}>
+        {hasChildren ? (
+          <button
+            className="collection-toggle"
+            type="button"
+            onClick={() => onToggle(collection.id)}
+            aria-label={collapsed ? `Expand ${collection.name}` : `Collapse ${collection.name}`}
+            aria-expanded={!collapsed}
+          >
+            {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+          </button>
+        ) : (
+          <span className="collection-toggle-spacer" />
+        )}
+        <button
+          className={selectedCollectionId === collection.id ? "collection-button active" : "collection-button"}
+          type="button"
+          onClick={() => onSelectCollection(collection.id)}
+          title={collection.name}
+        >
+          <Folder size={16} />
+          <span>{collection.name}</span>
+          <strong>{getCount(collection.id)}</strong>
+        </button>
+        <button
+          className="collection-child-button"
+          type="button"
+          onClick={() => onCreateCollection(collection.id)}
+          aria-label={`Create folder under ${collection.name}`}
+          title={`Create folder under ${collection.name}`}
+        >
+          <FolderPlus size={14} />
+        </button>
+      </div>
+      {hasChildren && !collapsed && children.map((child) => (
+        <CollectionTreeNode
+          key={child.collection.id}
+          node={child}
+          depth={depth + 1}
+          selectedCollectionId={selectedCollectionId}
+          collapsedCollections={collapsedCollections}
+          getCount={getCount}
+          onToggle={onToggle}
+          onSelectCollection={onSelectCollection}
+          onCreateCollection={onCreateCollection}
+        />
+      ))}
+    </>
   );
+}
+
+function buildCollectionTree(collections: Collection[]): CollectionNode[] {
+  const nodes = new Map(collections.map((collection) => [collection.id, { collection, children: [] as CollectionNode[] }]));
+  const roots: CollectionNode[] = [];
+
+  for (const collection of collections) {
+    const node = nodes.get(collection.id);
+    if (!node) {
+      continue;
+    }
+
+    const parent = collection.parentId ? nodes.get(collection.parentId) : undefined;
+    if (parent && parent.collection.id !== collection.id && !wouldCreateCollectionCycle(collections, collection.id, parent.collection.id)) {
+      parent.children.push(node);
+    } else {
+      roots.push(node);
+    }
+  }
+
+  return roots;
+}
+
+function getCollectionPaperCount(state: LibraryState, collections: Collection[], collectionId: string) {
+  const collectionIds = getCollectionAndDescendantIds(collections, collectionId);
+  return state.paperCollections.filter((item) => collectionIds.has(item.collectionId) && !item.deletedAt).length;
+}
+
+function getCollectionAndDescendantIds(collections: Collection[], collectionId: string) {
+  const ids = new Set<string>([collectionId]);
+  let added = true;
+
+  while (added) {
+    added = false;
+    for (const collection of collections) {
+      if (collection.parentId && ids.has(collection.parentId) && !ids.has(collection.id)) {
+        ids.add(collection.id);
+        added = true;
+      }
+    }
+  }
+
+  return ids;
+}
+
+function wouldCreateCollectionCycle(collections: Collection[], collectionId: string, parentId: string) {
+  const collectionById = new Map(collections.map((collection) => [collection.id, collection]));
+  let currentId: string | undefined = parentId;
+
+  while (currentId) {
+    if (currentId === collectionId) {
+      return true;
+    }
+
+    currentId = collectionById.get(currentId)?.parentId;
+  }
+
+  return false;
 }
 
 function NavButton({

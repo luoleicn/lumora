@@ -166,9 +166,10 @@ export default function App() {
 
   const filteredPapers = useMemo(() => {
     const query = search.trim().toLowerCase();
+    const selectedCollectionIds = getCollectionAndDescendantIds(library.collections, selectedCollectionId);
     const collectionPaperIds = new Set(
       library.paperCollections
-        .filter((item) => !item.deletedAt && item.collectionId === selectedCollectionId)
+        .filter((item) => !item.deletedAt && selectedCollectionIds.has(item.collectionId))
         .map((item) => item.paperId)
     );
     const isTrash = selectedCollectionId === "trash";
@@ -351,17 +352,20 @@ export default function App() {
     setStatus("Manual entry added.");
   }
 
-  function handleCreateCollection() {
-    const name = window.prompt("Collection name");
+  function handleCreateCollection(parentId?: string) {
+    const parent = parentId ? library.collections.find((collection) => collection.id === parentId && !collection.deletedAt) : undefined;
+    const name = window.prompt(parent ? `Folder name under ${parent.name}` : "Folder name");
     if (!name?.trim()) {
       return;
     }
 
     const now = new Date().toISOString();
+    const siblingCount = library.collections.filter((item) => !item.deletedAt && item.parentId === parent?.id).length;
     const collection: Collection = {
       id: createId("collection"),
       name: name.trim(),
-      sortOrder: library.collections.length,
+      parentId: parent?.id,
+      sortOrder: siblingCount,
       createdAt: now,
       updatedAt: now
     };
@@ -690,6 +694,23 @@ function PanelFragment({
       )}
     </>
   );
+}
+
+function getCollectionAndDescendantIds(collections: Collection[], collectionId: string) {
+  const ids = new Set<string>([collectionId]);
+  let added = true;
+
+  while (added) {
+    added = false;
+    for (const collection of collections) {
+      if (!collection.deletedAt && collection.parentId && ids.has(collection.parentId) && !ids.has(collection.id)) {
+        ids.add(collection.id);
+        added = true;
+      }
+    }
+  }
+
+  return ids;
 }
 
 function WorkspaceTabs({

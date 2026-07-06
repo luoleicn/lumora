@@ -10,7 +10,7 @@ type AppToolbarProps = {
   onAddManual: () => void;
   onImportReferences: () => void;
   onOpenNotebook: () => void;
-  onCreateCollection: () => void;
+  onCreateCollection: (parentId?: string) => void;
   onSync: () => void;
   onConnectMendeley: () => void;
   onImportMendeley: () => void;
@@ -63,7 +63,7 @@ export function AppToolbar({
             </div>
           )}
         </div>
-        <button type="button" className="toolbar-command" onClick={onCreateCollection}>
+        <button type="button" className="toolbar-command" onClick={() => onCreateCollection()}>
           <FolderPlus size={16} />
           Folders
         </button>

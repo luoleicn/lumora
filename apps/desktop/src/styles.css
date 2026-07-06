@@ -335,6 +335,19 @@ button {
   text-transform: uppercase;
 }
 
+.collection-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.collection-tree-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 3px;
+}
+
 .collection-button,
 .new-folder-button {
   display: grid;
@@ -349,6 +362,35 @@ button {
   background: transparent;
   padding: 8px 9px;
   text-align: left;
+}
+
+.collection-tree-row .collection-button {
+  min-height: 34px;
+  padding: 7px 8px;
+}
+
+.collection-toggle,
+.collection-child-button {
+  display: grid;
+  width: 26px;
+  height: 30px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #aeb8c2;
+  padding: 0;
+}
+
+.collection-toggle-spacer {
+  width: 18px;
+  height: 30px;
+}
+
+.collection-toggle:hover,
+.collection-child-button:hover {
+  background: #33414f;
+  color: #ffffff;
 }
 
 .collection-button strong {
