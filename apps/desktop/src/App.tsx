@@ -10,6 +10,7 @@ import { PaperList } from "./components/PaperList";
 import { PdfReader } from "./components/PdfReader";
 import { SyncPanel } from "./components/SyncPanel";
 import { createId } from "./lib/id";
+import { addPaperToCollection, deleteCollectionAndReassignPapers, getCollectionAndDescendantIds } from "./lib/libraryActions";
 import {
   getFileBytes,
   importPdfFile,
@@ -404,7 +405,6 @@ export default function App() {
       return;
     }
 
-    const now = new Date().toISOString();
     const target = library.collections.find((collection) => collection.id === deleteCollectionId && !collection.deletedAt);
     if (!target || target.id === "collection_inbox") {
       setDeleteCollectionId(undefined);
@@ -412,42 +412,7 @@ export default function App() {
     }
 
     const parentId = target.parentId;
-    setLibrary((current) => {
-      const activeParentPaperIds = new Set(
-        parentId
-          ? current.paperCollections
-            .filter((item) => !item.deletedAt && item.collectionId === parentId)
-            .map((item) => item.paperId)
-          : []
-      );
-
-      return {
-        ...current,
-        collections: current.collections.map((collection) => {
-          if (collection.id === target.id) {
-            return { ...collection, deletedAt: now, updatedAt: now };
-          }
-
-          if (!collection.deletedAt && collection.parentId === target.id) {
-            return { ...collection, parentId, updatedAt: now };
-          }
-
-          return collection;
-        }),
-        paperCollections: current.paperCollections.map((paperCollection) => {
-          if (paperCollection.deletedAt || paperCollection.collectionId !== target.id) {
-            return paperCollection;
-          }
-
-          if (!parentId || activeParentPaperIds.has(paperCollection.paperId)) {
-            return { ...paperCollection, deletedAt: now, updatedAt: now };
-          }
-
-          activeParentPaperIds.add(paperCollection.paperId);
-          return { ...paperCollection, collectionId: parentId, updatedAt: now };
-        })
-      };
-    });
+    setLibrary((current) => deleteCollectionAndReassignPapers(current, target.id));
 
     if (selectedCollectionId === target.id) {
       setSelectedCollectionId(parentId ?? "unsorted");
@@ -455,6 +420,18 @@ export default function App() {
 
     setDeleteCollectionId(undefined);
     setStatus(parentId ? "Deleted folder and moved papers to parent folder." : "Deleted folder and moved papers to Unsorted.");
+  }
+
+  function handleAddPaperToCollection(paperId: string, collectionId: string) {
+    const nextLibrary = addPaperToCollection(library, paperId, collectionId);
+    const added = nextLibrary !== library;
+    setLibrary(nextLibrary);
+    const paper = library.papers.find((item) => item.id === paperId);
+    const collection = library.collections.find((item) => item.id === collectionId);
+    setStatus(added
+      ? `Added ${paper?.title ?? "paper"} to ${collection?.name ?? "folder"}.`
+      : "Paper is already in that folder."
+    );
   }
 
   function handleCreateAnnotation(annotation: Annotation) {
@@ -651,6 +628,7 @@ export default function App() {
               onSelectTag={setSelectedTag}
               onCreateCollection={handleCreateCollection}
               onDeleteCollection={handleRequestDeleteCollection}
+              onAddPaperToCollection={handleAddPaperToCollection}
             />
           )}
 
@@ -794,23 +772,6 @@ function PanelFragment({
       )}
     </>
   );
-}
-
-function getCollectionAndDescendantIds(collections: Collection[], collectionId: string) {
-  const ids = new Set<string>([collectionId]);
-  let added = true;
-
-  while (added) {
-    added = false;
-    for (const collection of collections) {
-      if (!collection.deletedAt && collection.parentId && ids.has(collection.parentId) && !ids.has(collection.id)) {
-        ids.add(collection.id);
-        added = true;
-      }
-    }
-  }
-
-  return ids;
 }
 
 function WorkspaceTabs({

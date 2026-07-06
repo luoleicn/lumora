@@ -346,6 +346,11 @@ button {
   grid-template-columns: 18px minmax(0, 1fr) 28px 28px;
   align-items: center;
   gap: 3px;
+  border-radius: 7px;
+}
+
+.collection-tree-row.drag-over {
+  background: rgba(50, 124, 101, 0.28);
 }
 
 .collection-button,
@@ -367,6 +372,12 @@ button {
 .collection-tree-row .collection-button {
   min-height: 34px;
   padding: 7px 8px;
+}
+
+.collection-tree-row .collection-button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .collection-toggle,

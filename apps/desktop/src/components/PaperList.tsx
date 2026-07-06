@@ -265,8 +265,14 @@ function PaperRow({
   return (
     <tr
       className={`${active ? "active " : ""}${paper.unread ? "unread" : ""}`}
+      draggable
       onClick={onClick}
       onDoubleClick={onDoubleClick}
+      onDragStart={(event) => {
+        event.dataTransfer.effectAllowed = "copy";
+        event.dataTransfer.setData("application/x-lumora-paper-id", paper.id);
+        event.dataTransfer.setData("text/plain", paper.title);
+      }}
     >
       <td>
         <button

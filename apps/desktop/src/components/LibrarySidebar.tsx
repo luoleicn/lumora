@@ -26,6 +26,7 @@ type LibrarySidebarProps = {
   onSelectTag: (tag?: string) => void;
   onCreateCollection: (parentId?: string) => void;
   onDeleteCollection: (collectionId: string) => void;
+  onAddPaperToCollection: (paperId: string, collectionId: string) => void;
 };
 
 export function LibrarySidebar({
@@ -37,7 +38,8 @@ export function LibrarySidebar({
   onSelectAuthor,
   onSelectTag,
   onCreateCollection,
-  onDeleteCollection
+  onDeleteCollection,
+  onAddPaperToCollection
 }: LibrarySidebarProps) {
   const [authorsExpanded, setAuthorsExpanded] = useState(true);
   const [tagsExpanded, setTagsExpanded] = useState(true);
@@ -119,6 +121,7 @@ export function LibrarySidebar({
                 onSelectCollection={onSelectCollection}
                 onCreateCollection={onCreateCollection}
                 onDeleteCollection={onDeleteCollection}
+                onAddPaperToCollection={onAddPaperToCollection}
               />
             ))}
           </div>
@@ -229,7 +232,8 @@ function CollectionTreeNode({
   onToggle,
   onSelectCollection,
   onCreateCollection,
-  onDeleteCollection
+  onDeleteCollection,
+  onAddPaperToCollection
 }: {
   node: CollectionNode;
   depth: number;
@@ -240,14 +244,37 @@ function CollectionTreeNode({
   onSelectCollection: (id: string) => void;
   onCreateCollection: (parentId?: string) => void;
   onDeleteCollection: (collectionId: string) => void;
+  onAddPaperToCollection: (paperId: string, collectionId: string) => void;
 }) {
   const { collection, children } = node;
   const collapsed = Boolean(collapsedCollections[collection.id]);
   const hasChildren = children.length > 0;
+  const [dragOver, setDragOver] = useState(false);
 
   return (
     <>
-      <div className="collection-tree-row" style={{ paddingLeft: `${depth * 14}px` }}>
+      <div
+        className={dragOver ? "collection-tree-row drag-over" : "collection-tree-row"}
+        style={{ paddingLeft: `${depth * 14}px` }}
+        onDragOver={(event) => {
+          if (event.dataTransfer.types.includes("application/x-lumora-paper-id")) {
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "copy";
+            setDragOver(true);
+          }
+        }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(event) => {
+          const paperId = event.dataTransfer.getData("application/x-lumora-paper-id");
+          setDragOver(false);
+          if (!paperId) {
+            return;
+          }
+
+          event.preventDefault();
+          onAddPaperToCollection(paperId, collection.id);
+        }}
+      >
         {hasChildren ? (
           <button
             className="collection-toggle"
@@ -306,6 +333,7 @@ function CollectionTreeNode({
           onSelectCollection={onSelectCollection}
           onCreateCollection={onCreateCollection}
           onDeleteCollection={onDeleteCollection}
+          onAddPaperToCollection={onAddPaperToCollection}
         />
       ))}
     </>
