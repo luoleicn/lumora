@@ -104,6 +104,32 @@ export default function App() {
   }, [workspaceLayout]);
 
   useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const isApplePlatform = /Mac|iPhone|iPad|iPod/i.test(navigator.platform);
+      const detailsShortcut = event.key.toLowerCase() === "i"
+        && (isApplePlatform ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey)
+        && !event.altKey
+        && !event.shiftKey;
+
+      if (!detailsShortcut) {
+        return;
+      }
+
+      event.preventDefault();
+      setWorkspaceLayout((current) => ({
+        ...current,
+        visible: {
+          ...current.visible,
+          sync: !current.visible.sync
+        }
+      }));
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  useEffect(() => {
     if (!resizeDrag) {
       return;
     }
