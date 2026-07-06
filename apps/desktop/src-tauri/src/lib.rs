@@ -1,3 +1,11 @@
+use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID, WINDOW_SUBMENU_ID};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
+
+const PDF_VIEW_EVENT: &str = "lumora-pdf-view-command";
+const PDF_VIEW_FIT_WIDTH: &str = "pdf-view-fit-width";
+const PDF_VIEW_GO_TO_PAGE: &str = "pdf-view-go-to-page";
+const PDF_VIEW_ZOOM_PREFIX: &str = "pdf-view-zoom-";
+
 #[tauri::command]
 fn ping() -> &'static str {
     "lumora-ready"
@@ -67,9 +75,117 @@ async fn search_arxiv_by_title(title: String) -> Result<Vec<ArxivMetadata>, Stri
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .menu(build_menu)
+        .on_menu_event(|app, event| {
+            let id = event.id().as_ref();
+            if id == PDF_VIEW_FIT_WIDTH {
+                let _ = app.emit(PDF_VIEW_EVENT, "fit-width");
+            } else if id == PDF_VIEW_GO_TO_PAGE {
+                let _ = app.emit(PDF_VIEW_EVENT, "go-to-page");
+            } else if let Some(zoom) = id.strip_prefix(PDF_VIEW_ZOOM_PREFIX) {
+                let _ = app.emit(PDF_VIEW_EVENT, format!("zoom:{zoom}"));
+            }
+        })
         .invoke_handler(tauri::generate_handler![ping, search_arxiv_by_title])
         .run(tauri::generate_context!())
         .expect("error while running lumora");
+}
+
+#[cfg(desktop)]
+fn build_menu<R: Runtime>(app_handle: &AppHandle<R>) -> tauri::Result<Menu<R>> {
+    let pkg_info = app_handle.package_info();
+    let app_menu = Submenu::with_items(
+        app_handle,
+        pkg_info.name.clone(),
+        true,
+        &[
+            &PredefinedMenuItem::about(app_handle, None, Some(about_metadata(app_handle)))?,
+            &PredefinedMenuItem::separator(app_handle)?,
+            &PredefinedMenuItem::services(app_handle, None)?,
+            &PredefinedMenuItem::separator(app_handle)?,
+            &PredefinedMenuItem::hide(app_handle, None)?,
+            &PredefinedMenuItem::hide_others(app_handle, None)?,
+            &PredefinedMenuItem::separator(app_handle)?,
+            &PredefinedMenuItem::quit(app_handle, None)?,
+        ],
+    )?;
+
+    let edit_menu = Submenu::with_items(
+        app_handle,
+        "Edit",
+        true,
+        &[
+            &PredefinedMenuItem::undo(app_handle, None)?,
+            &PredefinedMenuItem::redo(app_handle, None)?,
+            &PredefinedMenuItem::separator(app_handle)?,
+            &PredefinedMenuItem::cut(app_handle, None)?,
+            &PredefinedMenuItem::copy(app_handle, None)?,
+            &PredefinedMenuItem::paste(app_handle, None)?,
+            &PredefinedMenuItem::select_all(app_handle, None)?,
+        ],
+    )?;
+
+    let view_menu = Submenu::with_items(
+        app_handle,
+        "View",
+        true,
+        &[
+            &MenuItem::with_id(app_handle, PDF_VIEW_FIT_WIDTH, "Fit Width", true, Some("CmdOrCtrl+0"))?,
+            &zoom_menu(app_handle)?,
+            &MenuItem::with_id(app_handle, PDF_VIEW_GO_TO_PAGE, "Go to Page...", true, Some("CmdOrCtrl+G"))?,
+            &PredefinedMenuItem::separator(app_handle)?,
+            &PredefinedMenuItem::fullscreen(app_handle, None)?,
+        ],
+    )?;
+
+    let window_menu = Submenu::with_id_and_items(
+        app_handle,
+        WINDOW_SUBMENU_ID,
+        "Window",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(app_handle, None)?,
+            &PredefinedMenuItem::maximize(app_handle, None)?,
+            &PredefinedMenuItem::separator(app_handle)?,
+            &PredefinedMenuItem::close_window(app_handle, None)?,
+        ],
+    )?;
+
+    let help_menu = Submenu::with_id_and_items(app_handle, HELP_SUBMENU_ID, "Help", true, &[])?;
+
+    Menu::with_items(app_handle, &[&app_menu, &edit_menu, &view_menu, &window_menu, &help_menu])
+}
+
+#[cfg(desktop)]
+fn zoom_menu<R: Runtime, M: Manager<R>>(manager: &M) -> tauri::Result<Submenu<R>> {
+    Submenu::with_items(
+        manager,
+        "Zoom",
+        true,
+        &[
+            &MenuItem::with_id(manager, "pdf-view-zoom-0.75", "75%", true, None::<&str>)?,
+            &MenuItem::with_id(manager, "pdf-view-zoom-0.9", "90%", true, None::<&str>)?,
+            &MenuItem::with_id(manager, "pdf-view-zoom-1", "100%", true, Some("CmdOrCtrl+1"))?,
+            &MenuItem::with_id(manager, "pdf-view-zoom-1.1", "110%", true, None::<&str>)?,
+            &MenuItem::with_id(manager, "pdf-view-zoom-1.25", "125%", true, None::<&str>)?,
+            &MenuItem::with_id(manager, "pdf-view-zoom-1.5", "150%", true, None::<&str>)?,
+            &MenuItem::with_id(manager, "pdf-view-zoom-1.75", "175%", true, None::<&str>)?,
+            &MenuItem::with_id(manager, "pdf-view-zoom-2", "200%", true, None::<&str>)?,
+        ],
+    )
+}
+
+#[cfg(desktop)]
+fn about_metadata<R: Runtime>(app_handle: &AppHandle<R>) -> AboutMetadata<'_> {
+    let pkg_info = app_handle.package_info();
+    let config = app_handle.config();
+    AboutMetadata {
+        name: Some(pkg_info.name.clone()),
+        version: Some(pkg_info.version.to_string()),
+        copyright: config.bundle.copyright.clone(),
+        authors: config.bundle.publisher.clone().map(|publisher| vec![publisher]),
+        ..Default::default()
+    }
 }
 
 fn parse_arxiv_feed(xml: &str, query_title: &str) -> Vec<ArxivMetadata> {

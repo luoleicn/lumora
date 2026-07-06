@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { Document, Page, pdfjs } from "react-pdf";
-import { Maximize2, MessageSquare, StickyNote, Trash2, X } from "lucide-react";
+import { MessageSquare, StickyNote, Trash2, X } from "lucide-react";
 import type { Annotation, FileAsset, Paper } from "@lumora/shared";
 import { mergeNearbyRects, normalizeRect } from "@lumora/shared";
 import { createId } from "../lib/id";
@@ -46,7 +47,7 @@ type PdfReaderProps = {
 };
 
 const colors = ["#ffe45c", "#8ee6a8", "#82cfff", "#ffadad"];
-const zoomOptions = [0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
+const pdfViewEvent = "lumora-pdf-view-command";
 
 export function PdfReader({
   paper,
@@ -61,7 +62,6 @@ export function PdfReader({
   const [numPages, setNumPages] = useState(0);
   const [pageWidth, setPageWidth] = useState(760);
   const [zoom, setZoom] = useState(1);
-  const [pageJumpValue, setPageJumpValue] = useState("1");
   const [color, setColor] = useState(colors[0]);
   const [contextMenu, setContextMenu] = useState<AnnotationContextMenu>();
   const [loadError, setLoadError] = useState<string>();
@@ -117,11 +117,46 @@ export function PdfReader({
     setNumPages(0);
     setLoadError(undefined);
     setZoom(1);
-    setPageJumpValue("1");
   }, [fileData]);
 
   useEffect(() => {
     pageRefs.current = pageRefs.current.slice(0, numPages);
+  }, [numPages]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+
+    void listen<string>(pdfViewEvent, (event) => {
+      const command = event.payload;
+      if (command === "fit-width") {
+        handleFitWidth();
+        return;
+      }
+
+      if (command === "go-to-page") {
+        handlePromptPageJump();
+        return;
+      }
+
+      if (command.startsWith("zoom:")) {
+        const nextZoom = Number.parseFloat(command.slice("zoom:".length));
+        if (Number.isFinite(nextZoom)) {
+          setZoom(nextZoom);
+        }
+      }
+    }).then((nextUnlisten) => {
+      if (disposed) {
+        nextUnlisten();
+        return;
+      }
+      unlisten = nextUnlisten;
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, [numPages]);
 
   function handleContextMenu(event: React.MouseEvent) {
@@ -253,14 +288,24 @@ export function PdfReader({
     setZoom(1);
   }
 
-  function handleJumpToPage() {
-    const nextPage = Number.parseInt(pageJumpValue, 10);
+  function handlePromptPageJump() {
+    if (numPages === 0) {
+      return;
+    }
+
+    const pageValue = window.prompt(`Go to page (1-${numPages})`);
+    if (pageValue !== null) {
+      handleJumpToPage(pageValue);
+    }
+  }
+
+  function handleJumpToPage(pageValue: string | number) {
+    const nextPage = typeof pageValue === "number" ? pageValue : Number.parseInt(pageValue, 10);
     if (!Number.isFinite(nextPage) || numPages === 0) {
       return;
     }
 
     const clampedPage = Math.min(Math.max(nextPage, 1), numPages);
-    setPageJumpValue(String(clampedPage));
     pageRefs.current[clampedPage - 1]?.scrollIntoView({ block: "start", behavior: "smooth" });
   }
 
@@ -292,38 +337,6 @@ export function PdfReader({
         <div className="paper-heading">
           <h2>{paper.title}</h2>
           <span>{fileAsset?.fileName}</span>
-        </div>
-        <div className="toolbar-actions">
-          <div className="view-controls" aria-label="View controls">
-            <span>View</span>
-            <button type="button" onClick={handleFitWidth}>
-              <Maximize2 size={14} />
-              Fit Width
-            </button>
-            <select value={zoom} onChange={(event) => setZoom(Number(event.target.value))} aria-label="Zoom ratio">
-              {zoomOptions.map((value) => (
-                <option key={value} value={value}>
-                  {Math.round(value * 100)}%
-                </option>
-              ))}
-            </select>
-            <form
-              className="page-jump-form"
-              onSubmit={(event) => {
-                event.preventDefault();
-                handleJumpToPage();
-              }}
-            >
-              <input
-                value={pageJumpValue}
-                onChange={(event) => setPageJumpValue(event.target.value)}
-                onBlur={handleJumpToPage}
-                inputMode="numeric"
-                aria-label="Page number"
-              />
-              <span>/ {numPages || "-"}</span>
-            </form>
-          </div>
         </div>
       </header>
 
