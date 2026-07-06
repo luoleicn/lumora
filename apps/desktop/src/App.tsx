@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Annotation, Collection, FileAsset, LibraryState, Paper } from "@lumora/shared";
 import { FileText, X } from "lucide-react";
 import { AppToolbar } from "./components/AppToolbar";
+import { CollectionModal } from "./components/CollectionModal";
 import { LibrarySidebar } from "./components/LibrarySidebar";
 import { ManualReferenceModal, type ManualReferenceDraft } from "./components/ManualReferenceModal";
 import { NotebookPanel } from "./components/NotebookPanel";
@@ -83,6 +84,8 @@ export default function App() {
   const [workspaceLayout, setWorkspaceLayout] = useState<WorkspaceLayout>(() => loadWorkspaceLayout());
   const [resizeDrag, setResizeDrag] = useState<ResizeDrag>();
   const [manualModalOpen, setManualModalOpen] = useState(false);
+  const [collectionModalParentId, setCollectionModalParentId] = useState<string | undefined>();
+  const [collectionModalOpen, setCollectionModalOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string>();
 
@@ -353,9 +356,16 @@ export default function App() {
   }
 
   function handleCreateCollection(parentId?: string) {
-    const parent = parentId ? library.collections.find((collection) => collection.id === parentId && !collection.deletedAt) : undefined;
-    const name = window.prompt(parent ? `Folder name under ${parent.name}` : "Folder name");
-    if (!name?.trim()) {
+    setCollectionModalParentId(parentId);
+    setCollectionModalOpen(true);
+  }
+
+  function handleSaveCollection(name: string) {
+    const parent = collectionModalParentId
+      ? library.collections.find((collection) => collection.id === collectionModalParentId && !collection.deletedAt)
+      : undefined;
+    const trimmedName = name.trim();
+    if (!trimmedName) {
       return;
     }
 
@@ -363,7 +373,7 @@ export default function App() {
     const siblingCount = library.collections.filter((item) => !item.deletedAt && item.parentId === parent?.id).length;
     const collection: Collection = {
       id: createId("collection"),
-      name: name.trim(),
+      name: trimmedName,
       parentId: parent?.id,
       sortOrder: siblingCount,
       createdAt: now,
@@ -374,6 +384,9 @@ export default function App() {
       collections: [...current.collections, collection]
     }));
     setSelectedCollectionId(collection.id);
+    setCollectionModalOpen(false);
+    setCollectionModalParentId(undefined);
+    setStatus(parent ? `Created folder in ${parent.name}.` : "Created folder.");
   }
 
   function handleCreateAnnotation(annotation: Annotation) {
@@ -649,6 +662,15 @@ export default function App() {
         open={manualModalOpen}
         onClose={() => setManualModalOpen(false)}
         onSave={handleCreateManualReference}
+      />
+      <CollectionModal
+        open={collectionModalOpen}
+        parentName={library.collections.find((collection) => collection.id === collectionModalParentId)?.name}
+        onClose={() => {
+          setCollectionModalOpen(false);
+          setCollectionModalParentId(undefined);
+        }}
+        onSave={handleSaveCollection}
       />
     </main>
   );

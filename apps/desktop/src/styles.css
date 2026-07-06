@@ -1773,6 +1773,10 @@ button:disabled {
   box-shadow: 0 24px 70px rgba(15, 23, 32, 0.26);
 }
 
+.collection-modal {
+  width: min(420px, 100%);
+}
+
 .manual-modal header,
 .manual-modal footer {
   display: flex;
@@ -1808,6 +1812,29 @@ button:disabled {
 
 .manual-form-grid .wide {
   grid-column: 1 / -1;
+}
+
+.collection-modal-body {
+  padding: 16px;
+}
+
+.collection-modal-body label {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  color: #4a5560;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.collection-modal-body input {
+  min-height: 38px;
+  border: 1px solid #cfd7df;
+  border-radius: 7px;
+  background: #ffffff;
+  color: #202226;
+  font: inherit;
+  padding: 0 10px;
 }
 
 .manual-modal footer {
