@@ -526,7 +526,7 @@ function AnnotationContextMenu({
           ) : (
             <button type="button" onClick={onStartNote}>
               <MessageSquare size={16} />
-              Add Note
+              {menu.selectionBased ? "Note" : "Add Note"}
             </button>
           )}
           <button type="button" className="danger" onClick={() => onDeleteAnnotation(menu.annotation)}>
@@ -553,6 +553,14 @@ function AnnotationContextMenu({
 function getContextMenuTitle(menu: AnnotationContextMenu) {
   if (menu.kind === "new") {
     return menu.mode === "note" ? "Add note" : "Annotate selection";
+  }
+
+  if (menu.selectionBased && menu.annotation.kind === "note") {
+    return "Note";
+  }
+
+  if (menu.selectionBased) {
+    return "Highlight";
   }
 
   if (menu.mode === "note") {
@@ -602,11 +610,12 @@ function findAnnotationAtPoint(
 
 function findAnnotationForSelection(selection: PendingSelection, annotations: Annotation[]) {
   const samePageAnnotations = annotations.filter((annotation) => annotation.pageIndex === selection.pageIndex);
-  return samePageAnnotations.find((annotation) =>
+  const overlappingAnnotations = samePageAnnotations.filter((annotation) =>
     annotation.rects.some((annotationRect) =>
       selection.rects.some((selectionRect) => rectsOverlap(annotationRect, selectionRect))
     )
   );
+  return overlappingAnnotations.find((annotation) => annotation.kind === "note") ?? overlappingAnnotations[0];
 }
 
 function getSelectionMenuPosition(container: HTMLElement | null) {
