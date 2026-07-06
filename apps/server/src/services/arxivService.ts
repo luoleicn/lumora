@@ -11,7 +11,7 @@ export async function searchArxivByTitle(title: string): Promise<ArxivMetadata[]
   const url = new URL(ARXIV_API);
   url.searchParams.set("search_query", `ti:"${query.replaceAll("\"", "")}"`);
   url.searchParams.set("start", "0");
-  url.searchParams.set("max_results", "5");
+  url.searchParams.set("max_results", "3");
   url.searchParams.set("sortBy", "relevance");
   url.searchParams.set("sortOrder", "descending");
 

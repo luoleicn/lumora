@@ -39,7 +39,7 @@ async fn search_arxiv_by_title(title: String) -> Result<Vec<ArxivMetadata>, Stri
     url.query_pairs_mut()
         .append_pair("search_query", &format!("ti:\"{}\"", query.replace('"', "")))
         .append_pair("start", "0")
-        .append_pair("max_results", "5")
+        .append_pair("max_results", "3")
         .append_pair("sortBy", "relevance")
         .append_pair("sortOrder", "descending");
 
