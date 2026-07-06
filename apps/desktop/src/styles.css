@@ -1108,12 +1108,12 @@ button {
 
 .context-swatches {
   display: flex;
-  gap: 8px;
+  gap: 6px;
 }
 
 .swatch {
-  width: 24px;
-  height: 24px;
+  width: 18px;
+  height: 18px;
   border: 2px solid transparent;
   border-radius: 50%;
 }
@@ -1220,6 +1220,19 @@ button {
   padding: 10px;
 }
 
+.pdf-context-menu.compact {
+  width: auto;
+  max-width: min(280px, calc(100vw - 28px));
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  overflow: visible;
+  border-color: #cfd7df;
+  border-radius: 7px;
+  box-shadow: 0 10px 24px rgba(31, 41, 51, 0.18);
+  padding: 6px;
+}
+
 .pdf-context-menu header {
   display: flex;
   align-items: center;
@@ -1294,6 +1307,21 @@ button {
   background: #ffffff;
   color: #202226;
   padding: 0 10px;
+}
+
+.pdf-context-menu.compact .button-row {
+  gap: 5px;
+}
+
+.pdf-context-menu.compact .button-row.vertical {
+  flex-direction: row;
+}
+
+.pdf-context-menu.compact .button-row button {
+  min-height: 28px;
+  border-radius: 6px;
+  font-size: 12px;
+  padding: 0 8px;
 }
 
 .context-note-view button:hover,

@@ -454,27 +454,30 @@ function AnnotationContextMenu({
 }) {
   const title = getContextMenuTitle(menu);
   const quote = menu.kind === "new" ? menu.selection.quote : menu.annotation.quote;
+  const compact = menu.mode !== "note" && (menu.kind === "new" || Boolean(menu.selectionBased));
 
   return (
     <div
-      className="pdf-context-menu"
+      className={compact ? "pdf-context-menu compact" : "pdf-context-menu"}
       style={{ left: menu.x, top: menu.y }}
       onPointerDown={(event) => event.stopPropagation()}
       role="menu"
       aria-label="Annotation actions"
     >
-      <header>
-        <span>{title}</span>
-        <button
-          type="button"
-          onPointerDown={(event) => event.preventDefault()}
-          onClick={onClose}
-          aria-label="Close annotation menu"
-        >
-          <X size={14} />
-        </button>
-      </header>
-      {quote && <p>{quote}</p>}
+      {!compact && (
+        <header>
+          <span>{title}</span>
+          <button
+            type="button"
+            onPointerDown={(event) => event.preventDefault()}
+            onClick={onClose}
+            aria-label="Close annotation menu"
+          >
+            <X size={14} />
+          </button>
+        </header>
+      )}
+      {!compact && quote && <p>{quote}</p>}
       {menu.kind === "new" && menu.mode === "actions" && (
         <div className="context-swatches" aria-label="Annotation color">
           {colors.map((item) => (
