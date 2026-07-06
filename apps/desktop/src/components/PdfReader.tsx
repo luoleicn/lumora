@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Document, Page, pdfjs } from "react-pdf";
-import { MessageSquare, Minus, Plus, StickyNote, Trash2, X } from "lucide-react";
+import { Maximize2, MessageSquare, StickyNote, Trash2, X } from "lucide-react";
 import type { Annotation, FileAsset, Paper } from "@lumora/shared";
 import { mergeNearbyRects, normalizeRect } from "@lumora/shared";
 import { createId } from "../lib/id";
@@ -46,6 +46,7 @@ type PdfReaderProps = {
 };
 
 const colors = ["#ffe45c", "#8ee6a8", "#82cfff", "#ffadad"];
+const zoomOptions = [0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
 
 export function PdfReader({
   paper,
@@ -56,9 +57,11 @@ export function PdfReader({
   onDeleteAnnotation
 }: PdfReaderProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const pageRefs = useRef<Array<HTMLDivElement | null>>([]);
   const [numPages, setNumPages] = useState(0);
   const [pageWidth, setPageWidth] = useState(760);
   const [zoom, setZoom] = useState(1);
+  const [pageJumpValue, setPageJumpValue] = useState("1");
   const [color, setColor] = useState(colors[0]);
   const [contextMenu, setContextMenu] = useState<AnnotationContextMenu>();
   const [loadError, setLoadError] = useState<string>();
@@ -76,7 +79,7 @@ export function PdfReader({
     }
 
     const resize = () => {
-      setPageWidth(Math.min(920, Math.max(420, element.clientWidth - 56)));
+      setPageWidth(Math.max(420, element.clientWidth - 56));
     };
     resize();
 
@@ -113,7 +116,13 @@ export function PdfReader({
     setContextMenu(undefined);
     setNumPages(0);
     setLoadError(undefined);
+    setZoom(1);
+    setPageJumpValue("1");
   }, [fileData]);
+
+  useEffect(() => {
+    pageRefs.current = pageRefs.current.slice(0, numPages);
+  }, [numPages]);
 
   function handleContextMenu(event: React.MouseEvent) {
     const existingAnnotation = findAnnotationAtPoint(scrollRef.current, event.clientX, event.clientY, visibleAnnotations);
@@ -240,6 +249,21 @@ export function PdfReader({
     setContextMenu(undefined);
   }
 
+  function handleFitWidth() {
+    setZoom(1);
+  }
+
+  function handleJumpToPage() {
+    const nextPage = Number.parseInt(pageJumpValue, 10);
+    if (!Number.isFinite(nextPage) || numPages === 0) {
+      return;
+    }
+
+    const clampedPage = Math.min(Math.max(nextPage, 1), numPages);
+    setPageJumpValue(String(clampedPage));
+    pageRefs.current[clampedPage - 1]?.scrollIntoView({ block: "start", behavior: "smooth" });
+  }
+
   if (!paper) {
     return (
       <section className="reader-empty">
@@ -270,13 +294,36 @@ export function PdfReader({
           <span>{fileAsset?.fileName}</span>
         </div>
         <div className="toolbar-actions">
-          <button className="icon-button" type="button" onClick={() => setZoom((value) => Math.max(0.7, value - 0.1))} aria-label="Zoom out">
-            <Minus size={17} />
-          </button>
-          <span className="zoom-label">{Math.round(zoom * 100)}%</span>
-          <button className="icon-button" type="button" onClick={() => setZoom((value) => Math.min(1.8, value + 0.1))} aria-label="Zoom in">
-            <Plus size={17} />
-          </button>
+          <div className="view-controls" aria-label="View controls">
+            <span>View</span>
+            <button type="button" onClick={handleFitWidth}>
+              <Maximize2 size={14} />
+              Fit Width
+            </button>
+            <select value={zoom} onChange={(event) => setZoom(Number(event.target.value))} aria-label="Zoom ratio">
+              {zoomOptions.map((value) => (
+                <option key={value} value={value}>
+                  {Math.round(value * 100)}%
+                </option>
+              ))}
+            </select>
+            <form
+              className="page-jump-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                handleJumpToPage();
+              }}
+            >
+              <input
+                value={pageJumpValue}
+                onChange={(event) => setPageJumpValue(event.target.value)}
+                onBlur={handleJumpToPage}
+                inputMode="numeric"
+                aria-label="Page number"
+              />
+              <span>/ {numPages || "-"}</span>
+            </form>
+          </div>
         </div>
       </header>
 
@@ -290,7 +337,14 @@ export function PdfReader({
             onLoadError={(error) => setLoadError(error.message)}
           >
             {Array.from({ length: numPages }, (_, index) => (
-              <div className="page-shell" data-page-index={index} key={index}>
+              <div
+                className="page-shell"
+                data-page-index={index}
+                key={index}
+                ref={(element) => {
+                  pageRefs.current[index] = element;
+                }}
+              >
                 <Page pageNumber={index + 1} width={pageWidth * zoom} renderAnnotationLayer renderTextLayer />
                 <AnnotationOverlay
                   annotations={visibleAnnotations.filter((annotation) => annotation.pageIndex === index)}
