@@ -12,6 +12,7 @@ import type {
   SyncPullResponse,
   SyncPushResponse
 } from "@lumora/shared";
+import { invoke } from "@tauri-apps/api/core";
 import { getClientId, getFileBlob, upsertById } from "./localStore";
 
 export type SyncSettings = {
@@ -81,9 +82,26 @@ export async function startMendeleyImport(settings: SyncSettings) {
 }
 
 export async function searchArxivMetadata(settings: SyncSettings, title: string): Promise<ArxivMetadata[]> {
+  if (isTauriRuntime()) {
+    try {
+      return await invoke<ArxivMetadata[]>("search_arxiv_by_title", { title });
+    } catch (error) {
+      console.warn("Tauri arXiv lookup failed, falling back to server.", error);
+    }
+  }
+
   const url = new URL(`${settings.serverUrl}/metadata/arxiv`);
   url.searchParams.set("title", title);
-  const response = await fetch(url);
+  let response: Response;
+  try {
+    response = await fetch(url);
+  } catch (error) {
+    throw new Error(
+      error instanceof Error && error.message
+        ? `arXiv lookup failed: ${error.message}. Is the lumora server running?`
+        : "arXiv lookup failed. Is the lumora server running?"
+    );
+  }
 
   if (!response.ok) {
     const body = await response.json().catch(() => undefined) as { error?: string } | undefined;
@@ -92,6 +110,10 @@ export async function searchArxivMetadata(settings: SyncSettings, title: string)
 
   const data = await response.json() as { results: ArxivMetadata[] };
   return data.results;
+}
+
+function isTauriRuntime() {
+  return "__TAURI_INTERNALS__" in window;
 }
 
 async function pushChanges(settings: SyncSettings, state: LibraryState): Promise<SyncPushResponse> {
