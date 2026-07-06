@@ -937,15 +937,10 @@ button {
   padding-left: 8px;
 }
 
-.reader-toolbar {
+.reader {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  min-height: 58px;
-  gap: 18px;
-  border-bottom: 1px solid #d5dbe1;
-  background: #ffffff;
-  padding: 10px 16px;
+  min-height: 0;
+  flex: 1;
 }
 
 .paper-heading {
@@ -997,7 +992,7 @@ button {
   min-width: 0;
   flex: 1;
   overflow: auto;
-  padding: 24px 20px 42px;
+  padding: 14px 14px 30px;
 }
 
 .page-shell {

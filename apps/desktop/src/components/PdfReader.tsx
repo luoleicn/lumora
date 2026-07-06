@@ -333,13 +333,6 @@ export function PdfReader({
 
   return (
     <section className="reader">
-      <header className="reader-toolbar">
-        <div className="paper-heading">
-          <h2>{paper.title}</h2>
-          <span>{fileAsset?.fileName}</span>
-        </div>
-      </header>
-
       <div className="reader-body">
         <div ref={scrollRef} className="pdf-scroll" onContextMenu={handleContextMenu} onPointerUp={handleSelectionPointerUp}>
           <Document
