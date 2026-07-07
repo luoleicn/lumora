@@ -192,10 +192,7 @@ export function PaperList({
 
     event.preventDefault();
     suppressPaperClickRef.current = true;
-    const dropElement = document
-      .elementFromPoint(event.clientX, event.clientY)
-      ?.closest<HTMLElement>("[data-collection-drop-id]");
-    const collectionId = dropElement?.dataset.collectionDropId;
+    const collectionId = getCollectionDropIdAtPoint(event.clientX, event.clientY);
     if (collectionId) {
       onDropPaperToCollection(drag.paperId, collectionId);
     }
@@ -425,6 +422,22 @@ function formatDate(value: string) {
     month: "2-digit",
     day: "2-digit"
   }).format(new Date(value));
+}
+
+function getCollectionDropIdAtPoint(x: number, y: number) {
+  const elements = typeof document.elementsFromPoint === "function"
+    ? document.elementsFromPoint(x, y)
+    : [document.elementFromPoint(x, y)].filter(Boolean);
+
+  for (const element of elements) {
+    const dropElement = element?.closest?.("[data-collection-drop-id]") as HTMLElement | null | undefined;
+    const collectionId = dropElement?.dataset.collectionDropId;
+    if (collectionId) {
+      return collectionId;
+    }
+  }
+
+  return undefined;
 }
 
 function loadColumnWidths(): PaperColumnWidths {

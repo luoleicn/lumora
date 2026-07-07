@@ -293,6 +293,7 @@ function CollectionTreeNode({
         <button
           className={selectedCollectionId === collection.id ? "collection-button active" : "collection-button"}
           type="button"
+          data-collection-drop-id={collection.id}
           onClick={() => onSelectCollection(collection.id)}
           title={collection.name}
         >
