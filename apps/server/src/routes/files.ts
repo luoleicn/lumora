@@ -19,30 +19,45 @@ export async function fileRoutes(app: FastifyInstance) {
     const uploadUrl = await createUploadUrl(objectKey, body.mime);
     const now = new Date();
 
-    await prisma.$transaction(async (tx) => {
-      await tx.fileAsset.upsert({
-        where: { id: body.fileAssetId },
-        update: {
-          objectKey,
-          downloadState: "remote",
-          updatedAt: now
-        },
-        create: {
-          id: body.fileAssetId,
-          userId: user.id,
-          paperId: body.paperId,
-          sha256: body.sha256,
-          size: body.size,
-          mime: body.mime,
-          fileName: body.fileName,
-          objectKey,
-          downloadState: "remote",
-          createdAt: now,
-          updatedAt: now
+    try {
+      await prisma.$transaction(async (tx) => {
+        const paper = await tx.paper.findUnique({
+          where: { userId_id: { userId: user.id, id: body.paperId } },
+          select: { id: true }
+        });
+        if (!paper) {
+          throw new Error("Paper not found");
         }
+
+        await tx.fileAsset.upsert({
+          where: { userId_id: { userId: user.id, id: body.fileAssetId } },
+          update: {
+            objectKey,
+            downloadState: "remote",
+            updatedAt: now
+          },
+          create: {
+            id: body.fileAssetId,
+            userId: user.id,
+            paperId: body.paperId,
+            sha256: body.sha256,
+            size: body.size,
+            mime: body.mime,
+            fileName: body.fileName,
+            objectKey,
+            downloadState: "remote",
+            createdAt: now,
+            updatedAt: now
+          }
+        });
+        await recordChange(tx, user.id, "fileAsset", body.fileAssetId, "upsert", "file-upload");
       });
-      await recordChange(tx, user.id, "fileAsset", body.fileAssetId, "upsert", "file-upload");
-    });
+    } catch (error) {
+      if (error instanceof Error && error.message === "Paper not found") {
+        return reply.code(404).send({ error: "Paper not found" });
+      }
+      throw error;
+    }
 
     return {
       fileAssetId: body.fileAssetId,

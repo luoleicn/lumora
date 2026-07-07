@@ -45,7 +45,7 @@ export async function runMendeleyImport(db: PrismaClient, jobId: string, userId:
     for (const folder of folders) {
       await db.$transaction(async (tx) => {
         await tx.collection.upsert({
-          where: { id: folder.id },
+          where: { userId_id: { userId, id: folder.id } },
           update: {
             name: folder.name,
             parentId: folder.parent_id,
@@ -70,7 +70,7 @@ export async function runMendeleyImport(db: PrismaClient, jobId: string, userId:
       const paper = mapDocument(document);
       await db.$transaction(async (tx) => {
         await tx.paper.upsert({
-          where: { id: paper.id },
+          where: { userId_id: { userId, id: paper.id } },
           update: {
             title: paper.title,
             authors: paper.authors,

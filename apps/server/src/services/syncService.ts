@@ -101,7 +101,7 @@ async function loadEntity(db: PrismaClient, userId: string, entity: SyncEntity, 
 
 async function upsertPaper(tx: Transaction, userId: string, data: Paper) {
   await tx.paper.upsert({
-    where: { id: data.id },
+    where: { userId_id: { userId, id: data.id } },
     update: {
       title: data.title,
       authors: data.authors as unknown as Prisma.InputJsonValue,
@@ -157,8 +157,10 @@ async function upsertPaper(tx: Transaction, userId: string, data: Paper) {
 }
 
 async function upsertFileAsset(tx: Transaction, userId: string, data: FileAsset) {
+  await ensurePaperOwnedByUser(tx, userId, data.paperId);
+
   await tx.fileAsset.upsert({
-    where: { id: data.id },
+    where: { userId_id: { userId, id: data.id } },
     update: {
       paperId: data.paperId,
       sha256: data.sha256,
@@ -190,8 +192,12 @@ async function upsertFileAsset(tx: Transaction, userId: string, data: FileAsset)
 }
 
 async function upsertCollection(tx: Transaction, userId: string, data: Collection) {
+  if (data.parentId) {
+    await ensureCollectionOwnedByUser(tx, userId, data.parentId);
+  }
+
   await tx.collection.upsert({
-    where: { id: data.id },
+    where: { userId_id: { userId, id: data.id } },
     update: {
       name: data.name,
       parentId: data.parentId,
@@ -213,8 +219,11 @@ async function upsertCollection(tx: Transaction, userId: string, data: Collectio
 }
 
 async function upsertPaperCollection(tx: Transaction, userId: string, data: PaperCollection) {
+  await ensurePaperOwnedByUser(tx, userId, data.paperId);
+  await ensureCollectionOwnedByUser(tx, userId, data.collectionId);
+
   await tx.paperCollection.upsert({
-    where: { id: data.id },
+    where: { userId_id: { userId, id: data.id } },
     update: {
       paperId: data.paperId,
       collectionId: data.collectionId,
@@ -234,8 +243,11 @@ async function upsertPaperCollection(tx: Transaction, userId: string, data: Pape
 }
 
 async function upsertAnnotation(tx: Transaction, userId: string, data: Annotation) {
+  await ensurePaperOwnedByUser(tx, userId, data.paperId);
+  await ensureFileAssetOwnedByUser(tx, userId, data.fileId, data.paperId);
+
   await tx.annotation.upsert({
-    where: { id: data.id },
+    where: { userId_id: { userId, id: data.id } },
     update: {
       paperId: data.paperId,
       fileId: data.fileId,
@@ -264,6 +276,39 @@ async function upsertAnnotation(tx: Transaction, userId: string, data: Annotatio
       deletedAt: toDate(data.deletedAt)
     }
   });
+}
+
+async function ensurePaperOwnedByUser(tx: Transaction, userId: string, paperId: string) {
+  const paper = await tx.paper.findUnique({
+    where: { userId_id: { userId, id: paperId } },
+    select: { id: true }
+  });
+  if (!paper) {
+    throw new Error("Referenced paper does not belong to the authenticated user");
+  }
+}
+
+async function ensureCollectionOwnedByUser(tx: Transaction, userId: string, collectionId: string) {
+  const collection = await tx.collection.findUnique({
+    where: { userId_id: { userId, id: collectionId } },
+    select: { id: true }
+  });
+  if (!collection) {
+    throw new Error("Referenced collection does not belong to the authenticated user");
+  }
+}
+
+async function ensureFileAssetOwnedByUser(tx: Transaction, userId: string, fileId: string, paperId?: string) {
+  const fileAsset = await tx.fileAsset.findUnique({
+    where: { userId_id: { userId, id: fileId } },
+    select: { id: true, paperId: true }
+  });
+  if (!fileAsset) {
+    throw new Error("Referenced file asset does not belong to the authenticated user");
+  }
+  if (paperId && fileAsset.paperId !== paperId) {
+    throw new Error("Referenced file asset does not belong to the annotation paper");
+  }
 }
 
 function serializePaper(data: Awaited<ReturnType<PrismaClient["paper"]["findFirst"]>>): Paper {

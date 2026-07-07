@@ -55,6 +55,7 @@ model Paper {
   paperCollections PaperCollection[]
   annotations      Annotation[]
 
+  @@unique([userId, id])
   @@index([userId, updatedAt])
   @@index([userId, doi])
   @@index([userId, arxiv])
@@ -79,6 +80,7 @@ model FileAsset {
   paper         Paper        @relation(fields: [paperId], references: [id], onDelete: Cascade)
   annotations   Annotation[]
 
+  @@unique([userId, id])
   @@index([userId, sha256])
   @@index([userId, paperId])
 }
@@ -95,6 +97,7 @@ model Collection {
   user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
   paperCollections PaperCollection[]
 
+  @@unique([userId, id])
   @@index([userId, parentId])
 }
 
@@ -110,6 +113,7 @@ model PaperCollection {
   paper        Paper      @relation(fields: [paperId], references: [id], onDelete: Cascade)
   collection   Collection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
 
+  @@unique([userId, id])
   @@unique([userId, paperId, collectionId])
   @@index([userId, collectionId])
 }
@@ -132,6 +136,7 @@ model Annotation {
   paper     Paper     @relation(fields: [paperId], references: [id], onDelete: Cascade)
   fileAsset FileAsset @relation(fields: [fileId], references: [id], onDelete: Cascade)
 
+  @@unique([userId, id])
   @@index([userId, paperId])
   @@index([userId, updatedAt])
 }
