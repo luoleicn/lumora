@@ -22,6 +22,14 @@ type ColumnResizeDrag = {
   startWidth: number;
 };
 
+type PaperPointerDrag = {
+  paperId: string;
+  pointerId: number;
+  startX: number;
+  startY: number;
+  dragging: boolean;
+};
+
 const columnWidthsKey = "lumora:documents-column-widths";
 
 const paperColumns: PaperColumn[] = [
@@ -40,6 +48,7 @@ type PaperListProps = {
   onSelectPaper: (id: string) => void;
   onOpenPaper: (id: string) => void;
   onUpdatePaper: (paper: Paper) => void;
+  onDropPaperToCollection: (paperId: string, collectionId: string) => void;
 };
 
 export function PaperList({
@@ -48,13 +57,16 @@ export function PaperList({
   selectedPaperId,
   onSelectPaper,
   onOpenPaper,
-  onUpdatePaper
+  onUpdatePaper,
+  onDropPaperToCollection
 }: PaperListProps) {
   const [sortKey, setSortKey] = useState<SortKey>("added");
   const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
   const [columnWidths, setColumnWidths] = useState<PaperColumnWidths>(() => loadColumnWidths());
   const [resizingColumn, setResizingColumn] = useState<PaperColumnKey>();
   const columnResizeRef = useRef<ColumnResizeDrag | undefined>(undefined);
+  const paperPointerDragRef = useRef<PaperPointerDrag | undefined>(undefined);
+  const suppressPaperClickRef = useRef(false);
   const sortedPapers = useMemo(
     () => [...papers].sort((a, b) => comparePapers(a, b, sortKey, sortDirection)),
     [papers, sortDirection, sortKey]
@@ -134,6 +146,61 @@ export function PaperList({
     }));
   }
 
+  function handlePaperPointerDown(event: React.PointerEvent<HTMLTableRowElement>, paperId: string) {
+    if (event.button !== 0 || (event.target as HTMLElement).closest("button")) {
+      return;
+    }
+
+    paperPointerDragRef.current = {
+      paperId,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      dragging: false
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function handlePaperPointerMove(event: React.PointerEvent<HTMLTableRowElement>) {
+    const drag = paperPointerDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+
+    const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+    if (distance > 6) {
+      drag.dragging = true;
+      document.body.classList.add("paper-pointer-dragging");
+    }
+  }
+
+  function handlePaperPointerEnd(event: React.PointerEvent<HTMLTableRowElement>) {
+    const drag = paperPointerDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    paperPointerDragRef.current = undefined;
+    document.body.classList.remove("paper-pointer-dragging");
+    if (!drag.dragging) {
+      return;
+    }
+
+    event.preventDefault();
+    suppressPaperClickRef.current = true;
+    const dropElement = document
+      .elementFromPoint(event.clientX, event.clientY)
+      ?.closest<HTMLElement>("[data-collection-drop-id]");
+    const collectionId = dropElement?.dataset.collectionDropId;
+    if (collectionId) {
+      onDropPaperToCollection(drag.paperId, collectionId);
+    }
+  }
+
   return (
     <section className="paper-list">
       <header className="paper-table-title">
@@ -179,9 +246,19 @@ export function PaperList({
                   paper={paper}
                   fileAsset={state.fileAssets.find((file) => file.paperId === paper.id && !file.deletedAt)}
                   active={paper.id === selectedPaperId}
-                  onClick={() => onSelectPaper(paper.id)}
+                  onClick={() => {
+                    if (suppressPaperClickRef.current) {
+                      suppressPaperClickRef.current = false;
+                      return;
+                    }
+                    onSelectPaper(paper.id);
+                  }}
                   onDoubleClick={() => onOpenPaper(paper.id)}
                   onUpdatePaper={onUpdatePaper}
+                  onPointerDown={(event) => handlePaperPointerDown(event, paper.id)}
+                  onPointerMove={handlePaperPointerMove}
+                  onPointerUp={handlePaperPointerEnd}
+                  onPointerCancel={handlePaperPointerEnd}
                 />
               ))}
             </tbody>
@@ -251,7 +328,11 @@ function PaperRow({
   active,
   onClick,
   onDoubleClick,
-  onUpdatePaper
+  onUpdatePaper,
+  onPointerDown,
+  onPointerMove,
+  onPointerUp,
+  onPointerCancel
 }: {
   paper: Paper;
   fileAsset?: FileAsset;
@@ -259,6 +340,10 @@ function PaperRow({
   onClick: () => void;
   onDoubleClick: () => void;
   onUpdatePaper: (paper: Paper) => void;
+  onPointerDown: (event: React.PointerEvent<HTMLTableRowElement>) => void;
+  onPointerMove: (event: React.PointerEvent<HTMLTableRowElement>) => void;
+  onPointerUp: (event: React.PointerEvent<HTMLTableRowElement>) => void;
+  onPointerCancel: (event: React.PointerEvent<HTMLTableRowElement>) => void;
 }) {
   const authorLine = paper.authors.map((author) => author.fullName).join(", ");
 
@@ -274,6 +359,10 @@ function PaperRow({
       draggable
       onClick={onClick}
       onDoubleClick={onDoubleClick}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerCancel}
       onDragStart={handleDragStart}
     >
       <td>

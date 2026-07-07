@@ -256,6 +256,7 @@ function CollectionTreeNode({
       <div
         className={dragOver ? "collection-tree-row drag-over" : "collection-tree-row"}
         style={{ paddingLeft: `${depth * 14}px` }}
+        data-collection-drop-id={collection.id}
         onDragOver={(event) => {
           if (hasPaperDragData(event.dataTransfer)) {
             event.preventDefault();

@@ -458,6 +458,7 @@ export default function App() {
       ? `Added ${paper?.title ?? "paper"} to ${collection?.name ?? "folder"}.`
       : "Paper is already in that folder."
     );
+    setSelectedCollectionId(collectionId);
   }
 
   function handleCreateAnnotation(annotation: Annotation) {
@@ -682,6 +683,7 @@ export default function App() {
                 onSelectPaper={handleSelectPaper}
                 onOpenPaper={handleOpenPaperTab}
                 onUpdatePaper={handleUpdatePaper}
+                onDropPaperToCollection={handleAddPaperToCollection}
                 onCreateAnnotation={handleCreateAnnotation}
                 onDeleteAnnotation={handleDeleteAnnotation}
               />
@@ -868,6 +870,7 @@ function WorkspaceTabContent({
   onSelectPaper,
   onOpenPaper,
   onUpdatePaper,
+  onDropPaperToCollection,
   onCreateAnnotation,
   onDeleteAnnotation
 }: {
@@ -882,6 +885,7 @@ function WorkspaceTabContent({
   onSelectPaper: (paperId: string) => void;
   onOpenPaper: (paperId: string) => void;
   onUpdatePaper: (paper: Paper) => void;
+  onDropPaperToCollection: (paperId: string, collectionId: string) => void;
   onCreateAnnotation: (annotation: Annotation) => void;
   onDeleteAnnotation: (annotation: Annotation) => void;
 }) {
@@ -894,6 +898,7 @@ function WorkspaceTabContent({
         onSelectPaper={onSelectPaper}
         onOpenPaper={onOpenPaper}
         onUpdatePaper={onUpdatePaper}
+        onDropPaperToCollection={onDropPaperToCollection}
       />
     );
   }

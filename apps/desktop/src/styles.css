@@ -803,6 +803,11 @@ button {
   cursor: grabbing;
 }
 
+body.paper-pointer-dragging,
+body.paper-pointer-dragging * {
+  cursor: grabbing !important;
+}
+
 .paper-table tbody tr:hover {
   background: #eef6f3;
 }
