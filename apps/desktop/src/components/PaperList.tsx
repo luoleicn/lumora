@@ -262,17 +262,19 @@ function PaperRow({
 }) {
   const authorLine = paper.authors.map((author) => author.fullName).join(", ");
 
+  function handleDragStart(event: React.DragEvent<HTMLTableRowElement | HTMLTableCellElement>) {
+    event.dataTransfer.effectAllowed = "copy";
+    event.dataTransfer.setData("application/x-lumora-paper-id", paper.id);
+    event.dataTransfer.setData("text/plain", `lumora-paper:${paper.id}`);
+  }
+
   return (
     <tr
       className={`${active ? "active " : ""}${paper.unread ? "unread" : ""}`}
       draggable
       onClick={onClick}
       onDoubleClick={onDoubleClick}
-      onDragStart={(event) => {
-        event.dataTransfer.effectAllowed = "copy";
-        event.dataTransfer.setData("application/x-lumora-paper-id", paper.id);
-        event.dataTransfer.setData("text/plain", paper.title);
-      }}
+      onDragStart={handleDragStart}
     >
       <td>
         <button
@@ -287,14 +289,16 @@ function PaperRow({
           <Star size={15} fill={paper.favorite ? "currentColor" : "none"} />
         </button>
       </td>
-      <td title={authorLine || "No authors"}>{authorLine || "No authors"}</td>
-      <td className="paper-title-cell" title={paper.title}>
+      <td title={authorLine || "No authors"} draggable onDragStart={handleDragStart}>{authorLine || "No authors"}</td>
+      <td className="paper-title-cell" title={paper.title} draggable onDragStart={handleDragStart}>
         {fileAsset && <FileText size={14} />}
         <span>{paper.title}</span>
       </td>
-      <td>{paper.year ?? ""}</td>
-      <td title={paper.venue || fileAsset?.fileName || "PDF"}>{paper.venue || fileAsset?.fileName || "PDF"}</td>
-      <td>{formatDate(paper.createdAt)}</td>
+      <td draggable onDragStart={handleDragStart}>{paper.year ?? ""}</td>
+      <td title={paper.venue || fileAsset?.fileName || "PDF"} draggable onDragStart={handleDragStart}>
+        {paper.venue || fileAsset?.fileName || "PDF"}
+      </td>
+      <td draggable onDragStart={handleDragStart}>{formatDate(paper.createdAt)}</td>
     </tr>
   );
 }

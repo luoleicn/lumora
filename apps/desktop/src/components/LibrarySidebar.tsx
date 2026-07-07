@@ -257,7 +257,7 @@ function CollectionTreeNode({
         className={dragOver ? "collection-tree-row drag-over" : "collection-tree-row"}
         style={{ paddingLeft: `${depth * 14}px` }}
         onDragOver={(event) => {
-          if (event.dataTransfer.types.includes("application/x-lumora-paper-id")) {
+          if (hasPaperDragData(event.dataTransfer)) {
             event.preventDefault();
             event.dataTransfer.dropEffect = "copy";
             setDragOver(true);
@@ -265,7 +265,7 @@ function CollectionTreeNode({
         }}
         onDragLeave={() => setDragOver(false)}
         onDrop={(event) => {
-          const paperId = event.dataTransfer.getData("application/x-lumora-paper-id");
+          const paperId = readDraggedPaperId(event.dataTransfer);
           setDragOver(false);
           if (!paperId) {
             return;
@@ -273,6 +273,7 @@ function CollectionTreeNode({
 
           event.preventDefault();
           onAddPaperToCollection(paperId, collection.id);
+          onSelectCollection(collection.id);
         }}
       >
         {hasChildren ? (
@@ -338,6 +339,21 @@ function CollectionTreeNode({
       ))}
     </>
   );
+}
+
+function hasPaperDragData(dataTransfer: DataTransfer) {
+  const types = Array.from(dataTransfer.types);
+  return types.includes("application/x-lumora-paper-id") || types.includes("text/plain");
+}
+
+function readDraggedPaperId(dataTransfer: DataTransfer) {
+  const directValue = dataTransfer.getData("application/x-lumora-paper-id");
+  if (directValue) {
+    return directValue;
+  }
+
+  const textValue = dataTransfer.getData("text/plain");
+  return textValue.startsWith("lumora-paper:") ? textValue.slice("lumora-paper:".length) : undefined;
 }
 
 function buildCollectionTree(collections: Collection[]): CollectionNode[] {

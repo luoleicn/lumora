@@ -351,6 +351,8 @@ button {
 
 .collection-tree-row.drag-over {
   background: rgba(50, 124, 101, 0.28);
+  outline: 1px solid #55b495;
+  outline-offset: -1px;
 }
 
 .collection-button,
@@ -794,7 +796,11 @@ button {
 }
 
 .paper-table tr {
-  cursor: default;
+  cursor: grab;
+}
+
+.paper-table tr:active {
+  cursor: grabbing;
 }
 
 .paper-table tbody tr:hover {
