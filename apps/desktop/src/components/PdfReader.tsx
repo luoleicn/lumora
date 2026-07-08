@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Document, Page, pdfjs } from "react-pdf";
-import { MessageSquare, StickyNote, Trash2, X } from "lucide-react";
+import { Languages, MessageSquare, StickyNote, Trash2, X } from "lucide-react";
 import type { Annotation, FileAsset, Paper } from "@lumora/shared";
 import { mergeNearbyRects, normalizeRect } from "@lumora/shared";
 import { createId } from "../lib/id";
@@ -16,13 +17,26 @@ type PendingSelection = {
   quote: string;
 };
 
+type YoudaoTranslation = {
+  query: string;
+  phonetic?: string;
+  explains: string[];
+  pageUrl: string;
+};
+
+type TranslationState =
+  | { status: "loading"; query: string }
+  | { status: "ready"; query: string; result: YoudaoTranslation }
+  | { status: "error"; query: string; error: string };
+
 type NewAnnotationContextMenu = {
   kind: "new";
   x: number;
   y: number;
   selection: PendingSelection;
-  mode: "actions" | "note";
+  mode: "actions" | "note" | "translate";
   noteText: string;
+  translation?: TranslationState;
 };
 
 type ExistingAnnotationContextMenu = {
@@ -30,9 +44,10 @@ type ExistingAnnotationContextMenu = {
   x: number;
   y: number;
   annotation: Annotation;
-  mode: "actions" | "note" | "viewNote";
+  mode: "actions" | "note" | "viewNote" | "translate";
   noteText: string;
   selectionBased?: boolean;
+  translation?: TranslationState;
 };
 
 type AnnotationContextMenu = NewAnnotationContextMenu | ExistingAnnotationContextMenu;
@@ -309,6 +324,43 @@ export function PdfReader({
     pageRefs.current[clampedPage - 1]?.scrollIntoView({ block: "start", behavior: "smooth" });
   }
 
+  async function handleTranslate(quote: string) {
+    const query = normalizeDictionaryQuery(quote);
+    if (!query) {
+      return;
+    }
+
+    setContextMenu((current) => current ? {
+      ...current,
+      mode: "translate",
+      translation: { status: "loading", query }
+    } : current);
+
+    try {
+      const result = await invoke<YoudaoTranslation>("translate_with_youdao", { query });
+      setContextMenu((current) => current?.translation?.query === query ? {
+        ...current,
+        mode: "translate",
+        translation: { status: "ready", query, result }
+      } : current);
+    } catch (error) {
+      setContextMenu((current) => current?.translation?.query === query ? {
+        ...current,
+        mode: "translate",
+        translation: { status: "error", query, error: error instanceof Error ? error.message : String(error) }
+      } : current);
+    }
+  }
+
+  async function handleOpenDictionaryPage(url: string) {
+    try {
+      await invoke("open_external_url", { url });
+    } catch (error) {
+      window.open(url, "_blank", "noopener,noreferrer");
+      console.error("Failed to open Youdao page through Tauri command.", error);
+    }
+  }
+
   if (!paper) {
     return (
       <section className="reader-empty">
@@ -387,6 +439,8 @@ export function PdfReader({
                 createAnnotation("highlight", contextMenu.selection);
               }
             }}
+            onTranslate={handleTranslate}
+            onOpenDictionaryPage={handleOpenDictionaryPage}
             onDeleteAnnotation={(annotation) => {
               onDeleteAnnotation(annotation);
               window.getSelection()?.removeAllRanges();
@@ -496,6 +550,8 @@ function AnnotationContextMenu({
   onStartNote,
   onShowNote,
   onHighlight,
+  onTranslate,
+  onOpenDictionaryPage,
   onDeleteAnnotation,
   onDeleteNote,
   onSaveNote
@@ -508,13 +564,15 @@ function AnnotationContextMenu({
   onStartNote: () => void;
   onShowNote: () => void;
   onHighlight: () => void;
+  onTranslate: (quote: string) => void;
+  onOpenDictionaryPage: (url: string) => void;
   onDeleteAnnotation: (annotation: Annotation) => void;
   onDeleteNote: (annotation: Annotation) => void;
   onSaveNote: (noteText: string) => void;
 }) {
   const title = getContextMenuTitle(menu);
   const quote = menu.kind === "new" ? menu.selection.quote : menu.annotation.quote;
-  const compact = menu.mode !== "note" && (menu.kind === "new" || Boolean(menu.selectionBased));
+  const compact = menu.mode !== "note" && menu.mode !== "translate" && (menu.kind === "new" || Boolean(menu.selectionBased));
 
   return (
     <div
@@ -553,7 +611,9 @@ function AnnotationContextMenu({
         </div>
       )}
 
-      {menu.mode === "note" ? (
+      {menu.mode === "translate" ? (
+        <TranslationView translation={menu.translation} onOpenPage={onOpenDictionaryPage} />
+      ) : menu.mode === "note" ? (
         <div className="context-note-editor">
           <textarea
             value={menu.noteText}
@@ -566,6 +626,11 @@ function AnnotationContextMenu({
         </div>
       ) : menu.kind === "existing" && menu.selectionBased && menu.annotation.kind === "note" ? (
         <div className="button-row vertical">
+          {quote && (
+            <button type="button" onClick={() => onTranslate(quote)} aria-label="Translate" title="Translate">
+              <Languages size={16} />
+            </button>
+          )}
           <button type="button" className="danger" onClick={() => onDeleteNote(menu.annotation)}>
             <Trash2 size={16} />
             Delete Note
@@ -574,6 +639,11 @@ function AnnotationContextMenu({
       ) : menu.mode === "viewNote" && menu.kind === "existing" ? (
         <div className="context-note-view">
           <blockquote>{menu.annotation.comment || "No note content."}</blockquote>
+          {quote && (
+            <button type="button" onClick={() => onTranslate(quote)} aria-label="Translate" title="Translate">
+              <Languages size={16} />
+            </button>
+          )}
           <button type="button" className="danger" onClick={() => onDeleteAnnotation(menu.annotation)}>
             <Trash2 size={16} />
             Delete Annotation
@@ -581,6 +651,11 @@ function AnnotationContextMenu({
         </div>
       ) : menu.kind === "existing" ? (
         <div className="button-row vertical">
+          {quote && (
+            <button type="button" onClick={() => onTranslate(quote)} aria-label="Translate" title="Translate">
+              <Languages size={16} />
+            </button>
+          )}
           {menu.annotation.kind === "note" ? (
             <button type="button" onClick={onShowNote}>
               <MessageSquare size={16} />
@@ -599,18 +674,58 @@ function AnnotationContextMenu({
         </div>
       ) : (
         <div className="button-row">
-          <button type="button" onClick={onHighlight}>
-            <StickyNote size={16} />
-            Highlight
+          <button type="button" onClick={() => onTranslate(menu.selection.quote)} aria-label="Translate" title="Translate">
+            <Languages size={16} />
           </button>
-          <button type="button" onClick={onStartNote}>
+          <button type="button" onClick={onHighlight} aria-label="Highlight" title="Highlight">
+            <StickyNote size={16} />
+          </button>
+          <button type="button" onClick={onStartNote} aria-label="Note" title="Note">
             <MessageSquare size={16} />
-            Note
           </button>
         </div>
       )}
     </div>
   );
+}
+
+function TranslationView({
+  translation,
+  onOpenPage
+}: {
+  translation?: TranslationState;
+  onOpenPage: (url: string) => void;
+}) {
+  if (!translation || translation.status === "loading") {
+    return <div className="context-translation muted">Translating...</div>;
+  }
+
+  if (translation.status === "error") {
+    return <div className="context-translation error">{translation.error || "Translation failed."}</div>;
+  }
+
+  return (
+    <div className="context-translation">
+      <strong>{translation.result.query}</strong>
+      {translation.result.phonetic && <span>/{translation.result.phonetic}/</span>}
+      {translation.result.explains.length > 0 ? (
+        <ul>
+          {translation.result.explains.map((explain) => (
+            <li key={explain}>{explain}</li>
+          ))}
+        </ul>
+      ) : (
+        <p>No translation found.</p>
+      )}
+      <button type="button" className="youdao-link-button" onClick={() => onOpenPage(translation.result.pageUrl)}>
+        Open in Youdao
+      </button>
+    </div>
+  );
+}
+
+function normalizeDictionaryQuery(quote: string) {
+  return quote.trim().replace(/\s+/g, " ").slice(0, 200);
 }
 
 function getContextMenuTitle(menu: AnnotationContextMenu) {
@@ -628,6 +743,10 @@ function getContextMenuTitle(menu: AnnotationContextMenu) {
 
   if (menu.mode === "note") {
     return "Add note to highlight";
+  }
+
+  if (menu.mode === "translate") {
+    return "Translation";
   }
 
   if (menu.mode === "viewNote") {

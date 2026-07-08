@@ -18,6 +18,20 @@ export function getCollectionAndDescendantIds(collections: Collection[], collect
   return ids;
 }
 
+export function getCollectionPaperCount(state: LibraryState, collections: Collection[], collectionId: EntityId) {
+  const collectionIds = getCollectionAndDescendantIds(collections, collectionId);
+  const activePaperIds = new Set(state.papers.filter((paper) => !paper.deletedAt).map((paper) => paper.id));
+  const countedPaperIds = new Set<EntityId>();
+
+  for (const item of state.paperCollections) {
+    if (!item.deletedAt && collectionIds.has(item.collectionId) && activePaperIds.has(item.paperId)) {
+      countedPaperIds.add(item.paperId);
+    }
+  }
+
+  return countedPaperIds.size;
+}
+
 export function addPaperToCollection(state: LibraryState, paperId: EntityId, collectionId: EntityId, now = new Date().toISOString()) {
   const paper = state.papers.find((item) => item.id === paperId && !item.deletedAt);
   const collection = state.collections.find((item) => item.id === collectionId && !item.deletedAt);

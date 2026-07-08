@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import type { Collection, LibraryState } from "@lumora/shared";
 import { useState } from "react";
+import { getCollectionPaperCount } from "../lib/libraryActions";
 import lumoraLogoUrl from "../assets/lumora-logo-64.png";
 
 type LibrarySidebarProps = {
@@ -41,8 +42,8 @@ export function LibrarySidebar({
   onDeleteCollection,
   onAddPaperToCollection
 }: LibrarySidebarProps) {
-  const [authorsExpanded, setAuthorsExpanded] = useState(true);
-  const [tagsExpanded, setTagsExpanded] = useState(true);
+  const [authorsExpanded, setAuthorsExpanded] = useState(false);
+  const [tagsExpanded, setTagsExpanded] = useState(false);
   const [collapsedCollections, setCollapsedCollections] = useState<Record<string, boolean>>({});
   const collections = state.collections
     .filter((collection) => !collection.deletedAt)
@@ -377,28 +378,6 @@ function buildCollectionTree(collections: Collection[]): CollectionNode[] {
   }
 
   return roots;
-}
-
-function getCollectionPaperCount(state: LibraryState, collections: Collection[], collectionId: string) {
-  const collectionIds = getCollectionAndDescendantIds(collections, collectionId);
-  return state.paperCollections.filter((item) => collectionIds.has(item.collectionId) && !item.deletedAt).length;
-}
-
-function getCollectionAndDescendantIds(collections: Collection[], collectionId: string) {
-  const ids = new Set<string>([collectionId]);
-  let added = true;
-
-  while (added) {
-    added = false;
-    for (const collection of collections) {
-      if (collection.parentId && ids.has(collection.parentId) && !ids.has(collection.id)) {
-        ids.add(collection.id);
-        added = true;
-      }
-    }
-  }
-
-  return ids;
 }
 
 function wouldCreateCollectionCycle(collections: Collection[], collectionId: string, parentId: string) {

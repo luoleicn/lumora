@@ -1279,7 +1279,7 @@ body.paper-pointer-dragging * {
 
 .pdf-context-menu.compact {
   width: auto;
-  max-width: min(280px, calc(100vw - 28px));
+  max-width: min(320px, calc(100vw - 28px));
   flex-direction: row;
   align-items: center;
   gap: 6px;
@@ -1368,6 +1368,7 @@ body.paper-pointer-dragging * {
 
 .pdf-context-menu.compact .button-row {
   gap: 5px;
+  flex-wrap: nowrap;
 }
 
 .pdf-context-menu.compact .button-row.vertical {
@@ -1375,10 +1376,63 @@ body.paper-pointer-dragging * {
 }
 
 .pdf-context-menu.compact .button-row button {
-  min-height: 28px;
+  width: 34px;
+  min-width: 34px;
+  min-height: 30px;
   border-radius: 6px;
   font-size: 12px;
-  padding: 0 8px;
+  padding: 0;
+}
+
+.context-translation {
+  display: flex;
+  min-width: 220px;
+  flex-direction: column;
+  gap: 6px;
+  color: #202226;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.context-translation strong {
+  color: #26313a;
+  font-size: 13px;
+}
+
+.context-translation span {
+  color: #68727d;
+}
+
+.context-translation ul {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding-left: 16px;
+}
+
+.context-translation p {
+  display: block;
+  max-height: none;
+}
+
+.context-translation.error {
+  color: #a13b27;
+}
+
+.context-translation .youdao-link-button {
+  align-self: flex-start;
+  min-height: 28px;
+  border: 1px solid #cfd7df;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #256057;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+.context-translation .youdao-link-button:hover {
+  background: #eef6f3;
 }
 
 .context-note-view button:hover,

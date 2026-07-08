@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { Collection, LibraryState, Paper } from "@lumora/shared";
-import { addPaperToCollection, deleteCollectionAndReassignPapers, getCollectionAndDescendantIds } from "./libraryActions";
+import {
+  addPaperToCollection,
+  deleteCollectionAndReassignPapers,
+  getCollectionAndDescendantIds,
+  getCollectionPaperCount
+} from "./libraryActions";
 
 const now = "2026-07-06T00:00:00.000Z";
 
@@ -53,6 +58,12 @@ describe("library actions", () => {
       "folder-grandchild",
       "folder-parent"
     ]);
+  });
+
+  it("counts unique active papers across a folder and descendant folders", () => {
+    const current = state();
+
+    expect(getCollectionPaperCount(current, current.collections, "folder-parent")).toBe(3);
   });
 
   it("adds a paper to a target folder as a copied organization link", () => {
