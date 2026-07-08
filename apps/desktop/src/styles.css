@@ -207,8 +207,8 @@ button {
 
 .collapsed-gutter {
   display: grid;
-  width: 15px;
-  min-width: 15px;
+  width: 8px;
+  min-width: 8px;
   height: 100%;
   place-items: center;
   border: 0;
@@ -228,13 +228,13 @@ button {
 
 .collapsed-gutter span {
   display: grid;
-  width: 12px;
+  width: 6px;
   height: 42px;
   place-items: center;
   border: 1px solid #aab7c3;
   border-radius: 3px;
   background: #f8fafc;
-  font-size: 10px;
+  font-size: 5px;
   line-height: 1;
 }
 
@@ -367,6 +367,7 @@ button {
   border-radius: 7px;
   color: inherit;
   background: transparent;
+  font-size: 11px;
   padding: 8px 9px;
   text-align: left;
 }
@@ -437,7 +438,7 @@ button {
 .new-folder-button.inline {
   min-height: 32px;
   color: #aeb8c2;
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .author-filter,
@@ -467,7 +468,7 @@ button {
   background: transparent;
   margin-bottom: 6px;
   color: #cbd5de;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 700;
   padding: 0 7px;
   text-align: left;
@@ -497,7 +498,7 @@ button {
   border-radius: 6px;
   background: transparent;
   color: #cbd5de;
-  font-size: 12px;
+  font-size: 11px;
   padding: 5px 7px;
   text-align: left;
   text-overflow: ellipsis;
