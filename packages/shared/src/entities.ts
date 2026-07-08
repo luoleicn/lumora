@@ -98,6 +98,11 @@ export type NormalizedRect = {
   height: number;
 };
 
+export type NormalizedPoint = {
+  x: number;
+  y: number;
+};
+
 export type AnnotationKind = "highlight" | "note";
 
 export type Annotation = {
@@ -108,6 +113,7 @@ export type Annotation = {
   kind: AnnotationKind;
   color: string;
   rects: NormalizedRect[];
+  notePosition?: NormalizedPoint;
   quote?: string;
   comment?: string;
   createdAt: string;

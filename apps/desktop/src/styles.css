@@ -1108,13 +1108,19 @@ body.paper-pointer-dragging * {
   color: #287d65;
   box-shadow: 0 2px 8px rgba(31, 41, 51, 0.18);
   padding: 0;
+  cursor: grab;
   pointer-events: auto;
+  touch-action: none;
 }
 
 .note-marker:hover,
 .note-marker.active {
   border-color: #287d65;
   background: #e8f4ef;
+}
+
+.note-marker:active {
+  cursor: grabbing;
 }
 
 .note-popover {
@@ -1383,6 +1389,13 @@ body.paper-pointer-dragging * {
   border-radius: 6px;
   font-size: 12px;
   padding: 0;
+}
+
+.pdf-context-menu.compact .button-row button.text-action {
+  width: auto;
+  min-width: max-content;
+  padding: 0 10px;
+  white-space: nowrap;
 }
 
 .context-translation {

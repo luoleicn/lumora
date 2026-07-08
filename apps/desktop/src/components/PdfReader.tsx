@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Document, Page, pdfjs } from "react-pdf";
 import { Languages, MessageSquare, StickyNote, Trash2, X } from "lucide-react";
 import type { Annotation, FileAsset, Paper } from "@lumora/shared";
-import { mergeNearbyRects, normalizeRect } from "@lumora/shared";
+import { clamp01, mergeNearbyRects, normalizeRect } from "@lumora/shared";
 import { createId } from "../lib/id";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
@@ -293,6 +293,7 @@ export function PdfReader({
       ...annotation,
       kind: "highlight",
       comment: undefined,
+      notePosition: undefined,
       updatedAt: new Date().toISOString()
     });
     window.getSelection()?.removeAllRanges();
@@ -406,6 +407,7 @@ export function PdfReader({
                 <Page pageNumber={index + 1} width={pageWidth * zoom} renderAnnotationLayer renderTextLayer />
                 <AnnotationOverlay
                   annotations={visibleAnnotations.filter((annotation) => annotation.pageIndex === index)}
+                  onMoveAnnotation={(annotation, position) => onCreateAnnotation(moveNoteMarker(annotation, position))}
                   onOpenAnnotationMenu={(annotation, event) => {
                     event.preventDefault();
                     event.stopPropagation();
@@ -466,14 +468,92 @@ export function PdfReader({
 
 function AnnotationOverlay({
   annotations,
+  onMoveAnnotation,
   onOpenAnnotationMenu
 }: {
   annotations: Annotation[];
+  onMoveAnnotation: (annotation: Annotation, position: NonNullable<Annotation["notePosition"]>) => void;
   onOpenAnnotationMenu: (annotation: Annotation, event: React.MouseEvent) => void;
 }) {
   const [openNoteId, setOpenNoteId] = useState<string>();
+  const markerDragRef = useRef<{
+    annotation: Annotation;
+    pointerId: number;
+    startX: number;
+    startY: number;
+    startMarkerX: number;
+    startMarkerY: number;
+    pageWidth: number;
+    pageHeight: number;
+    dragging: boolean;
+  } | undefined>(undefined);
+  const suppressClickRef = useRef<string | undefined>(undefined);
   const openNote = annotations.find((annotation) => annotation.id === openNoteId && annotation.kind === "note");
-  const openNoteRect = openNote?.rects[0];
+  const openNotePosition = openNote ? getNoteMarkerPosition(openNote) : undefined;
+
+  function handleMarkerPointerDown(annotation: Annotation, event: React.PointerEvent<HTMLButtonElement>) {
+    if (event.button !== 0) {
+      return;
+    }
+
+    const markerPosition = getNoteMarkerPosition(annotation);
+    const pageRect = event.currentTarget.closest<HTMLElement>(".annotation-overlay")?.getBoundingClientRect();
+    if (!markerPosition || !pageRect) {
+      return;
+    }
+
+    event.stopPropagation();
+    markerDragRef.current = {
+      annotation,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      startMarkerX: markerPosition.x,
+      startMarkerY: markerPosition.y,
+      pageWidth: pageRect.width,
+      pageHeight: pageRect.height,
+      dragging: false
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function handleMarkerPointerMove(event: React.PointerEvent<HTMLButtonElement>) {
+    const drag = markerDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+
+    const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+    if (!drag.dragging && distance < 4) {
+      return;
+    }
+
+    drag.dragging = true;
+    event.preventDefault();
+    onMoveAnnotation(drag.annotation, {
+      x: drag.startMarkerX + (event.clientX - drag.startX) / drag.pageWidth,
+      y: drag.startMarkerY + (event.clientY - drag.startY) / drag.pageHeight
+    });
+  }
+
+  function handleMarkerPointerUp(event: React.PointerEvent<HTMLButtonElement>) {
+    const drag = markerDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    if (drag.dragging) {
+      suppressClickRef.current = drag.annotation.id;
+      event.preventDefault();
+      setOpenNoteId(drag.annotation.id);
+    }
+
+    markerDragRef.current = undefined;
+  }
 
   return (
     <div className="annotation-overlay">
@@ -494,8 +574,8 @@ function AnnotationOverlay({
         ))
       )}
       {annotations.filter((annotation) => annotation.kind === "note").map((annotation) => {
-        const rect = annotation.rects[0];
-        if (!rect) {
+        const markerPosition = getNoteMarkerPosition(annotation);
+        if (!markerPosition) {
           return null;
         }
 
@@ -505,27 +585,36 @@ function AnnotationOverlay({
             className={openNoteId === annotation.id ? "note-marker active" : "note-marker"}
             key={`${annotation.id}-marker`}
             style={{
-              left: `${Math.min(0.965, rect.x + rect.width) * 100}%`,
-              top: `${Math.max(0.01, rect.y) * 100}%`
+              left: `${markerPosition.x * 100}%`,
+              top: `${markerPosition.y * 100}%`
             }}
             onClick={(event) => {
               event.stopPropagation();
+              if (suppressClickRef.current === annotation.id) {
+                suppressClickRef.current = undefined;
+                return;
+              }
+
               setOpenNoteId((current) => current === annotation.id ? undefined : annotation.id);
             }}
+            onPointerDown={(event) => handleMarkerPointerDown(annotation, event)}
+            onPointerMove={handleMarkerPointerMove}
+            onPointerUp={handleMarkerPointerUp}
+            onPointerCancel={handleMarkerPointerUp}
             onContextMenu={(event) => onOpenAnnotationMenu(annotation, event)}
             aria-label="Show note"
-            title="Show note"
+            title="Drag to move note"
           >
             <MessageSquare size={12} />
           </button>
         );
       })}
-      {openNote && openNoteRect && (
+      {openNote && openNotePosition && (
         <aside
           className="note-popover"
           style={{
-            left: `${Math.min(0.84, openNoteRect.x + openNoteRect.width) * 100}%`,
-            top: `${Math.min(0.92, openNoteRect.y + openNoteRect.height + 0.01) * 100}%`
+            left: `${Math.min(0.84, openNotePosition.x) * 100}%`,
+            top: `${Math.min(0.92, openNotePosition.y + 0.035) * 100}%`
           }}
         >
           <header>
@@ -539,6 +628,29 @@ function AnnotationOverlay({
       )}
     </div>
   );
+}
+
+function getNoteMarkerPosition(annotation: Annotation): Annotation["notePosition"] {
+  const firstRect = annotation.rects[0];
+  if (!firstRect) {
+    return annotation.notePosition;
+  }
+
+  return annotation.notePosition ?? {
+    x: Math.min(0.965, firstRect.x + firstRect.width),
+    y: Math.max(0.01, firstRect.y)
+  };
+}
+
+function moveNoteMarker(annotation: Annotation, position: NonNullable<Annotation["notePosition"]>): Annotation {
+  return {
+    ...annotation,
+    notePosition: {
+      x: clamp01(position.x),
+      y: clamp01(position.y)
+    },
+    updatedAt: new Date().toISOString()
+  };
 }
 
 function AnnotationContextMenu({
@@ -631,7 +743,7 @@ function AnnotationContextMenu({
               <Languages size={16} />
             </button>
           )}
-          <button type="button" className="danger" onClick={() => onDeleteNote(menu.annotation)}>
+          <button type="button" className="danger text-action" onClick={() => onDeleteNote(menu.annotation)}>
             <Trash2 size={16} />
             Delete Note
           </button>

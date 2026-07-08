@@ -127,6 +127,7 @@ model Annotation {
   kind      String
   color     String
   rects     Json
+  notePosition Json?
   quote     String?
   comment   String?
   createdAt DateTime
