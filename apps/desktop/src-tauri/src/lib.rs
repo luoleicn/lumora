@@ -1,4 +1,4 @@
-use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID, WINDOW_SUBMENU_ID};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID, WINDOW_SUBMENU_ID};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 const PDF_VIEW_EVENT: &str = "lumora-pdf-view-command";
@@ -8,6 +8,7 @@ const PDF_VIEW_ZOOM_PREFIX: &str = "pdf-view-zoom-";
 const WORKSPACE_EVENT: &str = "lumora-workspace-command";
 const WORKSPACE_CLOSE_ACTIVE_TAB: &str = "workspace-close-active-tab";
 const HELP_KEYBOARD_SHORTCUTS: &str = "help-keyboard-shortcuts";
+const APP_ABOUT: &str = "app-about";
 
 #[tauri::command]
 fn ping() -> &'static str {
@@ -184,6 +185,8 @@ pub fn run() {
                 let _ = app.emit(WORKSPACE_EVENT, "close-active-tab");
             } else if id == HELP_KEYBOARD_SHORTCUTS {
                 let _ = app.emit(WORKSPACE_EVENT, "show-shortcuts-help");
+            } else if id == APP_ABOUT {
+                let _ = app.emit(WORKSPACE_EVENT, "show-about");
             } else if let Some(zoom) = id.strip_prefix(PDF_VIEW_ZOOM_PREFIX) {
                 let _ = app.emit(PDF_VIEW_EVENT, format!("zoom:{zoom}"));
             }
@@ -283,7 +286,7 @@ fn build_menu<R: Runtime>(app_handle: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         pkg_info.name.clone(),
         true,
         &[
-            &PredefinedMenuItem::about(app_handle, None, Some(about_metadata(app_handle)))?,
+            &MenuItem::with_id(app_handle, APP_ABOUT, format!("About {}", pkg_info.name), true, None::<&str>)?,
             &PredefinedMenuItem::separator(app_handle)?,
             &PredefinedMenuItem::services(app_handle, None)?,
             &PredefinedMenuItem::separator(app_handle)?,
@@ -364,19 +367,6 @@ fn zoom_menu<R: Runtime, M: Manager<R>>(manager: &M) -> tauri::Result<Submenu<R>
             &MenuItem::with_id(manager, "pdf-view-zoom-2", "200%", true, None::<&str>)?,
         ],
     )
-}
-
-#[cfg(desktop)]
-fn about_metadata<R: Runtime>(app_handle: &AppHandle<R>) -> AboutMetadata<'_> {
-    let pkg_info = app_handle.package_info();
-    let config = app_handle.config();
-    AboutMetadata {
-        name: Some(pkg_info.name.clone()),
-        version: Some(pkg_info.version.to_string()),
-        copyright: config.bundle.copyright.clone(),
-        authors: config.bundle.publisher.clone().map(|publisher| vec![publisher]),
-        ..Default::default()
-    }
 }
 
 fn parse_arxiv_feed(xml: &str, query_title: &str) -> Vec<ArxivMetadata> {

@@ -4,10 +4,11 @@ import { listen } from "@tauri-apps/api/event";
 import type { Annotation, Collection, FileAsset, LibraryState, Paper } from "@lumora/shared";
 import { FileText, X } from "lucide-react";
 import { AppToolbar } from "./components/AppToolbar";
-import { CollectionModal, DeleteCollectionModal } from "./components/CollectionModal";
+import { CollectionModal, DeleteCollectionModal, RenameCollectionModal } from "./components/CollectionModal";
 import { LibrarySidebar } from "./components/LibrarySidebar";
 import { ManualReferenceModal, type ManualReferenceDraft } from "./components/ManualReferenceModal";
 import { ShortcutsHelpModal } from "./components/ShortcutsHelpModal";
+import { AboutModal } from "./components/AboutModal";
 import { NotebookPanel } from "./components/NotebookPanel";
 import { PaperList } from "./components/PaperList";
 import { PdfReader, type PdfReaderViewState } from "./components/PdfReader";
@@ -19,7 +20,8 @@ import {
   deletePaperFromLibrary,
   getCollectionAndDescendantIds,
   getCollectionPaperCount,
-  removePaperFromCollectionTree
+  removePaperFromCollectionTree,
+  renameCollection
 } from "./lib/libraryActions";
 import {
   getFileBytes,
@@ -105,9 +107,11 @@ export default function App() {
   const [paperDrag, setPaperDrag] = useState<PaperDrag>();
   const [manualModalOpen, setManualModalOpen] = useState(false);
   const [shortcutsHelpOpen, setShortcutsHelpOpen] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);
   const [collectionModalParentId, setCollectionModalParentId] = useState<string | undefined>();
   const [collectionModalOpen, setCollectionModalOpen] = useState(false);
   const [deleteCollectionId, setDeleteCollectionId] = useState<string | undefined>();
+  const [renameCollectionId, setRenameCollectionId] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string>();
   const collectionPaperCounts = useMemo(() => getCollectionPaperCounts(library), [library]);
@@ -193,6 +197,8 @@ export default function App() {
         handleCloseActiveWorkspaceTab();
       } else if (event.payload === "show-shortcuts-help") {
         setShortcutsHelpOpen(true);
+      } else if (event.payload === "show-about") {
+        setAboutOpen(true);
       }
     }).then((nextUnlisten) => {
       if (disposed) {
@@ -521,6 +527,25 @@ export default function App() {
     setCollectionModalOpen(false);
     setCollectionModalParentId(undefined);
     setStatus(parent ? `Created folder in ${parent.name}.` : "Created folder.");
+  }
+
+  function handleRequestRenameCollection(collectionId: string) {
+    setRenameCollectionId(collectionId);
+  }
+
+  function handleRenameCollection(name: string) {
+    if (!renameCollectionId) {
+      return;
+    }
+
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      return;
+    }
+
+    setLibrary((current) => renameCollection(current, renameCollectionId, trimmedName));
+    setRenameCollectionId(undefined);
+    setStatus(`Renamed folder to ${trimmedName}.`);
   }
 
   function handleRequestDeleteCollection(collectionId: string) {
@@ -857,6 +882,7 @@ export default function App() {
               onSelectAuthor={setSelectedAuthor}
               onSelectTag={setSelectedTag}
               onCreateCollection={handleCreateCollection}
+              onRenameCollection={handleRequestRenameCollection}
               onDeleteCollection={handleRequestDeleteCollection}
               onAddPaperToCollection={handleAddPaperToCollection}
             />
@@ -951,6 +977,7 @@ export default function App() {
         onSave={handleCreateManualReference}
       />
       <ShortcutsHelpModal open={shortcutsHelpOpen} onClose={() => setShortcutsHelpOpen(false)} />
+      <AboutModal open={aboutOpen} onClose={() => setAboutOpen(false)} />
       <CollectionModal
         open={collectionModalOpen}
         parentName={library.collections.find((collection) => collection.id === collectionModalParentId)?.name}
@@ -968,6 +995,12 @@ export default function App() {
         )?.name}
         onClose={() => setDeleteCollectionId(undefined)}
         onDelete={handleDeleteCollection}
+      />
+      <RenameCollectionModal
+        open={Boolean(renameCollectionId)}
+        currentName={library.collections.find((collection) => collection.id === renameCollectionId)?.name}
+        onClose={() => setRenameCollectionId(undefined)}
+        onSave={handleRenameCollection}
       />
     </main>
   );

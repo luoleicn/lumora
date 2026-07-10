@@ -6,6 +6,7 @@ import {
   FileText,
   Folder,
   FolderPlus,
+  Pencil,
   Star,
   Tags,
   Trash2,
@@ -13,7 +14,7 @@ import {
   type LucideIcon
 } from "lucide-react";
 import type { Collection, LibraryState } from "@lumora/shared";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import lumoraLogoUrl from "../assets/lumora-logo-64.png";
 
 type LibrarySidebarProps = {
@@ -27,8 +28,16 @@ type LibrarySidebarProps = {
   onSelectAuthor: (author?: string) => void;
   onSelectTag: (tag?: string) => void;
   onCreateCollection: (parentId?: string) => void;
+  onRenameCollection: (collectionId: string) => void;
   onDeleteCollection: (collectionId: string) => void;
   onAddPaperToCollection: (paperId: string, collectionId: string) => void;
+};
+
+type CollectionContextMenu = {
+  x: number;
+  y: number;
+  collectionId: string;
+  collectionName: string;
 };
 
 export function LibrarySidebar({
@@ -42,6 +51,7 @@ export function LibrarySidebar({
   onSelectAuthor,
   onSelectTag,
   onCreateCollection,
+  onRenameCollection,
   onDeleteCollection,
   onAddPaperToCollection
 }: LibrarySidebarProps) {
@@ -49,6 +59,23 @@ export function LibrarySidebar({
   const [tagsExpanded, setTagsExpanded] = useState(false);
   const [collapsedCollections, setCollapsedCollections] = useState<Record<string, boolean>>({});
   const [nativeDragOverCollectionId, setNativeDragOverCollectionId] = useState<string>();
+  const [contextMenu, setContextMenu] = useState<CollectionContextMenu>();
+
+  useEffect(() => {
+    if (!contextMenu) {
+      return;
+    }
+
+    const closeMenu = () => setContextMenu(undefined);
+    window.addEventListener("click", closeMenu);
+    window.addEventListener("keydown", closeMenu);
+    window.addEventListener("scroll", closeMenu, true);
+    return () => {
+      window.removeEventListener("click", closeMenu);
+      window.removeEventListener("keydown", closeMenu);
+      window.removeEventListener("scroll", closeMenu, true);
+    };
+  }, [contextMenu]);
   const visibleDragOverCollectionId = dragOverCollectionId ?? nativeDragOverCollectionId;
   const collections = state.collections
     .filter((collection) => !collection.deletedAt)
@@ -126,10 +153,9 @@ export function LibrarySidebar({
                   setCollapsedCollections((current) => ({ ...current, [collectionId]: !current[collectionId] }));
                 }}
                 onSelectCollection={onSelectCollection}
-                onCreateCollection={onCreateCollection}
-                onDeleteCollection={onDeleteCollection}
                 onAddPaperToCollection={onAddPaperToCollection}
                 onDragOverCollection={setNativeDragOverCollectionId}
+                onOpenContextMenu={setContextMenu}
               />
             ))}
           </div>
@@ -222,6 +248,53 @@ export function LibrarySidebar({
           </>
         )}
       </section>
+
+      {contextMenu && (
+        <div
+          className="paper-context-menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          role="menu"
+          onClick={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setContextMenu(undefined);
+              onRenameCollection(contextMenu.collectionId);
+            }}
+          >
+            <Pencil size={15} />
+            <span>Rename Folder</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setContextMenu(undefined);
+              onCreateCollection(contextMenu.collectionId);
+            }}
+          >
+            <FolderPlus size={15} />
+            <span>New Subfolder...</span>
+          </button>
+          {contextMenu.collectionId !== "collection_inbox" && (
+            <button
+              type="button"
+              className="danger"
+              role="menuitem"
+              onClick={() => {
+                setContextMenu(undefined);
+                onDeleteCollection(contextMenu.collectionId);
+              }}
+            >
+              <Trash2 size={15} />
+              <span>Delete Folder</span>
+            </button>
+          )}
+        </div>
+      )}
     </aside>
   );
 }
@@ -240,10 +313,9 @@ function CollectionTreeNode({
   getCount,
   onToggle,
   onSelectCollection,
-  onCreateCollection,
-  onDeleteCollection,
   onAddPaperToCollection,
-  onDragOverCollection
+  onDragOverCollection,
+  onOpenContextMenu
 }: {
   node: CollectionNode;
   depth: number;
@@ -253,10 +325,9 @@ function CollectionTreeNode({
   getCount: (collectionId: string) => number;
   onToggle: (collectionId: string) => void;
   onSelectCollection: (id: string) => void;
-  onCreateCollection: (parentId?: string) => void;
-  onDeleteCollection: (collectionId: string) => void;
   onAddPaperToCollection: (paperId: string, collectionId: string) => void;
   onDragOverCollection: (collectionId?: string) => void;
+  onOpenContextMenu: (menu: CollectionContextMenu) => void;
 }) {
   const { collection, children } = node;
   const collapsed = Boolean(collapsedCollections[collection.id]);
@@ -269,6 +340,16 @@ function CollectionTreeNode({
         className={dragOver ? "collection-tree-row drag-over" : "collection-tree-row"}
         style={{ paddingLeft: `${depth * 14}px` }}
         data-collection-drop-id={collection.id}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onOpenContextMenu({
+            x: event.clientX,
+            y: event.clientY,
+            collectionId: collection.id,
+            collectionName: collection.name
+          });
+        }}
         onDragOver={(event) => {
           if (hasPaperDragData(event.dataTransfer)) {
             event.preventDefault();
@@ -316,28 +397,6 @@ function CollectionTreeNode({
           <span>{collection.name}</span>
           <strong>{getCount(collection.id)}</strong>
         </button>
-        <button
-          className="collection-child-button"
-          type="button"
-          onClick={() => onCreateCollection(collection.id)}
-          aria-label={`Create folder under ${collection.name}`}
-          title={`Create folder under ${collection.name}`}
-        >
-          <FolderPlus size={14} />
-        </button>
-        {collection.id !== "collection_inbox" ? (
-          <button
-            className="collection-delete-button"
-            type="button"
-            onClick={() => onDeleteCollection(collection.id)}
-            aria-label={`Delete ${collection.name}`}
-            title={`Delete ${collection.name}`}
-          >
-            <Trash2 size={14} />
-          </button>
-        ) : (
-          <span className="collection-action-spacer" />
-        )}
       </div>
       {hasChildren && !collapsed && children.map((child) => (
         <CollectionTreeNode
@@ -350,10 +409,9 @@ function CollectionTreeNode({
           getCount={getCount}
           onToggle={onToggle}
           onSelectCollection={onSelectCollection}
-          onCreateCollection={onCreateCollection}
-          onDeleteCollection={onDeleteCollection}
           onAddPaperToCollection={onAddPaperToCollection}
           onDragOverCollection={onDragOverCollection}
+          onOpenContextMenu={onOpenContextMenu}
         />
       ))}
     </>

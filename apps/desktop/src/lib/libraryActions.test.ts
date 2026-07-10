@@ -6,7 +6,8 @@ import {
   deletePaperFromLibrary,
   getCollectionAndDescendantIds,
   getCollectionPaperCount,
-  removePaperFromCollectionTree
+  removePaperFromCollectionTree,
+  renameCollection
 } from "./libraryActions";
 
 const now = "2026-07-06T00:00:00.000Z";
@@ -118,6 +119,34 @@ describe("library actions", () => {
     expect(next.collections.find((item) => item.id === "folder-parent")?.deletedAt).toBe(now);
     expect(next.collections.find((item) => item.id === "folder-child")?.parentId).toBeUndefined();
     expect(next.paperCollections.find((item) => item.id === "pc-parent-a")?.deletedAt).toBe(now);
+  });
+
+  it("renames a folder and stamps updatedAt", () => {
+    const next = renameCollection(state(), "folder-parent", "  Reading List  ", now);
+
+    expect(next.collections.find((item) => item.id === "folder-parent")).toEqual(
+      expect.objectContaining({ name: "Reading List", updatedAt: now })
+    );
+  });
+
+  it("renames the system inbox folder since consumers key on its id", () => {
+    const next = renameCollection(state(), "collection_inbox", "My Inbox", now);
+
+    expect(next.collections.find((item) => item.id === "collection_inbox")).toEqual(
+      expect.objectContaining({ name: "My Inbox", updatedAt: now })
+    );
+  });
+
+  it("ignores renames for missing, deleted, empty-name, and unchanged folders", () => {
+    const current = state();
+
+    expect(renameCollection(current, "missing-folder", "New Name", now)).toBe(current);
+    expect(renameCollection(current, "folder-parent", "   ", now)).toBe(current);
+    expect(renameCollection(current, "folder-parent", "folder-parent", now)).toBe(current);
+    const deletedFolderState = { ...current, collections: current.collections.map((item) =>
+      item.id === "folder-target" ? { ...item, deletedAt: now } : item
+    ) };
+    expect(renameCollection(deletedFolderState, "folder-target", "New Name", now)).toBe(deletedFolderState);
   });
 
   it("does not delete the system inbox folder", () => {

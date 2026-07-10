@@ -129,6 +129,23 @@ export function removePaperFromCollectionTree(
   };
 }
 
+// Unlike deletion, renaming the system inbox is allowed: every consumer keys on
+// the fixed "collection_inbox" id, so the display name is free to change.
+export function renameCollection(state: LibraryState, collectionId: EntityId, name: string, now = new Date().toISOString()) {
+  const trimmedName = name.trim();
+  const target = state.collections.find((collection) => collection.id === collectionId && !collection.deletedAt);
+  if (!target || !trimmedName || target.name === trimmedName) {
+    return state;
+  }
+
+  return {
+    ...state,
+    collections: state.collections.map((collection) =>
+      collection.id === collectionId ? { ...collection, name: trimmedName, updatedAt: now } : collection
+    )
+  };
+}
+
 export function deleteCollectionAndReassignPapers(state: LibraryState, collectionId: EntityId, now = new Date().toISOString()) {
   const target = state.collections.find((collection) => collection.id === collectionId && !collection.deletedAt);
   if (!target || target.id === "collection_inbox") {
