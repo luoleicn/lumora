@@ -83,6 +83,29 @@ export function deletePaperFromLibrary(state: LibraryState, paperId: EntityId, n
   };
 }
 
+// Restores the paper (and its file/annotations) but leaves its old
+// paperCollections links deleted, so it lands in Unsorted rather than
+// reappearing in whatever folder it was in before deletion.
+export function restorePaperFromTrash(state: LibraryState, paperId: EntityId, now = new Date().toISOString()) {
+  const paper = state.papers.find((item) => item.id === paperId && item.deletedAt);
+  if (!paper) {
+    return state;
+  }
+
+  return {
+    ...state,
+    papers: state.papers.map((item) =>
+      item.id === paperId ? { ...item, deletedAt: undefined, updatedAt: now } : item
+    ),
+    fileAssets: state.fileAssets.map((item) =>
+      item.paperId === paperId && item.deletedAt ? { ...item, deletedAt: undefined, updatedAt: now } : item
+    ),
+    annotations: state.annotations.map((item) =>
+      item.paperId === paperId && item.deletedAt ? { ...item, deletedAt: undefined, updatedAt: now } : item
+    )
+  };
+}
+
 export function removePaperFromCollectionTree(
   state: LibraryState,
   paperId: EntityId,

@@ -16,6 +16,7 @@
   "dependencies": {
     "@lumora/shared": "0.1.0",
     "@tauri-apps/api": "^2.6.0",
+    "@tauri-apps/plugin-dialog": "^2.7.1",
     "lucide-react": "^0.468.0",
     "pdfjs-dist": "5.4.296",
     "react": "^19.1.0",

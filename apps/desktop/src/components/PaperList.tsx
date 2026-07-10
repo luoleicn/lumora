@@ -1,4 +1,4 @@
-import { FileText, FolderMinus, Star, Trash2 } from "lucide-react";
+import { FileText, FolderMinus, RotateCcw, Star, Trash2 } from "lucide-react";
 import type { FileAsset, LibraryState, Paper } from "@lumora/shared";
 import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 
@@ -61,6 +61,7 @@ type PaperListProps = {
   onPaperDragEnd: (paperId: string, collectionId?: string) => void;
   onRemovePaperFromCollection: (paperId: string) => void;
   onDeletePaper: (paperId: string) => void;
+  onRestorePaper: (paperId: string) => void;
 };
 
 export function PaperList({
@@ -75,8 +76,10 @@ export function PaperList({
   onPaperDragMove,
   onPaperDragEnd,
   onRemovePaperFromCollection,
-  onDeletePaper
+  onDeletePaper,
+  onRestorePaper
 }: PaperListProps) {
+  const isTrash = selectedCollectionId === "trash";
   const [sortKey, setSortKey] = useState<SortKey>("added");
   const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
   const [columnWidths, setColumnWidths] = useState<PaperColumnWidths>(() => loadColumnWidths());
@@ -322,9 +325,14 @@ export function PaperList({
         <PaperContextMenu
           x={contextMenu.x}
           y={contextMenu.y}
+          isTrash={isTrash}
           canRemoveFromCollection={isRealCollectionId(selectedCollectionId)}
           onRemoveFromCollection={() => {
             onRemovePaperFromCollection(contextMenu.paperId);
+            setContextMenu(undefined);
+          }}
+          onRestorePaper={() => {
+            onRestorePaper(contextMenu.paperId);
             setContextMenu(undefined);
           }}
           onDeletePaper={() => {
@@ -449,14 +457,18 @@ function PaperRow({
 function PaperContextMenu({
   x,
   y,
+  isTrash,
   canRemoveFromCollection,
   onRemoveFromCollection,
+  onRestorePaper,
   onDeletePaper
 }: {
   x: number;
   y: number;
+  isTrash: boolean;
   canRemoveFromCollection: boolean;
   onRemoveFromCollection: () => void;
+  onRestorePaper: () => void;
   onDeletePaper: () => void;
 }) {
   return (
@@ -467,16 +479,25 @@ function PaperContextMenu({
       onClick={(event) => event.stopPropagation()}
       onContextMenu={(event) => event.preventDefault()}
     >
-      {canRemoveFromCollection && (
-        <button type="button" role="menuitem" onClick={onRemoveFromCollection}>
-          <FolderMinus size={15} />
-          <span>Remove from Folder</span>
+      {isTrash ? (
+        <button type="button" role="menuitem" onClick={onRestorePaper}>
+          <RotateCcw size={15} />
+          <span>Restore to Unsorted</span>
         </button>
+      ) : (
+        <>
+          {canRemoveFromCollection && (
+            <button type="button" role="menuitem" onClick={onRemoveFromCollection}>
+              <FolderMinus size={15} />
+              <span>Remove from Folder</span>
+            </button>
+          )}
+          <button type="button" className="danger" role="menuitem" onClick={onDeletePaper}>
+            <Trash2 size={15} />
+            <span>Delete Document</span>
+          </button>
+        </>
       )}
-      <button type="button" className="danger" role="menuitem" onClick={onDeletePaper}>
-        <Trash2 size={15} />
-        <span>Delete Document</span>
-      </button>
     </div>
   );
 }

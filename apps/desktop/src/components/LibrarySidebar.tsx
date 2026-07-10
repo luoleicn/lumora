@@ -3,6 +3,7 @@ import {
   ChevronDown,
   ChevronRight,
   Clock,
+  FilePlus,
   FileText,
   Folder,
   FolderPlus,
@@ -31,6 +32,7 @@ type LibrarySidebarProps = {
   onRenameCollection: (collectionId: string) => void;
   onDeleteCollection: (collectionId: string) => void;
   onAddPaperToCollection: (paperId: string, collectionId: string) => void;
+  onAddPdfToCollection: (collectionId: string) => void;
 };
 
 type CollectionContextMenu = {
@@ -53,7 +55,8 @@ export function LibrarySidebar({
   onCreateCollection,
   onRenameCollection,
   onDeleteCollection,
-  onAddPaperToCollection
+  onAddPaperToCollection,
+  onAddPdfToCollection
 }: LibrarySidebarProps) {
   const [authorsExpanded, setAuthorsExpanded] = useState(false);
   const [tagsExpanded, setTagsExpanded] = useState(false);
@@ -257,6 +260,17 @@ export function LibrarySidebar({
           onClick={(event) => event.stopPropagation()}
           onContextMenu={(event) => event.preventDefault()}
         >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setContextMenu(undefined);
+              onAddPdfToCollection(contextMenu.collectionId);
+            }}
+          >
+            <FilePlus size={15} />
+            <span>Add PDF...</span>
+          </button>
           <button
             type="button"
             role="menuitem"

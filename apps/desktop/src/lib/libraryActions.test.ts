@@ -7,7 +7,8 @@ import {
   getCollectionAndDescendantIds,
   getCollectionPaperCount,
   removePaperFromCollectionTree,
-  renameCollection
+  renameCollection,
+  restorePaperFromTrash
 } from "./libraryActions";
 
 const now = "2026-07-06T00:00:00.000Z";
@@ -189,6 +190,40 @@ describe("library actions", () => {
     expect(next.fileAssets.find((item) => item.id === "file-a")?.deletedAt).toBe(now);
     expect(next.annotations.find((item) => item.id === "annotation-a")?.deletedAt).toBe(now);
     expect(next.paperCollections.find((item) => item.id === "pc-parent-a")?.deletedAt).toBe(now);
+  });
+
+  it("restores a trashed paper and its file/annotations, leaving folder links deleted so it lands in Unsorted", () => {
+    const trashedNow = "2026-07-09T00:00:00.000Z";
+    const withFile: LibraryState = {
+      ...state(),
+      fileAssets: [{
+        id: "file-a",
+        paperId: "paper-a",
+        sha256: "hash",
+        size: 10,
+        mime: "application/pdf",
+        fileName: "paper-a.pdf",
+        downloadState: "local",
+        createdAt: trashedNow,
+        updatedAt: trashedNow
+      }]
+    };
+    const trashed = deletePaperFromLibrary(withFile, "paper-a", trashedNow);
+
+    const restored = restorePaperFromTrash(trashed, "paper-a", now);
+
+    expect(restored.papers.find((item) => item.id === "paper-a")?.deletedAt).toBeUndefined();
+    expect(restored.fileAssets.find((item) => item.id === "file-a")?.deletedAt).toBeUndefined();
+    expect(restored.papers.find((item) => item.id === "paper-a")?.updatedAt).toBe(now);
+    expect(restored.paperCollections.find((item) => item.id === "pc-parent-a")?.deletedAt).toBe(trashedNow);
+    expect(restored.paperCollections.find((item) => item.id === "pc-target-a")?.deletedAt).toBe(trashedNow);
+  });
+
+  it("ignores restoring a paper that is missing or not currently trashed", () => {
+    const current = state();
+
+    expect(restorePaperFromTrash(current, "missing-paper", now)).toBe(current);
+    expect(restorePaperFromTrash(current, "paper-a", now)).toBe(current);
   });
 
   it("moves a paper to the parent folder when removed from a child folder", () => {

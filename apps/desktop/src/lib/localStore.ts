@@ -74,7 +74,11 @@ export function saveLibraryState(state: LibraryState) {
   localStorage.setItem(libraryKey, JSON.stringify(state));
 }
 
-export async function importPdfFile(current: LibraryState, file: File): Promise<ImportedPdf> {
+export async function importPdfFile(
+  current: LibraryState,
+  file: File,
+  options?: { skipBlobStore?: boolean }
+): Promise<ImportedPdf> {
   const now = new Date().toISOString();
   const paperId = createId("paper");
   const fileAssetId = createId("file");
@@ -116,7 +120,9 @@ export async function importPdfFile(current: LibraryState, file: File): Promise<
     updatedAt: now
   };
 
-  await putFileBlob(fileAssetId, file);
+  if (!options?.skipBlobStore) {
+    await putFileBlob(fileAssetId, file);
+  }
 
   return {
     paper,
@@ -168,6 +174,17 @@ export async function putFileBlob(fileAssetId: string, file: Blob): Promise<void
   await new Promise<void>((resolve, reject) => {
     const transaction = db.transaction(fileStoreName, "readwrite");
     transaction.objectStore(fileStoreName).put(file, fileAssetId);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+  db.close();
+}
+
+export async function deleteFileBlob(fileAssetId: string): Promise<void> {
+  const db = await openFilesDb();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(fileStoreName, "readwrite");
+    transaction.objectStore(fileStoreName).delete(fileAssetId);
     transaction.oncomplete = () => resolve();
     transaction.onerror = () => reject(transaction.error);
   });

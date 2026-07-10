@@ -13,7 +13,8 @@ import type {
   SyncPushResponse
 } from "@lumora/shared";
 import { invoke } from "@tauri-apps/api/core";
-import { getClientId, getFileBlob, upsertById } from "./localStore";
+import { getClientId, upsertById } from "./localStore";
+import { loadFileStorageSettings, readFileBytes } from "./fileStorage";
 
 export type SyncSettings = {
   serverUrl: string;
@@ -186,6 +187,7 @@ function applyRemoteChanges(state: LibraryState, response: SyncPullResponse): Li
 
 async function uploadLocalFiles(settings: SyncSettings, state: LibraryState): Promise<LibraryState> {
   const nextFileAssets: FileAsset[] = [];
+  const storageSettings = loadFileStorageSettings();
 
   for (const fileAsset of state.fileAssets) {
     if (fileAsset.deletedAt || fileAsset.objectKey) {
@@ -193,11 +195,12 @@ async function uploadLocalFiles(settings: SyncSettings, state: LibraryState): Pr
       continue;
     }
 
-    const blob = await getFileBlob(fileAsset.id);
-    if (!blob) {
+    const bytes = await readFileBytes(fileAsset, storageSettings);
+    if (!bytes) {
       nextFileAssets.push(fileAsset);
       continue;
     }
+    const blob = new Blob([new Uint8Array(bytes).buffer as ArrayBuffer], { type: fileAsset.mime });
 
     const request: InitUploadRequest = {
       fileAssetId: fileAsset.id,

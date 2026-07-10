@@ -21,16 +21,28 @@ import {
   getCollectionAndDescendantIds,
   getCollectionPaperCount,
   removePaperFromCollectionTree,
-  renameCollection
+  renameCollection,
+  restorePaperFromTrash
 } from "./lib/libraryActions";
 import {
-  getFileBytes,
-  importPdfFile,
   loadLibraryState,
   markAnnotationDeleted,
   saveLibraryState,
   upsertById
 } from "./lib/localStore";
+import { enqueueLibraryPersist, importStateToDb, loadLibraryFromDb } from "./lib/libraryDb";
+import {
+  buildPdfFileName,
+  fileNameMatchesTarget,
+  importPdf,
+  loadFileStorageSettings,
+  migrateStoredPdfs,
+  movePdfOnDisk,
+  readFileBytes,
+  saveFileStorageSettings,
+  type FileStorageSettings
+} from "./lib/fileStorage";
+import { FileStorageSettingsModal } from "./components/FileStorageSettingsModal";
 import { parseReferenceFile } from "./lib/referenceImport";
 import {
   login,
@@ -91,6 +103,12 @@ const documentsTab: WorkspaceTab = { id: "documents", kind: "documents", title: 
 export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const referenceInputRef = useRef<HTMLInputElement>(null);
+  const importTargetCollectionIdRef = useRef<string | undefined>(undefined);
+  const pdfRenameInFlightRef = useRef(false);
+  const libraryRef = useRef<LibraryState | undefined>(undefined);
+  const lastPersistedLibraryRef = useRef<LibraryState | undefined>(undefined);
+  const libraryLoadedRef = useRef(false);
+  const localStorageFallbackRef = useRef(false);
   const [library, setLibrary] = useState<LibraryState>(() => loadLibraryState());
   const [selectedCollectionId, setSelectedCollectionId] = useState("all");
   const [selectedAuthor, setSelectedAuthor] = useState<string>();
@@ -102,6 +120,9 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [fileDataById, setFileDataById] = useState<Record<string, Uint8Array>>({});
   const [settings, setSettings] = useState<SyncSettings>(() => loadSyncSettings());
+  const [fileStorageSettings, setFileStorageSettings] = useState<FileStorageSettings>(() => loadFileStorageSettings());
+  const [fileStorageModalOpen, setFileStorageModalOpen] = useState(false);
+  const [fileStorageBusy, setFileStorageBusy] = useState(false);
   const [workspaceLayout, setWorkspaceLayout] = useState<WorkspaceLayout>(() => loadWorkspaceLayout());
   const [resizeDrag, setResizeDrag] = useState<ResizeDrag>();
   const [paperDrag, setPaperDrag] = useState<PaperDrag>();
@@ -117,7 +138,68 @@ export default function App() {
   const collectionPaperCounts = useMemo(() => getCollectionPaperCounts(library), [library]);
 
   useEffect(() => {
-    saveLibraryState(library);
+    libraryRef.current = library;
+  }, [library]);
+
+  // Startup: SQLite is the source of truth. When it is empty this is a first
+  // run on the new storage layer, so the legacy localStorage state (already in
+  // React state) is imported once; localStorage is kept untouched as a backup
+  // but never written again.
+  useEffect(() => {
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        const { state: dbState, empty } = await loadLibraryFromDb();
+        if (cancelled) {
+          return;
+        }
+
+        if (!empty) {
+          lastPersistedLibraryRef.current = dbState;
+          libraryLoadedRef.current = true;
+          setLibrary(dbState);
+          return;
+        }
+
+        const legacyState = libraryRef.current ?? library;
+        await importStateToDb(legacyState);
+        if (cancelled) {
+          return;
+        }
+        lastPersistedLibraryRef.current = legacyState;
+        libraryLoadedRef.current = true;
+      } catch (error) {
+        // Without a working database, fall back to the legacy localStorage
+        // persistence for this session rather than silently losing edits.
+        localStorageFallbackRef.current = true;
+        setStatus(`Library database unavailable, falling back to browser storage: ${error}`);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!libraryLoadedRef.current) {
+      if (localStorageFallbackRef.current) {
+        saveLibraryState(library);
+      }
+      return;
+    }
+
+    const previous = lastPersistedLibraryRef.current;
+    if (!previous || previous === library) {
+      return;
+    }
+
+    lastPersistedLibraryRef.current = library;
+    void enqueueLibraryPersist(previous, library, (error) => {
+      setStatus(`Failed to save library: ${error}`);
+    });
   }, [library]);
 
   useEffect(() => {
@@ -127,6 +209,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(workspaceLayoutKey, JSON.stringify(workspaceLayout));
   }, [workspaceLayout]);
+
+  useEffect(() => {
+    saveFileStorageSettings(fileStorageSettings);
+  }, [fileStorageSettings]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -199,6 +285,8 @@ export default function App() {
         setShortcutsHelpOpen(true);
       } else if (event.payload === "show-about") {
         setAboutOpen(true);
+      } else if (event.payload === "show-file-storage-settings") {
+        setFileStorageModalOpen(true);
       }
     }).then((nextUnlisten) => {
       if (disposed) {
@@ -352,8 +440,8 @@ export default function App() {
     : [];
   const selectedFileData = selectedFile ? fileDataById[selectedFile.id] : undefined;
   const activeWorkspaceTab = workspaceTabs.find((tab) => tab.id === activeWorkspaceTabId) ?? documentsTab;
-  const openPaperFileIds = useMemo(() => workspaceTabs
-    .flatMap((tab) => {
+  const openPaperFileIds = useMemo(() => {
+    const fileIds = workspaceTabs.flatMap((tab) => {
       if (tab.kind !== "paper") {
         return [];
       }
@@ -363,7 +451,19 @@ export default function App() {
         ? library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt)
         : undefined;
       return fileAsset ? [fileAsset.id] : [];
-    }), [library.fileAssets, library.papers, workspaceTabs]);
+    });
+
+    // The Details panel (Extract PDF, metadata preview) needs bytes for the
+    // selected paper even when its reader tab isn't open.
+    const selectedFileId = selectedPaperId
+      ? library.fileAssets.find((item) => item.paperId === selectedPaperId && !item.deletedAt)?.id
+      : undefined;
+    if (selectedFileId && !fileIds.includes(selectedFileId)) {
+      fileIds.push(selectedFileId);
+    }
+
+    return fileIds;
+  }, [library.fileAssets, library.papers, selectedPaperId, workspaceTabs]);
 
   useEffect(() => {
     let cancelled = false;
@@ -373,18 +473,31 @@ export default function App() {
       return undefined;
     }
 
-    void Promise.all(missingFileIds.map(async (fileId) => {
-      const bytes = await getFileBytes(fileId);
+    void Promise.all(missingFileIds.map(async (fileId): Promise<{ fileId: string; bytes?: Uint8Array; missingFileName?: string } | undefined> => {
+      const fileAsset = library.fileAssets.find((item) => item.id === fileId);
+      if (!fileAsset) {
+        return undefined;
+      }
+
+      const bytes = await readFileBytes(fileAsset, fileStorageSettings);
+      if (!bytes && fileAsset.localPath) {
+        return { fileId, missingFileName: fileAsset.fileName };
+      }
       return bytes ? { fileId, bytes } : undefined;
     })).then((loadedFiles) => {
       if (cancelled) {
         return;
       }
 
+      const missingFile = loadedFiles.find((loadedFile) => loadedFile?.missingFileName);
+      if (missingFile?.missingFileName) {
+        setStatus(`PDF file not found on disk: ${missingFile.missingFileName}`);
+      }
+
       setFileDataById((current) => {
         const next = { ...current };
         for (const loadedFile of loadedFiles) {
-          if (loadedFile) {
+          if (loadedFile?.bytes) {
             next[loadedFile.fileId] = loadedFile.bytes;
           }
         }
@@ -395,20 +508,56 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [fileDataById, openPaperFileIds]);
+  }, [fileDataById, fileStorageSettings, library.fileAssets, openPaperFileIds]);
 
-  async function handleImportPdf(file?: File) {
+  // Details-panel inputs fire onUpdatePaper per keystroke, so on-disk renames are
+  // debounced off a fingerprint of the naming inputs instead of running inline.
+  const pdfRenameFingerprint = useMemo(() => {
+    if (!fileStorageSettings.directory) {
+      return "";
+    }
+
+    return library.fileAssets
+      .filter((fileAsset) => !fileAsset.deletedAt && fileAsset.localPath)
+      .map((fileAsset) => {
+        const paper = library.papers.find((item) => item.id === fileAsset.paperId && !item.deletedAt);
+        return paper
+          ? `${fileAsset.id}:${fileAsset.localPath}:${buildPdfFileName(paper, fileStorageSettings.nameTemplate)}`
+          : "";
+      })
+      .join("|");
+  }, [fileStorageSettings, library.fileAssets, library.papers]);
+
+  useEffect(() => {
+    if (!pdfRenameFingerprint || fileStorageBusy) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      void renameStoredPdfsToMatchMetadata();
+    }, 1500);
+    return () => window.clearTimeout(timer);
+  }, [fileStorageBusy, pdfRenameFingerprint]);
+
+  async function handleImportPdf(file?: File, targetCollectionId?: string) {
     if (!file) {
       return;
     }
 
-    const imported = await importPdfFile(library, file);
-    setLibrary(imported.state);
+    const imported = await importPdf(library, file, fileStorageSettings);
+    const targetCollection = targetCollectionId && targetCollectionId !== "collection_inbox"
+      ? library.collections.find((collection) => collection.id === targetCollectionId && !collection.deletedAt)
+      : undefined;
+    const finalState = targetCollection
+      ? addPaperToCollection(imported.state, imported.paper.id, targetCollection.id)
+      : imported.state;
+
+    setLibrary(finalState);
     setSelectedPaperId(imported.paper.id);
-    setSelectedCollectionId("all");
+    setSelectedCollectionId(targetCollection?.id ?? "all");
     setSelectedAuthor(undefined);
     setSelectedTag(undefined);
-    setStatus(`Imported ${file.name}.`);
+    setStatus(targetCollection ? `Imported ${file.name} to ${targetCollection.name}.` : `Imported ${file.name}.`);
   }
 
   async function handleImportReferenceFile(file?: File) {
@@ -498,6 +647,11 @@ export default function App() {
   function handleCreateCollection(parentId?: string) {
     setCollectionModalParentId(parentId);
     setCollectionModalOpen(true);
+  }
+
+  function handleAddPdfToCollection(collectionId: string) {
+    importTargetCollectionIdRef.current = collectionId;
+    fileInputRef.current?.click();
   }
 
   function handleSaveCollection(name: string) {
@@ -657,6 +811,16 @@ export default function App() {
     setStatus(`Deleted ${paper.title}.`);
   }
 
+  function handleRestorePaper(paperId: string) {
+    const paper = library.papers.find((item) => item.id === paperId && item.deletedAt);
+    if (!paper) {
+      return;
+    }
+
+    setLibrary((current) => restorePaperFromTrash(current, paperId));
+    setStatus(`Restored ${paper.title} to Unsorted.`);
+  }
+
   function handleCreateAnnotation(annotation: Annotation) {
     setLibrary((current) => ({
       ...current,
@@ -774,6 +938,81 @@ export default function App() {
     }));
   }
 
+  async function renameStoredPdfsToMatchMetadata() {
+    const directory = fileStorageSettings.directory;
+    if (!directory || pdfRenameInFlightRef.current) {
+      return;
+    }
+
+    pdfRenameInFlightRef.current = true;
+    try {
+      const updates: Array<{ id: string; fileName: string }> = [];
+      for (const fileAsset of library.fileAssets) {
+        if (fileAsset.deletedAt || !fileAsset.localPath) {
+          continue;
+        }
+
+        const paper = library.papers.find((item) => item.id === fileAsset.paperId && !item.deletedAt);
+        if (!paper) {
+          continue;
+        }
+
+        const targetName = buildPdfFileName(paper, fileStorageSettings.nameTemplate);
+        if (fileNameMatchesTarget(fileAsset.localPath, targetName)) {
+          continue;
+        }
+
+        try {
+          const storedName = await movePdfOnDisk(directory, fileAsset.localPath, directory, targetName);
+          updates.push({ id: fileAsset.id, fileName: storedName });
+        } catch (error) {
+          setStatus(`Failed to rename PDF: ${error}`);
+        }
+      }
+
+      if (updates.length > 0) {
+        const now = new Date().toISOString();
+        setLibrary((current) => ({
+          ...current,
+          fileAssets: current.fileAssets.map((item) => {
+            const update = updates.find((entry) => entry.id === item.id);
+            return update
+              ? { ...item, fileName: update.fileName, localPath: update.fileName, updatedAt: now }
+              : item;
+          })
+        }));
+      }
+    } finally {
+      pdfRenameInFlightRef.current = false;
+    }
+  }
+
+  async function handleSaveFileStorageSettings(nextSettings: FileStorageSettings) {
+    const directoryChanged = nextSettings.directory !== fileStorageSettings.directory;
+    const templateChanged = nextSettings.nameTemplate !== fileStorageSettings.nameTemplate;
+
+    if (!nextSettings.directory || (!directoryChanged && !templateChanged)) {
+      setFileStorageSettings(nextSettings);
+      setFileStorageModalOpen(false);
+      return;
+    }
+
+    setFileStorageBusy(true);
+    try {
+      const migrated = await migrateStoredPdfs(library, fileStorageSettings, nextSettings, (progress) => {
+        setStatus(`Moving PDFs (${progress.done}/${progress.total}): ${progress.fileName}`);
+      });
+      setLibrary(migrated);
+      setFileStorageSettings(nextSettings);
+      setFileStorageModalOpen(false);
+      setStatus(`PDF storage folder set to ${nextSettings.directory}.`);
+    } catch (error) {
+      setStatus(`File storage migration failed: ${error}`);
+    } finally {
+      setFileStorageBusy(false);
+    }
+  }
+
   async function handleLogin() {
     await runBusy("Logged in.", async () => {
       const response = await login(settings);
@@ -885,6 +1124,7 @@ export default function App() {
               onRenameCollection={handleRequestRenameCollection}
               onDeleteCollection={handleRequestDeleteCollection}
               onAddPaperToCollection={handleAddPaperToCollection}
+              onAddPdfToCollection={handleAddPdfToCollection}
             />
           )}
 
@@ -919,6 +1159,7 @@ export default function App() {
                     onPaperDragEnd={handlePaperDragEnd}
                     onRemovePaperFromCollection={handleRemovePaperFromSelectedCollection}
                     onDeletePaper={handleDeletePaper}
+                    onRestorePaper={handleRestorePaper}
                     onUpdatePdfViewState={handleUpdatePdfViewState}
                     onCreateAnnotation={handleCreateAnnotation}
                     onDeleteAnnotation={handleDeleteAnnotation}
@@ -955,7 +1196,9 @@ export default function App() {
         type="file"
         accept="application/pdf,.pdf"
         onChange={(event) => {
-          void handleImportPdf(event.target.files?.[0]);
+          const targetCollectionId = importTargetCollectionIdRef.current;
+          importTargetCollectionIdRef.current = undefined;
+          void handleImportPdf(event.target.files?.[0], targetCollectionId);
           event.currentTarget.value = "";
         }}
       />
@@ -978,6 +1221,14 @@ export default function App() {
       />
       <ShortcutsHelpModal open={shortcutsHelpOpen} onClose={() => setShortcutsHelpOpen(false)} />
       <AboutModal open={aboutOpen} onClose={() => setAboutOpen(false)} />
+      <FileStorageSettingsModal
+        open={fileStorageModalOpen}
+        settings={fileStorageSettings}
+        previewPaper={selectedPaper ?? library.papers.find((paper) => !paper.deletedAt)}
+        busy={fileStorageBusy}
+        onClose={() => setFileStorageModalOpen(false)}
+        onSave={(nextSettings) => void handleSaveFileStorageSettings(nextSettings)}
+      />
       <CollectionModal
         open={collectionModalOpen}
         parentName={library.collections.find((collection) => collection.id === collectionModalParentId)?.name}
@@ -1121,6 +1372,7 @@ function WorkspaceTabContent({
   onPaperDragEnd,
   onRemovePaperFromCollection,
   onDeletePaper,
+  onRestorePaper,
   onUpdatePdfViewState,
   onCreateAnnotation,
   onDeleteAnnotation
@@ -1141,6 +1393,7 @@ function WorkspaceTabContent({
   onPaperDragEnd: (paperId: string, collectionId?: string) => void;
   onRemovePaperFromCollection: (paperId: string) => void;
   onDeletePaper: (paperId: string) => void;
+  onRestorePaper: (paperId: string) => void;
   onUpdatePdfViewState: (paperId: string, viewState: PdfReaderViewState) => void;
   onCreateAnnotation: (annotation: Annotation) => void;
   onDeleteAnnotation: (annotation: Annotation) => void;
@@ -1160,6 +1413,7 @@ function WorkspaceTabContent({
         onPaperDragEnd={onPaperDragEnd}
         onRemovePaperFromCollection={onRemovePaperFromCollection}
         onDeletePaper={onDeletePaper}
+        onRestorePaper={onRestorePaper}
       />
     );
   }

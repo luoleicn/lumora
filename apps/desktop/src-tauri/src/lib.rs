@@ -9,6 +9,7 @@ const WORKSPACE_EVENT: &str = "lumora-workspace-command";
 const WORKSPACE_CLOSE_ACTIVE_TAB: &str = "workspace-close-active-tab";
 const HELP_KEYBOARD_SHORTCUTS: &str = "help-keyboard-shortcuts";
 const APP_ABOUT: &str = "app-about";
+const APP_FILE_STORAGE_SETTINGS: &str = "app-file-storage-settings";
 
 #[tauri::command]
 fn ping() -> &'static str {
@@ -161,6 +162,266 @@ async fn search_arxiv_by_title(title: String) -> Result<Vec<ArxivMetadata>, Stri
     Ok(results)
 }
 
+const LIBRARY_ENTITY_TYPES: [&str; 5] = ["paper", "fileAsset", "collection", "paperCollection", "annotation"];
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EntityUpsert {
+    entity_type: String,
+    id: String,
+    /// Full entity JSON, opaque to the storage layer.
+    data: String,
+    updated_at: String,
+    deleted_at: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadedEntity {
+    entity_type: String,
+    data: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadedLibrary {
+    entities: Vec<LoadedEntity>,
+    meta: std::collections::HashMap<String, String>,
+}
+
+fn open_library_db<R: Runtime>(app: &AppHandle<R>) -> Result<rusqlite::Connection, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Failed to resolve app data dir: {error}"))?;
+    std::fs::create_dir_all(&dir).map_err(|error| format!("Failed to create app data dir: {error}"))?;
+
+    let connection = rusqlite::Connection::open(dir.join("lumora.db"))
+        .map_err(|error| format!("Failed to open library database: {error}"))?;
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;
+             CREATE TABLE IF NOT EXISTS entities (
+               entity_type TEXT NOT NULL,
+               id TEXT NOT NULL,
+               data TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               deleted_at TEXT,
+               local_seq INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY (entity_type, id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_entities_local_seq ON entities(local_seq);
+             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .map_err(|error| format!("Failed to initialize library database: {error}"))?;
+
+    Ok(connection)
+}
+
+#[tauri::command]
+async fn db_load_library(app: AppHandle) -> Result<LoadedLibrary, String> {
+    let connection = open_library_db(&app)?;
+
+    let mut statement = connection
+        .prepare("SELECT entity_type, data FROM entities")
+        .map_err(|error| error.to_string())?;
+    let entities = statement
+        .query_map([], |row| {
+            Ok(LoadedEntity {
+                entity_type: row.get(0)?,
+                data: row.get(1)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+
+    let mut meta_statement = connection
+        .prepare("SELECT key, value FROM meta")
+        .map_err(|error| error.to_string())?;
+    let meta = meta_statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<std::collections::HashMap<_, _>, _>>()
+        .map_err(|error| error.to_string())?;
+
+    Ok(LoadedLibrary { entities, meta })
+}
+
+// Incremental-sync groundwork: local writes stamp a monotonically increasing
+// `local_seq` so a future sync engine can push `WHERE local_seq > last_pushed`;
+// applying remote changes uses source = "remote", which resets the marker so
+// pulled rows are never echoed back to the server.
+#[tauri::command]
+async fn db_upsert_entities(app: AppHandle, changes: Vec<EntityUpsert>, source: String) -> Result<(), String> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    if source != "local" && source != "remote" {
+        return Err(format!("Unknown write source: {source}"));
+    }
+
+    let mut connection = open_library_db(&app)?;
+    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+
+    let next_seq: i64 = if source == "local" {
+        let max_seq: i64 = transaction
+            .query_row("SELECT COALESCE(MAX(local_seq), 0) FROM entities", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        max_seq + 1
+    } else {
+        0
+    };
+
+    for change in &changes {
+        if !LIBRARY_ENTITY_TYPES.contains(&change.entity_type.as_str()) {
+            return Err(format!("Unknown entity type: {}", change.entity_type));
+        }
+
+        transaction
+            .execute(
+                "INSERT INTO entities (entity_type, id, data, updated_at, deleted_at, local_seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(entity_type, id) DO UPDATE SET
+                   data = excluded.data,
+                   updated_at = excluded.updated_at,
+                   deleted_at = excluded.deleted_at,
+                   local_seq = excluded.local_seq",
+                rusqlite::params![
+                    change.entity_type,
+                    change.id,
+                    change.data,
+                    change.updated_at,
+                    change.deleted_at,
+                    next_seq
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn db_set_meta(app: AppHandle, key: String, value: String) -> Result<(), String> {
+    let connection = open_library_db(&app)?;
+    connection
+        .execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+const STORE_PDF_DIR_HEADER: &str = "x-lumora-dir";
+const STORE_PDF_FILE_NAME_HEADER: &str = "x-lumora-file-name";
+
+fn decode_command_header(headers: &tauri::http::HeaderMap, name: &str) -> Result<String, String> {
+    let value = headers
+        .get(name)
+        .ok_or_else(|| format!("Missing {name} header."))?
+        .to_str()
+        .map_err(|_| format!("Invalid {name} header."))?;
+    percent_encoding::percent_decode_str(value)
+        .decode_utf8()
+        .map(|decoded| decoded.to_string())
+        .map_err(|_| format!("Invalid {name} header encoding."))
+}
+
+fn validate_stored_file_name(file_name: &str) -> Result<(), String> {
+    if file_name.is_empty() || file_name.contains('/') || file_name.contains('\\') || file_name == "." || file_name == ".." {
+        return Err(format!("Invalid file name: {file_name}"));
+    }
+    Ok(())
+}
+
+// Walks `name.pdf`, `name-2.pdf`, `name-3.pdf`, ... until a free slot. When the
+// occupied candidate is the file being moved itself, reuse it so renaming a file
+// to its current name is a no-op instead of drifting to a new suffix.
+fn resolve_collision_free_path(dir: &std::path::Path, file_name: &str, current_path: Option<&std::path::Path>) -> std::path::PathBuf {
+    let (stem, extension) = file_name
+        .rsplit_once('.')
+        .map(|(stem, extension)| (stem.to_string(), format!(".{extension}")))
+        .unwrap_or_else(|| (file_name.to_string(), String::new()));
+
+    let mut candidate = dir.join(file_name);
+    let mut counter = 2;
+    while candidate.exists() {
+        let is_same_file = current_path.is_some_and(|current| {
+            match (std::fs::canonicalize(&candidate), std::fs::canonicalize(current)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+        });
+        if is_same_file {
+            return candidate;
+        }
+
+        candidate = dir.join(format!("{stem}-{counter}{extension}"));
+        counter += 1;
+    }
+
+    candidate
+}
+
+// Raw-body command: the PDF bytes come through the invoke body, so the directory
+// and file name have to travel as (ASCII-only, hence percent-encoded) headers.
+#[tauri::command]
+fn store_pdf(request: tauri::ipc::Request<'_>) -> Result<String, String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("Expected a binary PDF payload.".to_string());
+    };
+
+    let dir = decode_command_header(request.headers(), STORE_PDF_DIR_HEADER)?;
+    let file_name = decode_command_header(request.headers(), STORE_PDF_FILE_NAME_HEADER)?;
+    validate_stored_file_name(&file_name)?;
+
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).map_err(|error| format!("Failed to create storage folder: {error}"))?;
+    let target = resolve_collision_free_path(&dir, &file_name, None);
+    std::fs::write(&target, bytes).map_err(|error| format!("Failed to write PDF: {error}"))?;
+
+    Ok(target.file_name().and_then(|name| name.to_str()).unwrap_or(&file_name).to_string())
+}
+
+#[tauri::command]
+async fn read_stored_pdf(dir: String, file_name: String) -> Result<tauri::ipc::Response, String> {
+    validate_stored_file_name(&file_name)?;
+    let path = std::path::Path::new(&dir).join(&file_name);
+    let bytes = std::fs::read(&path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[tauri::command]
+async fn move_stored_pdf(dir: String, file_name: String, new_dir: String, new_file_name: String) -> Result<String, String> {
+    validate_stored_file_name(&file_name)?;
+    validate_stored_file_name(&new_file_name)?;
+
+    let old_path = std::path::Path::new(&dir).join(&file_name);
+    if !old_path.exists() {
+        return Err(format!("File not found: {}", old_path.display()));
+    }
+
+    let target_dir = std::path::PathBuf::from(&new_dir);
+    std::fs::create_dir_all(&target_dir).map_err(|error| format!("Failed to create storage folder: {error}"))?;
+    let target = resolve_collision_free_path(&target_dir, &new_file_name, Some(&old_path));
+
+    if target != old_path {
+        // Cloud-synced folders (Google Drive etc.) can transiently hold files;
+        // retry once before surfacing the failure.
+        if std::fs::rename(&old_path, &target).is_err() {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            std::fs::rename(&old_path, &target).map_err(|error| format!("Failed to move PDF: {error}"))?;
+        }
+    }
+
+    Ok(target.file_name().and_then(|name| name.to_str()).unwrap_or(&new_file_name).to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -187,11 +448,25 @@ pub fn run() {
                 let _ = app.emit(WORKSPACE_EVENT, "show-shortcuts-help");
             } else if id == APP_ABOUT {
                 let _ = app.emit(WORKSPACE_EVENT, "show-about");
+            } else if id == APP_FILE_STORAGE_SETTINGS {
+                let _ = app.emit(WORKSPACE_EVENT, "show-file-storage-settings");
             } else if let Some(zoom) = id.strip_prefix(PDF_VIEW_ZOOM_PREFIX) {
                 let _ = app.emit(PDF_VIEW_EVENT, format!("zoom:{zoom}"));
             }
         })
-        .invoke_handler(tauri::generate_handler![ping, open_external_url, translate_with_youdao, search_arxiv_by_title])
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![
+            ping,
+            open_external_url,
+            translate_with_youdao,
+            search_arxiv_by_title,
+            store_pdf,
+            read_stored_pdf,
+            move_stored_pdf,
+            db_load_library,
+            db_upsert_entities,
+            db_set_meta
+        ])
         .run(tauri::generate_context!())
         .expect("error while running lumora");
 }
@@ -287,6 +562,8 @@ fn build_menu<R: Runtime>(app_handle: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         true,
         &[
             &MenuItem::with_id(app_handle, APP_ABOUT, format!("About {}", pkg_info.name), true, None::<&str>)?,
+            &PredefinedMenuItem::separator(app_handle)?,
+            &MenuItem::with_id(app_handle, APP_FILE_STORAGE_SETTINGS, "File Storage Settings...", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app_handle)?,
             &PredefinedMenuItem::services(app_handle, None)?,
             &PredefinedMenuItem::separator(app_handle)?,
