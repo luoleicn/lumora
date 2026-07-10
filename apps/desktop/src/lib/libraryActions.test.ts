@@ -3,8 +3,10 @@ import type { Collection, LibraryState, Paper } from "@lumora/shared";
 import {
   addPaperToCollection,
   deleteCollectionAndReassignPapers,
+  deletePaperFromLibrary,
   getCollectionAndDescendantIds,
-  getCollectionPaperCount
+  getCollectionPaperCount,
+  removePaperFromCollectionTree
 } from "./libraryActions";
 
 const now = "2026-07-06T00:00:00.000Z";
@@ -45,7 +47,9 @@ function state(): LibraryState {
       { id: "pc-parent-a", paperId: "paper-a", collectionId: "folder-parent", createdAt: now, updatedAt: now },
       { id: "pc-child-b", paperId: "paper-b", collectionId: "folder-child", createdAt: now, updatedAt: now },
       { id: "pc-child-c", paperId: "paper-c", collectionId: "folder-child", createdAt: now, updatedAt: now },
-      { id: "pc-parent-c", paperId: "paper-c", collectionId: "folder-parent", createdAt: now, updatedAt: now }
+      { id: "pc-parent-c", paperId: "paper-c", collectionId: "folder-parent", createdAt: now, updatedAt: now },
+      { id: "pc-grandchild-a", paperId: "paper-a", collectionId: "folder-grandchild", createdAt: now, updatedAt: now },
+      { id: "pc-target-a", paperId: "paper-a", collectionId: "folder-target", createdAt: now, updatedAt: now }
     ],
     annotations: []
   };
@@ -121,5 +125,64 @@ describe("library actions", () => {
     const next = deleteCollectionAndReassignPapers(current, "collection_inbox", now);
 
     expect(next).toBe(current);
+  });
+
+  it("soft deletes a paper and its dependent library records", () => {
+    const current: LibraryState = {
+      ...state(),
+      fileAssets: [{
+        id: "file-a",
+        paperId: "paper-a",
+        sha256: "hash",
+        size: 10,
+        mime: "application/pdf",
+        fileName: "paper-a.pdf",
+        downloadState: "local",
+        createdAt: now,
+        updatedAt: now
+      }],
+      annotations: [{
+        id: "annotation-a",
+        paperId: "paper-a",
+        fileId: "file-a",
+        pageIndex: 0,
+        kind: "highlight",
+        color: "#f5c542",
+        rects: [],
+        createdAt: now,
+        updatedAt: now
+      }]
+    };
+
+    const next = deletePaperFromLibrary(current, "paper-a", now);
+
+    expect(next.papers.find((item) => item.id === "paper-a")?.deletedAt).toBe(now);
+    expect(next.fileAssets.find((item) => item.id === "file-a")?.deletedAt).toBe(now);
+    expect(next.annotations.find((item) => item.id === "annotation-a")?.deletedAt).toBe(now);
+    expect(next.paperCollections.find((item) => item.id === "pc-parent-a")?.deletedAt).toBe(now);
+  });
+
+  it("moves a paper to the parent folder when removed from a child folder", () => {
+    const next = removePaperFromCollectionTree(state(), "paper-b", "folder-child", now);
+
+    expect(next.paperCollections.find((item) => item.id === "pc-child-b")).toEqual(
+      expect.objectContaining({ paperId: "paper-b", collectionId: "folder-parent", updatedAt: now })
+    );
+    expect(next.paperCollections.find((item) => item.id === "pc-child-b")?.deletedAt).toBeUndefined();
+  });
+
+  it("removes duplicate child links when the paper already belongs to the parent folder", () => {
+    const next = removePaperFromCollectionTree(state(), "paper-c", "folder-child", now);
+
+    expect(next.paperCollections.find((item) => item.id === "pc-child-c")?.deletedAt).toBe(now);
+    expect(next.paperCollections.find((item) => item.id === "pc-parent-c")?.deletedAt).toBeUndefined();
+  });
+
+  it("removes a paper from a top-level folder and its descendants so it can become unsorted", () => {
+    const next = removePaperFromCollectionTree(state(), "paper-a", "folder-parent", now);
+
+    expect(next.paperCollections.find((item) => item.id === "pc-parent-a")?.deletedAt).toBe(now);
+    expect(next.paperCollections.find((item) => item.id === "pc-grandchild-a")?.deletedAt).toBe(now);
+    expect(next.paperCollections.find((item) => item.id === "pc-target-a")?.deletedAt).toBeUndefined();
   });
 });

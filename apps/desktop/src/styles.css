@@ -350,9 +350,13 @@ button {
 }
 
 .collection-tree-row.drag-over {
-  background: rgba(50, 124, 101, 0.28);
-  outline: 1px solid #55b495;
+  background: rgba(52, 151, 118, 0.38);
+  outline: 2px solid #68d4ad;
   outline-offset: -1px;
+}
+
+.collection-tree-row.drag-over .collection-button {
+  color: #ffffff;
 }
 
 .collection-button,
@@ -807,6 +811,7 @@ button {
 body.paper-pointer-dragging,
 body.paper-pointer-dragging * {
   cursor: grabbing !important;
+  user-select: none !important;
 }
 
 .paper-table tbody tr:hover {
@@ -851,6 +856,47 @@ body.paper-pointer-dragging * {
 
 .table-icon-button.active {
   color: #d99a00;
+}
+
+.paper-context-menu {
+  position: fixed;
+  z-index: 30;
+  display: flex;
+  min-width: 188px;
+  flex-direction: column;
+  border: 1px solid #cfd7df;
+  border-radius: 7px;
+  background: #ffffff;
+  box-shadow: 0 12px 28px rgba(28, 36, 43, 0.18);
+  padding: 5px;
+}
+
+.paper-context-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 32px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #26313a;
+  padding: 0 9px;
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.paper-context-menu button:hover {
+  background: #eef6f3;
+}
+
+.paper-context-menu button.danger {
+  color: #b42318;
+}
+
+.paper-context-menu button.danger:hover {
+  background: #fff0ee;
 }
 
 .paper-row {

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import type { Annotation, Collection, FileAsset, LibraryState, Paper } from "@lumora/shared";
 import { FileText, X } from "lucide-react";
 import { AppToolbar } from "./components/AppToolbar";
@@ -10,7 +11,14 @@ import { PaperList } from "./components/PaperList";
 import { PdfReader } from "./components/PdfReader";
 import { SyncPanel } from "./components/SyncPanel";
 import { createId } from "./lib/id";
-import { addPaperToCollection, deleteCollectionAndReassignPapers, getCollectionAndDescendantIds } from "./lib/libraryActions";
+import {
+  addPaperToCollection,
+  deleteCollectionAndReassignPapers,
+  deletePaperFromLibrary,
+  getCollectionAndDescendantIds,
+  getCollectionPaperCount,
+  removePaperFromCollectionTree
+} from "./lib/libraryActions";
 import {
   getFileBytes,
   importPdfFile,
@@ -45,6 +53,11 @@ type ResizeDrag = {
   startX: number;
   startLeftWidth: number;
   startRightWidth: number;
+};
+
+type PaperDrag = {
+  paperId: string;
+  overCollectionId?: string;
 };
 
 const defaultWorkspaceLayout: WorkspaceLayout = {
@@ -84,12 +97,14 @@ export default function App() {
   const [settings, setSettings] = useState<SyncSettings>(() => loadSyncSettings());
   const [workspaceLayout, setWorkspaceLayout] = useState<WorkspaceLayout>(() => loadWorkspaceLayout());
   const [resizeDrag, setResizeDrag] = useState<ResizeDrag>();
+  const [paperDrag, setPaperDrag] = useState<PaperDrag>();
   const [manualModalOpen, setManualModalOpen] = useState(false);
   const [collectionModalParentId, setCollectionModalParentId] = useState<string | undefined>();
   const [collectionModalOpen, setCollectionModalOpen] = useState(false);
   const [deleteCollectionId, setDeleteCollectionId] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string>();
+  const collectionPaperCounts = useMemo(() => getCollectionPaperCounts(library), [library]);
 
   useEffect(() => {
     saveLibraryState(library);
@@ -106,12 +121,18 @@ export default function App() {
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       const isApplePlatform = /Mac|iPhone|iPad|iPod/i.test(navigator.platform);
-      const detailsShortcut = event.key.toLowerCase() === "i"
-        && (isApplePlatform ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey)
-        && !event.altKey
-        && !event.shiftKey;
+      const usesPrimaryModifier = isApplePlatform ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+      const isPanelShortcut = usesPrimaryModifier && !event.altKey && !event.shiftKey;
+      const shortcutKey = event.key.toLowerCase();
+      const targetPanel: MainPanelKey | undefined = isPanelShortcut
+        ? shortcutKey === "i"
+          ? "sync"
+          : shortcutKey === "j"
+            ? "library"
+            : undefined
+        : undefined;
 
-      if (!detailsShortcut) {
+      if (!targetPanel) {
         return;
       }
 
@@ -120,7 +141,7 @@ export default function App() {
         ...current,
         visible: {
           ...current.visible,
-          sync: !current.visible.sync
+          [targetPanel]: !current.visible[targetPanel]
         }
       }));
     };
@@ -449,16 +470,78 @@ export default function App() {
   }
 
   function handleAddPaperToCollection(paperId: string, collectionId: string) {
-    const nextLibrary = addPaperToCollection(library, paperId, collectionId);
-    const added = nextLibrary !== library;
-    setLibrary(nextLibrary);
-    const paper = library.papers.find((item) => item.id === paperId);
-    const collection = library.collections.find((item) => item.id === collectionId);
+    let added = false;
+    let paperTitle = "paper";
+    let collectionName = "folder";
+
+    flushSync(() => {
+      setLibrary((current) => {
+        const nextLibrary = addPaperToCollection(current, paperId, collectionId);
+        added = nextLibrary !== current;
+        paperTitle = current.papers.find((item) => item.id === paperId)?.title ?? paperTitle;
+        collectionName = current.collections.find((item) => item.id === collectionId)?.name ?? collectionName;
+        return nextLibrary;
+      });
+      setSelectedCollectionId(collectionId);
+    });
+
     setStatus(added
-      ? `Added ${paper?.title ?? "paper"} to ${collection?.name ?? "folder"}.`
+      ? `Added ${paperTitle} to ${collectionName}.`
       : "Paper is already in that folder."
     );
-    setSelectedCollectionId(collectionId);
+  }
+
+  function handlePaperDragStart(paperId: string) {
+    setPaperDrag({ paperId });
+  }
+
+  function handlePaperDragMove(paperId: string, overCollectionId?: string) {
+    setPaperDrag((current) => {
+      if (current?.paperId === paperId && current.overCollectionId === overCollectionId) {
+        return current;
+      }
+
+      return { paperId, overCollectionId };
+    });
+  }
+
+  function handlePaperDragEnd(paperId: string, collectionId?: string) {
+    setPaperDrag(undefined);
+    if (collectionId) {
+      handleAddPaperToCollection(paperId, collectionId);
+    }
+  }
+
+  function handleRemovePaperFromSelectedCollection(paperId: string) {
+    const collection = library.collections.find((item) => item.id === selectedCollectionId && !item.deletedAt);
+    if (!collection) {
+      setStatus("Select a folder before removing a folder relationship.");
+      return;
+    }
+
+    setLibrary((current) => removePaperFromCollectionTree(current, paperId, collection.id));
+    setStatus(collection.parentId
+      ? "Removed from this folder tree and moved the document to the parent folder."
+      : "Removed from this folder tree. The document remains in the library."
+    );
+  }
+
+  function handleDeletePaper(paperId: string) {
+    const paper = library.papers.find((item) => item.id === paperId && !item.deletedAt);
+    if (!paper) {
+      return;
+    }
+
+    setLibrary((current) => deletePaperFromLibrary(current, paperId));
+    if (selectedPaperId === paperId) {
+      setSelectedPaperId(undefined);
+      setFileData(undefined);
+    }
+    setWorkspaceTabs((current) => current.filter((tab) => !(tab.kind === "paper" && tab.paperId === paperId)));
+    if (activeWorkspaceTabId === `paper:${paperId}`) {
+      setActiveWorkspaceTabId(documentsTab.id);
+    }
+    setStatus(`Deleted ${paper.title}.`);
   }
 
   function handleCreateAnnotation(annotation: Annotation) {
@@ -647,6 +730,8 @@ export default function App() {
           {panel === "library" && (
             <LibrarySidebar
               state={library}
+              collectionPaperCounts={collectionPaperCounts}
+              dragOverCollectionId={paperDrag?.overCollectionId}
               selectedCollectionId={selectedCollectionId}
               selectedAuthor={selectedAuthor}
               selectedTag={selectedTag}
@@ -676,6 +761,7 @@ export default function App() {
                 library={library}
                 filteredPapers={filteredPapers}
                 selectedPaperId={selectedPaperId}
+                selectedCollectionId={selectedCollectionId}
                 selectedPaper={selectedPaper}
                 selectedFile={selectedFile}
                 fileData={fileData}
@@ -683,7 +769,11 @@ export default function App() {
                 onSelectPaper={handleSelectPaper}
                 onOpenPaper={handleOpenPaperTab}
                 onUpdatePaper={handleUpdatePaper}
-                onDropPaperToCollection={handleAddPaperToCollection}
+                onPaperDragStart={handlePaperDragStart}
+                onPaperDragMove={handlePaperDragMove}
+                onPaperDragEnd={handlePaperDragEnd}
+                onRemovePaperFromCollection={handleRemovePaperFromSelectedCollection}
+                onDeletePaper={handleDeletePaper}
                 onCreateAnnotation={handleCreateAnnotation}
                 onDeleteAnnotation={handleDeleteAnnotation}
               />
@@ -863,6 +953,7 @@ function WorkspaceTabContent({
   library,
   filteredPapers,
   selectedPaperId,
+  selectedCollectionId,
   selectedPaper,
   selectedFile,
   fileData,
@@ -870,7 +961,11 @@ function WorkspaceTabContent({
   onSelectPaper,
   onOpenPaper,
   onUpdatePaper,
-  onDropPaperToCollection,
+  onPaperDragStart,
+  onPaperDragMove,
+  onPaperDragEnd,
+  onRemovePaperFromCollection,
+  onDeletePaper,
   onCreateAnnotation,
   onDeleteAnnotation
 }: {
@@ -878,6 +973,7 @@ function WorkspaceTabContent({
   library: LibraryState;
   filteredPapers: Paper[];
   selectedPaperId?: string;
+  selectedCollectionId: string;
   selectedPaper?: Paper;
   selectedFile?: FileAsset;
   fileData?: Uint8Array;
@@ -885,7 +981,11 @@ function WorkspaceTabContent({
   onSelectPaper: (paperId: string) => void;
   onOpenPaper: (paperId: string) => void;
   onUpdatePaper: (paper: Paper) => void;
-  onDropPaperToCollection: (paperId: string, collectionId: string) => void;
+  onPaperDragStart: (paperId: string) => void;
+  onPaperDragMove: (paperId: string, collectionId?: string) => void;
+  onPaperDragEnd: (paperId: string, collectionId?: string) => void;
+  onRemovePaperFromCollection: (paperId: string) => void;
+  onDeletePaper: (paperId: string) => void;
   onCreateAnnotation: (annotation: Annotation) => void;
   onDeleteAnnotation: (annotation: Annotation) => void;
 }) {
@@ -895,10 +995,15 @@ function WorkspaceTabContent({
         state={library}
         papers={filteredPapers}
         selectedPaperId={selectedPaperId}
+        selectedCollectionId={selectedCollectionId}
         onSelectPaper={onSelectPaper}
         onOpenPaper={onOpenPaper}
         onUpdatePaper={onUpdatePaper}
-        onDropPaperToCollection={onDropPaperToCollection}
+        onPaperDragStart={onPaperDragStart}
+        onPaperDragMove={onPaperDragMove}
+        onPaperDragEnd={onPaperDragEnd}
+        onRemovePaperFromCollection={onRemovePaperFromCollection}
+        onDeletePaper={onDeletePaper}
       />
     );
   }
@@ -990,4 +1095,11 @@ function loadWorkspaceLayout(): WorkspaceLayout {
   } catch {
     return defaultWorkspaceLayout;
   }
+}
+
+function getCollectionPaperCounts(state: LibraryState) {
+  const activeCollections = state.collections.filter((collection) => !collection.deletedAt);
+  return Object.fromEntries(
+    activeCollections.map((collection) => [collection.id, getCollectionPaperCount(state, activeCollections, collection.id)])
+  );
 }

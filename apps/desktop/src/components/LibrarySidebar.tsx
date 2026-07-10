@@ -14,11 +14,12 @@ import {
 } from "lucide-react";
 import type { Collection, LibraryState } from "@lumora/shared";
 import { useState } from "react";
-import { getCollectionPaperCount } from "../lib/libraryActions";
 import lumoraLogoUrl from "../assets/lumora-logo-64.png";
 
 type LibrarySidebarProps = {
   state: LibraryState;
+  collectionPaperCounts: Record<string, number>;
+  dragOverCollectionId?: string;
   selectedCollectionId: string;
   selectedAuthor?: string;
   selectedTag?: string;
@@ -32,6 +33,8 @@ type LibrarySidebarProps = {
 
 export function LibrarySidebar({
   state,
+  collectionPaperCounts,
+  dragOverCollectionId,
   selectedCollectionId,
   selectedAuthor,
   selectedTag,
@@ -45,6 +48,8 @@ export function LibrarySidebar({
   const [authorsExpanded, setAuthorsExpanded] = useState(false);
   const [tagsExpanded, setTagsExpanded] = useState(false);
   const [collapsedCollections, setCollapsedCollections] = useState<Record<string, boolean>>({});
+  const [nativeDragOverCollectionId, setNativeDragOverCollectionId] = useState<string>();
+  const visibleDragOverCollectionId = dragOverCollectionId ?? nativeDragOverCollectionId;
   const collections = state.collections
     .filter((collection) => !collection.deletedAt)
     .sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
@@ -114,8 +119,9 @@ export function LibrarySidebar({
                 node={node}
                 depth={0}
                 selectedCollectionId={selectedCollectionId}
+                dragOverCollectionId={visibleDragOverCollectionId}
                 collapsedCollections={collapsedCollections}
-                getCount={(collectionId) => getCollectionPaperCount(state, collections, collectionId)}
+                getCount={(collectionId) => collectionPaperCounts[collectionId] ?? 0}
                 onToggle={(collectionId) => {
                   setCollapsedCollections((current) => ({ ...current, [collectionId]: !current[collectionId] }));
                 }}
@@ -123,6 +129,7 @@ export function LibrarySidebar({
                 onCreateCollection={onCreateCollection}
                 onDeleteCollection={onDeleteCollection}
                 onAddPaperToCollection={onAddPaperToCollection}
+                onDragOverCollection={setNativeDragOverCollectionId}
               />
             ))}
           </div>
@@ -228,17 +235,20 @@ function CollectionTreeNode({
   node,
   depth,
   selectedCollectionId,
+  dragOverCollectionId,
   collapsedCollections,
   getCount,
   onToggle,
   onSelectCollection,
   onCreateCollection,
   onDeleteCollection,
-  onAddPaperToCollection
+  onAddPaperToCollection,
+  onDragOverCollection
 }: {
   node: CollectionNode;
   depth: number;
   selectedCollectionId: string;
+  dragOverCollectionId?: string;
   collapsedCollections: Record<string, boolean>;
   getCount: (collectionId: string) => number;
   onToggle: (collectionId: string) => void;
@@ -246,11 +256,12 @@ function CollectionTreeNode({
   onCreateCollection: (parentId?: string) => void;
   onDeleteCollection: (collectionId: string) => void;
   onAddPaperToCollection: (paperId: string, collectionId: string) => void;
+  onDragOverCollection: (collectionId?: string) => void;
 }) {
   const { collection, children } = node;
   const collapsed = Boolean(collapsedCollections[collection.id]);
   const hasChildren = children.length > 0;
-  const [dragOver, setDragOver] = useState(false);
+  const dragOver = dragOverCollectionId === collection.id;
 
   return (
     <>
@@ -262,20 +273,24 @@ function CollectionTreeNode({
           if (hasPaperDragData(event.dataTransfer)) {
             event.preventDefault();
             event.dataTransfer.dropEffect = "copy";
-            setDragOver(true);
+            onDragOverCollection(collection.id);
           }
         }}
-        onDragLeave={() => setDragOver(false)}
+        onDragLeave={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+            onDragOverCollection(undefined);
+          }
+        }}
         onDrop={(event) => {
           const paperId = readDraggedPaperId(event.dataTransfer);
-          setDragOver(false);
+          onDragOverCollection(undefined);
+          document.body.classList.remove("paper-pointer-dragging");
           if (!paperId) {
             return;
           }
 
           event.preventDefault();
           onAddPaperToCollection(paperId, collection.id);
-          onSelectCollection(collection.id);
         }}
       >
         {hasChildren ? (
@@ -294,7 +309,6 @@ function CollectionTreeNode({
         <button
           className={selectedCollectionId === collection.id ? "collection-button active" : "collection-button"}
           type="button"
-          data-collection-drop-id={collection.id}
           onClick={() => onSelectCollection(collection.id)}
           title={collection.name}
         >
@@ -331,6 +345,7 @@ function CollectionTreeNode({
           node={child}
           depth={depth + 1}
           selectedCollectionId={selectedCollectionId}
+          dragOverCollectionId={dragOverCollectionId}
           collapsedCollections={collapsedCollections}
           getCount={getCount}
           onToggle={onToggle}
@@ -338,6 +353,7 @@ function CollectionTreeNode({
           onCreateCollection={onCreateCollection}
           onDeleteCollection={onDeleteCollection}
           onAddPaperToCollection={onAddPaperToCollection}
+          onDragOverCollection={onDragOverCollection}
         />
       ))}
     </>
@@ -346,7 +362,9 @@ function CollectionTreeNode({
 
 function hasPaperDragData(dataTransfer: DataTransfer) {
   const types = Array.from(dataTransfer.types);
-  return types.includes("application/x-lumora-paper-id") || types.includes("text/plain");
+  return document.body.classList.contains("paper-pointer-dragging")
+    || types.includes("application/x-lumora-paper-id")
+    || types.includes("text/plain");
 }
 
 function readDraggedPaperId(dataTransfer: DataTransfer) {

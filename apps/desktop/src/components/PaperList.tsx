@@ -1,4 +1,4 @@
-import { FileText, Star } from "lucide-react";
+import { FileText, FolderMinus, Star, Trash2 } from "lucide-react";
 import type { FileAsset, LibraryState, Paper } from "@lumora/shared";
 import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 
@@ -22,12 +22,19 @@ type ColumnResizeDrag = {
   startWidth: number;
 };
 
-type PaperPointerDrag = {
+type InternalPaperDrag = {
   paperId: string;
   pointerId: number;
   startX: number;
   startY: number;
   dragging: boolean;
+  cleanup: () => void;
+};
+
+type PaperContextMenu = {
+  paperId: string;
+  x: number;
+  y: number;
 };
 
 const columnWidthsKey = "lumora:documents-column-widths";
@@ -45,28 +52,38 @@ type PaperListProps = {
   state: LibraryState;
   papers: Paper[];
   selectedPaperId?: string;
+  selectedCollectionId: string;
   onSelectPaper: (id: string) => void;
   onOpenPaper: (id: string) => void;
   onUpdatePaper: (paper: Paper) => void;
-  onDropPaperToCollection: (paperId: string, collectionId: string) => void;
+  onPaperDragStart: (paperId: string) => void;
+  onPaperDragMove: (paperId: string, collectionId?: string) => void;
+  onPaperDragEnd: (paperId: string, collectionId?: string) => void;
+  onRemovePaperFromCollection: (paperId: string) => void;
+  onDeletePaper: (paperId: string) => void;
 };
 
 export function PaperList({
   state,
   papers,
   selectedPaperId,
+  selectedCollectionId,
   onSelectPaper,
   onOpenPaper,
   onUpdatePaper,
-  onDropPaperToCollection
+  onPaperDragStart,
+  onPaperDragMove,
+  onPaperDragEnd,
+  onRemovePaperFromCollection,
+  onDeletePaper
 }: PaperListProps) {
   const [sortKey, setSortKey] = useState<SortKey>("added");
   const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
   const [columnWidths, setColumnWidths] = useState<PaperColumnWidths>(() => loadColumnWidths());
   const [resizingColumn, setResizingColumn] = useState<PaperColumnKey>();
+  const [contextMenu, setContextMenu] = useState<PaperContextMenu>();
   const columnResizeRef = useRef<ColumnResizeDrag | undefined>(undefined);
-  const paperPointerDragRef = useRef<PaperPointerDrag | undefined>(undefined);
-  const suppressPaperClickRef = useRef(false);
+  const internalPaperDragRef = useRef<InternalPaperDrag | undefined>(undefined);
   const sortedPapers = useMemo(
     () => [...papers].sort((a, b) => comparePapers(a, b, sortKey, sortDirection)),
     [papers, sortDirection, sortKey]
@@ -79,6 +96,29 @@ export function PaperList({
   useEffect(() => {
     localStorage.setItem(columnWidthsKey, JSON.stringify(columnWidths));
   }, [columnWidths]);
+
+  useEffect(() => {
+    return () => {
+      internalPaperDragRef.current?.cleanup();
+      document.body.classList.remove("paper-pointer-dragging");
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!contextMenu) {
+      return;
+    }
+
+    const closeMenu = () => setContextMenu(undefined);
+    window.addEventListener("click", closeMenu);
+    window.addEventListener("keydown", closeMenu);
+    window.addEventListener("scroll", closeMenu, true);
+    return () => {
+      window.removeEventListener("click", closeMenu);
+      window.removeEventListener("keydown", closeMenu);
+      window.removeEventListener("scroll", closeMenu, true);
+    };
+  }, [contextMenu]);
 
   function handleSort(nextSortKey: SortKey) {
     if (nextSortKey === sortKey) {
@@ -146,56 +186,80 @@ export function PaperList({
     }));
   }
 
+  function handlePaperContextMenu(event: React.MouseEvent<HTMLTableRowElement>, paperId: string) {
+    event.preventDefault();
+    onSelectPaper(paperId);
+    setContextMenu({ paperId, x: event.clientX, y: event.clientY });
+  }
+
   function handlePaperPointerDown(event: React.PointerEvent<HTMLTableRowElement>, paperId: string) {
     if (event.button !== 0 || (event.target as HTMLElement).closest("button")) {
       return;
     }
 
-    paperPointerDragRef.current = {
+    event.preventDefault();
+    internalPaperDragRef.current?.cleanup();
+
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.userSelect = "none";
+
+    const drag: InternalPaperDrag = {
       paperId,
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
-      dragging: false
+      dragging: false,
+      cleanup: () => {
+        window.removeEventListener("pointermove", handlePointerMove);
+        window.removeEventListener("pointerup", handlePointerEnd);
+        window.removeEventListener("pointercancel", handlePointerEnd);
+        document.body.style.userSelect = previousUserSelect;
+        if (internalPaperDragRef.current === drag) {
+          internalPaperDragRef.current = undefined;
+        }
+      }
     };
-    event.currentTarget.setPointerCapture(event.pointerId);
-  }
 
-  function handlePaperPointerMove(event: React.PointerEvent<HTMLTableRowElement>) {
-    const drag = paperPointerDragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) {
-      return;
+    function handlePointerMove(pointerEvent: PointerEvent) {
+      if (pointerEvent.pointerId !== drag.pointerId) {
+        return;
+      }
+
+      const distance = Math.hypot(pointerEvent.clientX - drag.startX, pointerEvent.clientY - drag.startY);
+      if (!drag.dragging && distance > 6) {
+        drag.dragging = true;
+        document.body.classList.add("paper-pointer-dragging");
+        onPaperDragStart(paperId);
+      }
+
+      if (drag.dragging) {
+        pointerEvent.preventDefault();
+        onPaperDragMove(paperId, getCollectionDropIdAtPoint(pointerEvent.clientX, pointerEvent.clientY));
+      }
     }
 
-    const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
-    if (distance > 6) {
-      drag.dragging = true;
-      document.body.classList.add("paper-pointer-dragging");
-    }
-  }
+    function handlePointerEnd(pointerEvent: PointerEvent) {
+      if (pointerEvent.pointerId !== drag.pointerId) {
+        return;
+      }
 
-  function handlePaperPointerEnd(event: React.PointerEvent<HTMLTableRowElement>) {
-    const drag = paperPointerDragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) {
-      return;
-    }
+      const collectionId = drag.dragging
+        ? getCollectionDropIdAtPoint(pointerEvent.clientX, pointerEvent.clientY)
+        : undefined;
 
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
+      drag.cleanup();
+      document.body.classList.remove("paper-pointer-dragging");
 
-    paperPointerDragRef.current = undefined;
-    document.body.classList.remove("paper-pointer-dragging");
-    if (!drag.dragging) {
-      return;
+      if (drag.dragging) {
+        pointerEvent.preventDefault();
+        onPaperDragEnd(paperId, collectionId);
+      }
     }
 
-    event.preventDefault();
-    suppressPaperClickRef.current = true;
-    const collectionId = getCollectionDropIdAtPoint(event.clientX, event.clientY);
-    if (collectionId) {
-      onDropPaperToCollection(drag.paperId, collectionId);
-    }
+    internalPaperDragRef.current = drag;
+    window.addEventListener("pointermove", handlePointerMove, { passive: false });
+    window.addEventListener("pointerup", handlePointerEnd);
+    window.addEventListener("pointercancel", handlePointerEnd);
   }
 
   return (
@@ -243,25 +307,32 @@ export function PaperList({
                   paper={paper}
                   fileAsset={state.fileAssets.find((file) => file.paperId === paper.id && !file.deletedAt)}
                   active={paper.id === selectedPaperId}
-                  onClick={() => {
-                    if (suppressPaperClickRef.current) {
-                      suppressPaperClickRef.current = false;
-                      return;
-                    }
-                    onSelectPaper(paper.id);
-                  }}
+                  onClick={() => onSelectPaper(paper.id)}
                   onDoubleClick={() => onOpenPaper(paper.id)}
                   onUpdatePaper={onUpdatePaper}
                   onPointerDown={(event) => handlePaperPointerDown(event, paper.id)}
-                  onPointerMove={handlePaperPointerMove}
-                  onPointerUp={handlePaperPointerEnd}
-                  onPointerCancel={handlePaperPointerEnd}
+                  onContextMenu={(event) => handlePaperContextMenu(event, paper.id)}
                 />
               ))}
             </tbody>
           </table>
         )}
       </div>
+      {contextMenu && (
+        <PaperContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          canRemoveFromCollection={isRealCollectionId(selectedCollectionId)}
+          onRemoveFromCollection={() => {
+            onRemovePaperFromCollection(contextMenu.paperId);
+            setContextMenu(undefined);
+          }}
+          onDeletePaper={() => {
+            onDeletePaper(contextMenu.paperId);
+            setContextMenu(undefined);
+          }}
+        />
+      )}
     </section>
   );
 }
@@ -327,9 +398,7 @@ function PaperRow({
   onDoubleClick,
   onUpdatePaper,
   onPointerDown,
-  onPointerMove,
-  onPointerUp,
-  onPointerCancel
+  onContextMenu
 }: {
   paper: Paper;
   fileAsset?: FileAsset;
@@ -338,29 +407,17 @@ function PaperRow({
   onDoubleClick: () => void;
   onUpdatePaper: (paper: Paper) => void;
   onPointerDown: (event: React.PointerEvent<HTMLTableRowElement>) => void;
-  onPointerMove: (event: React.PointerEvent<HTMLTableRowElement>) => void;
-  onPointerUp: (event: React.PointerEvent<HTMLTableRowElement>) => void;
-  onPointerCancel: (event: React.PointerEvent<HTMLTableRowElement>) => void;
+  onContextMenu: (event: React.MouseEvent<HTMLTableRowElement>) => void;
 }) {
   const authorLine = paper.authors.map((author) => author.fullName).join(", ");
-
-  function handleDragStart(event: React.DragEvent<HTMLTableRowElement | HTMLTableCellElement>) {
-    event.dataTransfer.effectAllowed = "copy";
-    event.dataTransfer.setData("application/x-lumora-paper-id", paper.id);
-    event.dataTransfer.setData("text/plain", `lumora-paper:${paper.id}`);
-  }
 
   return (
     <tr
       className={`${active ? "active " : ""}${paper.unread ? "unread" : ""}`}
-      draggable
       onClick={onClick}
       onDoubleClick={onDoubleClick}
       onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-      onPointerCancel={onPointerCancel}
-      onDragStart={handleDragStart}
+      onContextMenu={onContextMenu}
     >
       <td>
         <button
@@ -375,17 +432,52 @@ function PaperRow({
           <Star size={15} fill={paper.favorite ? "currentColor" : "none"} />
         </button>
       </td>
-      <td title={authorLine || "No authors"} draggable onDragStart={handleDragStart}>{authorLine || "No authors"}</td>
-      <td className="paper-title-cell" title={paper.title} draggable onDragStart={handleDragStart}>
+      <td title={authorLine || "No authors"}>{authorLine || "No authors"}</td>
+      <td className="paper-title-cell" title={paper.title}>
         {fileAsset && <FileText size={14} />}
         <span>{paper.title}</span>
       </td>
-      <td draggable onDragStart={handleDragStart}>{paper.year ?? ""}</td>
-      <td title={paper.venue || fileAsset?.fileName || "PDF"} draggable onDragStart={handleDragStart}>
+      <td>{paper.year ?? ""}</td>
+      <td title={paper.venue || fileAsset?.fileName || "PDF"}>
         {paper.venue || fileAsset?.fileName || "PDF"}
       </td>
-      <td draggable onDragStart={handleDragStart}>{formatDate(paper.createdAt)}</td>
+      <td>{formatDate(paper.createdAt)}</td>
     </tr>
+  );
+}
+
+function PaperContextMenu({
+  x,
+  y,
+  canRemoveFromCollection,
+  onRemoveFromCollection,
+  onDeletePaper
+}: {
+  x: number;
+  y: number;
+  canRemoveFromCollection: boolean;
+  onRemoveFromCollection: () => void;
+  onDeletePaper: () => void;
+}) {
+  return (
+    <div
+      className="paper-context-menu"
+      style={{ left: x, top: y }}
+      role="menu"
+      onClick={(event) => event.stopPropagation()}
+      onContextMenu={(event) => event.preventDefault()}
+    >
+      {canRemoveFromCollection && (
+        <button type="button" role="menuitem" onClick={onRemoveFromCollection}>
+          <FolderMinus size={15} />
+          <span>Remove from Folder</span>
+        </button>
+      )}
+      <button type="button" className="danger" role="menuitem" onClick={onDeletePaper}>
+        <Trash2 size={15} />
+        <span>Delete Document</span>
+      </button>
+    </div>
   );
 }
 
@@ -430,14 +522,17 @@ function getCollectionDropIdAtPoint(x: number, y: number) {
     : [document.elementFromPoint(x, y)].filter(Boolean);
 
   for (const element of elements) {
-    const dropElement = element?.closest?.("[data-collection-drop-id]") as HTMLElement | null | undefined;
-    const collectionId = dropElement?.dataset.collectionDropId;
-    if (collectionId) {
-      return collectionId;
+    const dropElement = element?.closest?.(".collection-tree-row[data-collection-drop-id]") as HTMLElement | null | undefined;
+    if (dropElement?.dataset.collectionDropId) {
+      return dropElement.dataset.collectionDropId;
     }
   }
 
   return undefined;
+}
+
+function isRealCollectionId(collectionId: string) {
+  return !["all", "recently_added", "favorites", "unsorted", "trash"].includes(collectionId);
 }
 
 function loadColumnWidths(): PaperColumnWidths {

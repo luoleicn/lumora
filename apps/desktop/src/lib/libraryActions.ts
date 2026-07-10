@@ -60,6 +60,75 @@ export function addPaperToCollection(state: LibraryState, paperId: EntityId, col
   };
 }
 
+export function deletePaperFromLibrary(state: LibraryState, paperId: EntityId, now = new Date().toISOString()) {
+  const paper = state.papers.find((item) => item.id === paperId && !item.deletedAt);
+  if (!paper) {
+    return state;
+  }
+
+  return {
+    ...state,
+    papers: state.papers.map((item) =>
+      item.id === paperId ? { ...item, deletedAt: now, updatedAt: now } : item
+    ),
+    fileAssets: state.fileAssets.map((item) =>
+      item.paperId === paperId && !item.deletedAt ? { ...item, deletedAt: now, updatedAt: now } : item
+    ),
+    paperCollections: state.paperCollections.map((item) =>
+      item.paperId === paperId && !item.deletedAt ? { ...item, deletedAt: now, updatedAt: now } : item
+    ),
+    annotations: state.annotations.map((item) =>
+      item.paperId === paperId && !item.deletedAt ? { ...item, deletedAt: now, updatedAt: now } : item
+    )
+  };
+}
+
+export function removePaperFromCollectionTree(
+  state: LibraryState,
+  paperId: EntityId,
+  collectionId: EntityId,
+  now = new Date().toISOString()
+) {
+  const paper = state.papers.find((item) => item.id === paperId && !item.deletedAt);
+  const collection = state.collections.find((item) => item.id === collectionId && !item.deletedAt);
+  if (!paper || !collection) {
+    return state;
+  }
+
+  const collectionIds = getCollectionAndDescendantIds(state.collections, collectionId);
+  const removableLinks = state.paperCollections.filter((item) =>
+    !item.deletedAt && item.paperId === paperId && collectionIds.has(item.collectionId)
+  );
+  if (removableLinks.length === 0) {
+    return state;
+  }
+
+  const removableLinkIds = new Set(removableLinks.map((item) => item.id));
+  const parentId = collection.parentId;
+  const parentLink = parentId
+    ? state.paperCollections.find((item) => !item.deletedAt && item.paperId === paperId && item.collectionId === parentId)
+    : undefined;
+  const moveTargetCollectionId = parentId && !parentLink ? parentId : undefined;
+  const linkToMove = moveTargetCollectionId
+    ? removableLinks.find((item) => item.collectionId === collectionId) ?? removableLinks[0]
+    : undefined;
+
+  return {
+    ...state,
+    paperCollections: state.paperCollections.map((item) => {
+      if (!removableLinkIds.has(item.id)) {
+        return item;
+      }
+
+      if (linkToMove && moveTargetCollectionId && item.id === linkToMove.id) {
+        return { ...item, collectionId: moveTargetCollectionId, updatedAt: now };
+      }
+
+      return { ...item, deletedAt: now, updatedAt: now };
+    })
+  };
+}
+
 export function deleteCollectionAndReassignPapers(state: LibraryState, collectionId: EntityId, now = new Date().toISOString()) {
   const target = state.collections.find((collection) => collection.id === collectionId && !collection.deletedAt);
   if (!target || target.id === "collection_inbox") {
