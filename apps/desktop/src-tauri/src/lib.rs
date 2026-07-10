@@ -5,6 +5,9 @@ const PDF_VIEW_EVENT: &str = "lumora-pdf-view-command";
 const PDF_VIEW_FIT_WIDTH: &str = "pdf-view-fit-width";
 const PDF_VIEW_GO_TO_PAGE: &str = "pdf-view-go-to-page";
 const PDF_VIEW_ZOOM_PREFIX: &str = "pdf-view-zoom-";
+const WORKSPACE_EVENT: &str = "lumora-workspace-command";
+const WORKSPACE_CLOSE_ACTIVE_TAB: &str = "workspace-close-active-tab";
+const HELP_KEYBOARD_SHORTCUTS: &str = "help-keyboard-shortcuts";
 
 #[tauri::command]
 fn ping() -> &'static str {
@@ -160,13 +163,27 @@ async fn search_arxiv_by_title(title: String) -> Result<Vec<ArxivMetadata>, Stri
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            #[cfg(target_os = "macos")]
+            {
+                enable_trackpad_pinch_zoom(app);
+                install_fit_width_shortcut_monitor(app.handle().clone());
+            }
+            Ok(())
+        })
         .menu(build_menu)
         .on_menu_event(|app, event| {
             let id = event.id().as_ref();
             if id == PDF_VIEW_FIT_WIDTH {
+                #[cfg(target_os = "macos")]
+                reset_native_magnification(app);
                 let _ = app.emit(PDF_VIEW_EVENT, "fit-width");
             } else if id == PDF_VIEW_GO_TO_PAGE {
                 let _ = app.emit(PDF_VIEW_EVENT, "go-to-page");
+            } else if id == WORKSPACE_CLOSE_ACTIVE_TAB {
+                let _ = app.emit(WORKSPACE_EVENT, "close-active-tab");
+            } else if id == HELP_KEYBOARD_SHORTCUTS {
+                let _ = app.emit(WORKSPACE_EVENT, "show-shortcuts-help");
             } else if let Some(zoom) = id.strip_prefix(PDF_VIEW_ZOOM_PREFIX) {
                 let _ = app.emit(PDF_VIEW_EVENT, format!("zoom:{zoom}"));
             }
@@ -174,6 +191,88 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![ping, open_external_url, translate_with_youdao, search_arxiv_by_title])
         .run(tauri::generate_context!())
         .expect("error while running lumora");
+}
+
+// WKWebView disables trackpad pinch-to-zoom by default (`allowsMagnification` is false).
+// Enabling it lets WebKit dispatch `gesturestart`/`gesturechange` DOM events for the pinch
+// gesture, which PdfReader listens for; it also calls `preventDefault()` on those events so
+// WebKit's own whole-page magnification never kicks in.
+#[cfg(target_os = "macos")]
+fn enable_trackpad_pinch_zoom<R: Runtime>(app: &tauri::App<R>) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+
+    let _ = window.with_webview(|webview| unsafe {
+        let view = &*(webview.inner() as *const objc2_web_kit::WKWebView);
+        view.setAllowsMagnification(true);
+    });
+}
+
+// WKWebView claims macOS text-editing key equivalents (Cmd+Z is Undo, Cmd+; is
+// spell-check's "Check Document Now") inside its own performKeyEquivalent: pass,
+// which macOS runs before both the menu-bar accelerators and DOM keydown
+// listeners — so neither layer ever sees those chords. An NSApplication-level
+// local event monitor is the one hook that runs ahead of the responder chain,
+// so the Fit Width shortcut is intercepted here and forwarded as the same event
+// the View menu item emits. Returning null consumes the NSEvent, which also
+// keeps WebKit's built-in spell-check action from firing.
+#[cfg(target_os = "macos")]
+fn install_fit_width_shortcut_monitor(app_handle: AppHandle) {
+    use core::ptr::NonNull;
+    use objc2_app_kit::{NSEvent, NSEventMask, NSEventModifierFlags};
+
+    // kVK_ANSI_Semicolon: match the physical key, not the produced character —
+    // under a CJK input source charactersIgnoringModifiers can yield the
+    // full-width "；", which would break a string comparison against ";".
+    const SEMICOLON_KEY_CODE: u16 = 41;
+
+    let handler: block2::RcBlock<dyn Fn(NonNull<NSEvent>) -> *mut NSEvent> =
+        block2::RcBlock::new(move |event: NonNull<NSEvent>| {
+            let key_event = unsafe { event.as_ref() };
+            let flags = key_event.modifierFlags();
+            let is_semicolon_key = key_event.keyCode() == SEMICOLON_KEY_CODE
+                || key_event
+                    .charactersIgnoringModifiers()
+                    .is_some_and(|characters| matches!(characters.to_string().as_str(), ";" | "；"));
+            let is_fit_width_chord = flags.contains(NSEventModifierFlags::Command)
+                && !flags.intersects(
+                    NSEventModifierFlags::Shift | NSEventModifierFlags::Control | NSEventModifierFlags::Option,
+                )
+                && is_semicolon_key;
+
+            if is_fit_width_chord {
+                reset_native_magnification(&app_handle);
+                let _ = app_handle.emit(PDF_VIEW_EVENT, "fit-width");
+                return core::ptr::null_mut();
+            }
+
+            event.as_ptr()
+        });
+
+    unsafe {
+        if let Some(monitor) = NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &handler) {
+            // The monitor must stay registered for the app's whole lifetime.
+            std::mem::forget(monitor);
+        }
+    }
+}
+
+// With allowsMagnification enabled, a trackpad pinch may zoom via WKWebView's
+// native whole-view magnification (in addition to, or instead of, the JS-side
+// page zoom, depending on whether WebKit honors preventDefault on the gesture
+// events). Fit Width must therefore reset both layers: this handles the native
+// one, and the "fit-width" event handles the JS one.
+#[cfg(target_os = "macos")]
+fn reset_native_magnification<R: Runtime>(app_handle: &AppHandle<R>) {
+    let Some(window) = app_handle.get_webview_window("main") else {
+        return;
+    };
+
+    let _ = window.with_webview(|webview| unsafe {
+        let view = &*(webview.inner() as *const objc2_web_kit::WKWebView);
+        view.setMagnification(1.0);
+    });
 }
 
 #[cfg(desktop)]
@@ -215,7 +314,7 @@ fn build_menu<R: Runtime>(app_handle: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         "View",
         true,
         &[
-            &MenuItem::with_id(app_handle, PDF_VIEW_FIT_WIDTH, "Fit Width", true, Some("CmdOrCtrl+0"))?,
+            &MenuItem::with_id(app_handle, PDF_VIEW_FIT_WIDTH, "Fit Width", true, Some("CmdOrCtrl+;"))?,
             &zoom_menu(app_handle)?,
             &MenuItem::with_id(app_handle, PDF_VIEW_GO_TO_PAGE, "Go to Page...", true, Some("CmdOrCtrl+G"))?,
             &PredefinedMenuItem::separator(app_handle)?,
@@ -232,11 +331,17 @@ fn build_menu<R: Runtime>(app_handle: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             &PredefinedMenuItem::minimize(app_handle, None)?,
             &PredefinedMenuItem::maximize(app_handle, None)?,
             &PredefinedMenuItem::separator(app_handle)?,
-            &PredefinedMenuItem::close_window(app_handle, None)?,
+            &MenuItem::with_id(app_handle, WORKSPACE_CLOSE_ACTIVE_TAB, "Close Tab", true, Some("CmdOrCtrl+W"))?,
         ],
     )?;
 
-    let help_menu = Submenu::with_id_and_items(app_handle, HELP_SUBMENU_ID, "Help", true, &[])?;
+    let help_menu = Submenu::with_id_and_items(
+        app_handle,
+        HELP_SUBMENU_ID,
+        "Help",
+        true,
+        &[&MenuItem::with_id(app_handle, HELP_KEYBOARD_SHORTCUTS, "Keyboard Shortcuts", true, None::<&str>)?],
+    )?;
 
     Menu::with_items(app_handle, &[&app_menu, &edit_menu, &view_menu, &window_menu, &help_menu])
 }
@@ -250,7 +355,8 @@ fn zoom_menu<R: Runtime, M: Manager<R>>(manager: &M) -> tauri::Result<Submenu<R>
         &[
             &MenuItem::with_id(manager, "pdf-view-zoom-0.75", "75%", true, None::<&str>)?,
             &MenuItem::with_id(manager, "pdf-view-zoom-0.9", "90%", true, None::<&str>)?,
-            &MenuItem::with_id(manager, "pdf-view-zoom-1", "100%", true, Some("CmdOrCtrl+1"))?,
+            // No accelerator: Cmd+1..9 switch workspace tabs (handled in App.tsx).
+            &MenuItem::with_id(manager, "pdf-view-zoom-1", "100%", true, None::<&str>)?,
             &MenuItem::with_id(manager, "pdf-view-zoom-1.1", "110%", true, None::<&str>)?,
             &MenuItem::with_id(manager, "pdf-view-zoom-1.25", "125%", true, None::<&str>)?,
             &MenuItem::with_id(manager, "pdf-view-zoom-1.5", "150%", true, None::<&str>)?,

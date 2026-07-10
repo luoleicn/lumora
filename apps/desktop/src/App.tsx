@@ -1,14 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
+import { listen } from "@tauri-apps/api/event";
 import type { Annotation, Collection, FileAsset, LibraryState, Paper } from "@lumora/shared";
 import { FileText, X } from "lucide-react";
 import { AppToolbar } from "./components/AppToolbar";
 import { CollectionModal, DeleteCollectionModal } from "./components/CollectionModal";
 import { LibrarySidebar } from "./components/LibrarySidebar";
 import { ManualReferenceModal, type ManualReferenceDraft } from "./components/ManualReferenceModal";
+import { ShortcutsHelpModal } from "./components/ShortcutsHelpModal";
 import { NotebookPanel } from "./components/NotebookPanel";
 import { PaperList } from "./components/PaperList";
-import { PdfReader } from "./components/PdfReader";
+import { PdfReader, type PdfReaderViewState } from "./components/PdfReader";
 import { SyncPanel } from "./components/SyncPanel";
 import { createId } from "./lib/id";
 import {
@@ -60,6 +62,8 @@ type PaperDrag = {
   overCollectionId?: string;
 };
 
+const workspaceCommandEvent = "lumora-workspace-command";
+
 const defaultWorkspaceLayout: WorkspaceLayout = {
   widths: {
     library: 236,
@@ -92,13 +96,15 @@ export default function App() {
   const [selectedPaperId, setSelectedPaperId] = useState<string>();
   const [workspaceTabs, setWorkspaceTabs] = useState<WorkspaceTab[]>([documentsTab]);
   const [activeWorkspaceTabId, setActiveWorkspaceTabId] = useState(documentsTab.id);
+  const [pdfViewStates, setPdfViewStates] = useState<Record<string, PdfReaderViewState>>({});
   const [search, setSearch] = useState("");
-  const [fileData, setFileData] = useState<Uint8Array>();
+  const [fileDataById, setFileDataById] = useState<Record<string, Uint8Array>>({});
   const [settings, setSettings] = useState<SyncSettings>(() => loadSyncSettings());
   const [workspaceLayout, setWorkspaceLayout] = useState<WorkspaceLayout>(() => loadWorkspaceLayout());
   const [resizeDrag, setResizeDrag] = useState<ResizeDrag>();
   const [paperDrag, setPaperDrag] = useState<PaperDrag>();
   const [manualModalOpen, setManualModalOpen] = useState(false);
+  const [shortcutsHelpOpen, setShortcutsHelpOpen] = useState(false);
   const [collectionModalParentId, setCollectionModalParentId] = useState<string | undefined>();
   const [collectionModalOpen, setCollectionModalOpen] = useState(false);
   const [deleteCollectionId, setDeleteCollectionId] = useState<string | undefined>();
@@ -122,6 +128,34 @@ export default function App() {
     const handleKeyDown = (event: KeyboardEvent) => {
       const isApplePlatform = /Mac|iPhone|iPad|iPod/i.test(navigator.platform);
       const usesPrimaryModifier = isApplePlatform ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+      const isCloseTabShortcut = event.key.toLowerCase() === "w"
+        && usesPrimaryModifier
+        && !event.altKey
+        && !event.shiftKey;
+      if (isCloseTabShortcut) {
+        event.preventDefault();
+        handleCloseActiveWorkspaceTab();
+        return;
+      }
+
+      if (usesPrimaryModifier && !event.altKey && !event.shiftKey) {
+        // Match the physical digit row so the shortcut survives IME/layout quirks.
+        const digitMatch = /^Digit([1-9])$/.exec(event.code);
+        const digit = digitMatch
+          ? Number.parseInt(digitMatch[1], 10)
+          : /^[1-9]$/.test(event.key)
+            ? Number.parseInt(event.key, 10)
+            : undefined;
+        if (digit !== undefined) {
+          const tab = workspaceTabs[digit - 1];
+          if (tab) {
+            event.preventDefault();
+            handleActivateWorkspaceTab(tab);
+          }
+          return;
+        }
+      }
+
       const isPanelShortcut = usesPrimaryModifier && !event.altKey && !event.shiftKey;
       const shortcutKey = event.key.toLowerCase();
       const targetPanel: MainPanelKey | undefined = isPanelShortcut
@@ -148,7 +182,31 @@ export default function App() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, []);
+  }, [activeWorkspaceTabId, workspaceTabs]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+
+    void listen<string>(workspaceCommandEvent, (event) => {
+      if (event.payload === "close-active-tab") {
+        handleCloseActiveWorkspaceTab();
+      } else if (event.payload === "show-shortcuts-help") {
+        setShortcutsHelpOpen(true);
+      }
+    }).then((nextUnlisten) => {
+      if (disposed) {
+        nextUnlisten();
+        return;
+      }
+      unlisten = nextUnlisten;
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [activeWorkspaceTabId, workspaceTabs]);
 
   useEffect(() => {
     if (!resizeDrag) {
@@ -286,25 +344,52 @@ export default function App() {
   const selectedAnnotations = selectedPaper
     ? library.annotations.filter((annotation) => annotation.paperId === selectedPaper.id)
     : [];
+  const selectedFileData = selectedFile ? fileDataById[selectedFile.id] : undefined;
+  const activeWorkspaceTab = workspaceTabs.find((tab) => tab.id === activeWorkspaceTabId) ?? documentsTab;
+  const openPaperFileIds = useMemo(() => workspaceTabs
+    .flatMap((tab) => {
+      if (tab.kind !== "paper") {
+        return [];
+      }
+
+      const paper = library.papers.find((item) => item.id === tab.paperId && !item.deletedAt);
+      const fileAsset = paper
+        ? library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt)
+        : undefined;
+      return fileAsset ? [fileAsset.id] : [];
+    }), [library.fileAssets, library.papers, workspaceTabs]);
 
   useEffect(() => {
     let cancelled = false;
-    setFileData(undefined);
 
-    if (!selectedFile) {
-      return;
+    const missingFileIds = openPaperFileIds.filter((fileId) => !fileDataById[fileId]);
+    if (missingFileIds.length === 0) {
+      return undefined;
     }
 
-    getFileBytes(selectedFile.id).then((bytes) => {
-      if (!cancelled) {
-        setFileData(bytes);
+    void Promise.all(missingFileIds.map(async (fileId) => {
+      const bytes = await getFileBytes(fileId);
+      return bytes ? { fileId, bytes } : undefined;
+    })).then((loadedFiles) => {
+      if (cancelled) {
+        return;
       }
+
+      setFileDataById((current) => {
+        const next = { ...current };
+        for (const loadedFile of loadedFiles) {
+          if (loadedFile) {
+            next[loadedFile.fileId] = loadedFile.bytes;
+          }
+        }
+        return next;
+      });
     });
 
     return () => {
       cancelled = true;
     };
-  }, [selectedFile?.id]);
+  }, [fileDataById, openPaperFileIds]);
 
   async function handleImportPdf(file?: File) {
     if (!file) {
@@ -535,8 +620,11 @@ export default function App() {
     setLibrary((current) => deletePaperFromLibrary(current, paperId));
     if (selectedPaperId === paperId) {
       setSelectedPaperId(undefined);
-      setFileData(undefined);
     }
+    const deletedFileIds = library.fileAssets.filter((file) => file.paperId === paperId).map((file) => file.id);
+    setFileDataById((current) => Object.fromEntries(
+      Object.entries(current).filter(([fileId]) => !deletedFileIds.includes(fileId))
+    ));
     setWorkspaceTabs((current) => current.filter((tab) => !(tab.kind === "paper" && tab.paperId === paperId)));
     if (activeWorkspaceTabId === `paper:${paperId}`) {
       setActiveWorkspaceTabId(documentsTab.id);
@@ -615,6 +703,36 @@ export default function App() {
       }
 
       return next;
+    });
+  }
+
+  function handleCloseActiveWorkspaceTab() {
+    const activeTab = workspaceTabs.find((tab) => tab.id === activeWorkspaceTabId);
+    if (!activeTab || activeTab.id === documentsTab.id) {
+      return;
+    }
+
+    handleCloseWorkspaceTab(activeTab.id);
+  }
+
+  function handleActivateWorkspaceTab(tab: WorkspaceTab) {
+    setActiveWorkspaceTabId(tab.id);
+    if (tab.kind === "paper") {
+      handleSelectPaper(tab.paperId);
+    }
+  }
+
+  function handleUpdatePdfViewState(paperId: string, viewState: PdfReaderViewState) {
+    setPdfViewStates((current) => {
+      const previous = current[paperId];
+      if (previous?.scrollTop === viewState.scrollTop && previous.zoom === viewState.zoom) {
+        return current;
+      }
+
+      return {
+        ...current,
+        [paperId]: viewState
+      };
     });
   }
 
@@ -748,35 +866,39 @@ export default function App() {
             <WorkspaceTabs
               tabs={workspaceTabs}
               activeTabId={activeWorkspaceTabId}
-              onSelectTab={(tab) => {
-                setActiveWorkspaceTabId(tab.id);
-                if (tab.kind === "paper") {
-                  handleSelectPaper(tab.paperId);
-                }
-              }}
+              onSelectTab={handleActivateWorkspaceTab}
               onCloseTab={handleCloseWorkspaceTab}
             >
-              <WorkspaceTabContent
-                activeTab={workspaceTabs.find((tab) => tab.id === activeWorkspaceTabId) ?? documentsTab}
-                library={library}
-                filteredPapers={filteredPapers}
-                selectedPaperId={selectedPaperId}
-                selectedCollectionId={selectedCollectionId}
-                selectedPaper={selectedPaper}
-                selectedFile={selectedFile}
-                fileData={fileData}
-                selectedAnnotations={selectedAnnotations}
-                onSelectPaper={handleSelectPaper}
-                onOpenPaper={handleOpenPaperTab}
-                onUpdatePaper={handleUpdatePaper}
-                onPaperDragStart={handlePaperDragStart}
-                onPaperDragMove={handlePaperDragMove}
-                onPaperDragEnd={handlePaperDragEnd}
-                onRemovePaperFromCollection={handleRemovePaperFromSelectedCollection}
-                onDeletePaper={handleDeletePaper}
-                onCreateAnnotation={handleCreateAnnotation}
-                onDeleteAnnotation={handleDeleteAnnotation}
-              />
+              {workspaceTabs.map((tab) => (
+                <div
+                  key={tab.id}
+                  className={tab.id === activeWorkspaceTabId ? "workspace-tab-pane active" : "workspace-tab-pane"}
+                  aria-hidden={tab.id !== activeWorkspaceTabId}
+                  role="tabpanel"
+                >
+                  <WorkspaceTabContent
+                    active={tab.id === activeWorkspaceTabId}
+                    tab={tab}
+                    library={library}
+                    filteredPapers={filteredPapers}
+                    selectedPaperId={selectedPaperId}
+                    selectedCollectionId={selectedCollectionId}
+                    fileDataById={fileDataById}
+                    pdfViewStates={pdfViewStates}
+                    onSelectPaper={handleSelectPaper}
+                    onOpenPaper={handleOpenPaperTab}
+                    onUpdatePaper={handleUpdatePaper}
+                    onPaperDragStart={handlePaperDragStart}
+                    onPaperDragMove={handlePaperDragMove}
+                    onPaperDragEnd={handlePaperDragEnd}
+                    onRemovePaperFromCollection={handleRemovePaperFromSelectedCollection}
+                    onDeletePaper={handleDeletePaper}
+                    onUpdatePdfViewState={handleUpdatePdfViewState}
+                    onCreateAnnotation={handleCreateAnnotation}
+                    onDeleteAnnotation={handleDeleteAnnotation}
+                  />
+                </div>
+              ))}
             </WorkspaceTabs>
           )}
 
@@ -787,7 +909,7 @@ export default function App() {
               status={status}
               paper={selectedPaper}
               fileAsset={selectedFile}
-              fileData={fileData}
+              fileData={selectedFileData}
               annotations={selectedAnnotations}
               onSettingsChange={setSettings}
               onLogin={handleLogin}
@@ -828,6 +950,7 @@ export default function App() {
         onClose={() => setManualModalOpen(false)}
         onSave={handleCreateManualReference}
       />
+      <ShortcutsHelpModal open={shortcutsHelpOpen} onClose={() => setShortcutsHelpOpen(false)} />
       <CollectionModal
         open={collectionModalOpen}
         parentName={library.collections.find((collection) => collection.id === collectionModalParentId)?.name}
@@ -949,15 +1072,14 @@ function WorkspaceTabs({
 }
 
 function WorkspaceTabContent({
-  activeTab,
+  active,
+  tab,
   library,
   filteredPapers,
   selectedPaperId,
   selectedCollectionId,
-  selectedPaper,
-  selectedFile,
-  fileData,
-  selectedAnnotations,
+  fileDataById,
+  pdfViewStates,
   onSelectPaper,
   onOpenPaper,
   onUpdatePaper,
@@ -966,18 +1088,18 @@ function WorkspaceTabContent({
   onPaperDragEnd,
   onRemovePaperFromCollection,
   onDeletePaper,
+  onUpdatePdfViewState,
   onCreateAnnotation,
   onDeleteAnnotation
 }: {
-  activeTab: WorkspaceTab;
+  active: boolean;
+  tab: WorkspaceTab;
   library: LibraryState;
   filteredPapers: Paper[];
   selectedPaperId?: string;
   selectedCollectionId: string;
-  selectedPaper?: Paper;
-  selectedFile?: FileAsset;
-  fileData?: Uint8Array;
-  selectedAnnotations: Annotation[];
+  fileDataById: Record<string, Uint8Array>;
+  pdfViewStates: Record<string, PdfReaderViewState>;
   onSelectPaper: (paperId: string) => void;
   onOpenPaper: (paperId: string) => void;
   onUpdatePaper: (paper: Paper) => void;
@@ -986,10 +1108,11 @@ function WorkspaceTabContent({
   onPaperDragEnd: (paperId: string, collectionId?: string) => void;
   onRemovePaperFromCollection: (paperId: string) => void;
   onDeletePaper: (paperId: string) => void;
+  onUpdatePdfViewState: (paperId: string, viewState: PdfReaderViewState) => void;
   onCreateAnnotation: (annotation: Annotation) => void;
   onDeleteAnnotation: (annotation: Annotation) => void;
 }) {
-  if (activeTab.kind === "documents") {
+  if (tab.kind === "documents") {
     return (
       <PaperList
         state={library}
@@ -1008,7 +1131,7 @@ function WorkspaceTabContent({
     );
   }
 
-  if (activeTab.kind === "notebook") {
+  if (tab.kind === "notebook") {
     return (
       <NotebookPanel
         papers={library.papers.filter((paper) => !paper.deletedAt)}
@@ -1018,12 +1141,24 @@ function WorkspaceTabContent({
     );
   }
 
+  const paper = library.papers.find((item) => item.id === tab.paperId && !item.deletedAt);
+  const fileAsset = paper
+    ? library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt)
+    : undefined;
+  const fileData = fileAsset ? fileDataById[fileAsset.id] : undefined;
+  const annotations = paper
+    ? library.annotations.filter((annotation) => annotation.paperId === paper.id)
+    : [];
+
   return (
     <PdfReader
-      paper={selectedPaper}
-      fileAsset={selectedFile}
+      paper={paper}
+      fileAsset={fileAsset}
       fileData={fileData}
-      annotations={selectedAnnotations}
+      annotations={annotations}
+      active={active}
+      viewState={pdfViewStates[tab.paperId]}
+      onViewStateChange={(viewState) => onUpdatePdfViewState(tab.paperId, viewState)}
       onCreateAnnotation={onCreateAnnotation}
       onDeleteAnnotation={onDeleteAnnotation}
     />

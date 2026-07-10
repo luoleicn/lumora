@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Document, Page, pdfjs } from "react-pdf";
@@ -57,28 +57,53 @@ type PdfReaderProps = {
   fileAsset?: FileAsset;
   fileData?: Uint8Array;
   annotations: Annotation[];
+  active?: boolean;
+  viewState?: PdfReaderViewState;
+  onViewStateChange?: (viewState: PdfReaderViewState) => void;
   onCreateAnnotation: (annotation: Annotation) => void;
   onDeleteAnnotation: (annotation: Annotation) => void;
 };
 
+type WebKitGestureEvent = Event & {
+  scale: number;
+};
+
+export type PdfReaderViewState = {
+  scrollTop: number;
+  zoom?: number;
+};
+
 const colors = ["#ffe45c", "#8ee6a8", "#82cfff", "#ffadad"];
 const pdfViewEvent = "lumora-pdf-view-command";
+const minZoom = 0.5;
+const maxZoom = 3;
 
-export function PdfReader({
+function PdfReaderComponent({
   paper,
   fileAsset,
   fileData,
   annotations,
+  active = true,
+  viewState,
+  onViewStateChange,
   onCreateAnnotation,
   onDeleteAnnotation
 }: PdfReaderProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const pageJumpInputRef = useRef<HTMLInputElement>(null);
   const pageRefs = useRef<Array<HTMLDivElement | null>>([]);
+  const pendingScrollRestoreRef = useRef<number | undefined>(undefined);
+  const restoringScrollRef = useRef(false);
+  const gestureStartZoomRef = useRef(1);
   const [numPages, setNumPages] = useState(0);
   const [pageWidth, setPageWidth] = useState(760);
-  const [zoom, setZoom] = useState(1);
+  const [zoom, setZoom] = useState(viewState?.zoom ?? 1);
+  const zoomRef = useRef(zoom);
+  const [hasExplicitZoom, setHasExplicitZoom] = useState(viewState?.zoom !== undefined);
   const [color, setColor] = useState(colors[0]);
   const [contextMenu, setContextMenu] = useState<AnnotationContextMenu>();
+  const [pageJumpOpen, setPageJumpOpen] = useState(false);
+  const [pageJumpValue, setPageJumpValue] = useState("");
   const [loadError, setLoadError] = useState<string>();
   const documentFile = useMemo(() => (fileData ? { data: fileData.slice() } : undefined), [fileData]);
 
@@ -87,7 +112,7 @@ export function PdfReader({
     [annotations]
   );
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const element = scrollRef.current;
     if (!element) {
       return;
@@ -101,9 +126,13 @@ export function PdfReader({
     const observer = new ResizeObserver(resize);
     observer.observe(element);
     return () => observer.disconnect();
-  }, []);
+  }, [fileData, paper?.id]);
 
   useEffect(() => {
+    if (!active) {
+      return;
+    }
+
     if (!contextMenu) {
       return;
     }
@@ -125,20 +154,152 @@ export function PdfReader({
       window.removeEventListener("pointerdown", closeMenu);
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [contextMenu]);
+  }, [active, contextMenu]);
 
   useEffect(() => {
     setContextMenu(undefined);
     setNumPages(0);
     setLoadError(undefined);
-    setZoom(1);
-  }, [fileData]);
+    setPageJumpOpen(false);
+    setPageJumpValue("");
+    pendingScrollRestoreRef.current = viewState?.scrollTop ?? 0;
+    restoringScrollRef.current = true;
+    setHasExplicitZoom(viewState?.zoom !== undefined);
+    setZoom(viewState?.zoom ?? 1);
+  }, [fileData, paper?.id]);
+
+  useEffect(() => {
+    zoomRef.current = zoom;
+    onViewStateChange?.({
+      scrollTop: restoringScrollRef.current
+        ? pendingScrollRestoreRef.current ?? viewState?.scrollTop ?? 0
+        : scrollRef.current?.scrollTop ?? viewState?.scrollTop ?? 0,
+      zoom: hasExplicitZoom ? zoom : undefined
+    });
+  }, [hasExplicitZoom, zoom]);
+
+  useEffect(() => {
+    if (!fileData || numPages === 0) {
+      return;
+    }
+
+    pendingScrollRestoreRef.current = viewState?.scrollTop ?? 0;
+    restoringScrollRef.current = true;
+    const frame = restorePendingScroll();
+
+    return () => cancelAnimationFrame(frame);
+  }, [fileData, numPages, paper?.id]);
 
   useEffect(() => {
     pageRefs.current = pageRefs.current.slice(0, numPages);
   }, [numPages]);
 
   useEffect(() => {
+    if (!active) {
+      return;
+    }
+
+    if (!pageJumpOpen) {
+      return;
+    }
+
+    requestAnimationFrame(() => {
+      pageJumpInputRef.current?.focus();
+      pageJumpInputRef.current?.select();
+    });
+  }, [active, pageJumpOpen]);
+
+  useEffect(() => {
+    if (!active) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const isApplePlatform = /Mac|iPhone|iPad|iPod/i.test(navigator.platform);
+      const usesPrimaryModifier = isApplePlatform ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+      const isPageJumpShortcut = event.key.toLowerCase() === "g"
+        && usesPrimaryModifier
+        && !event.altKey
+        && !event.shiftKey;
+      // On macOS this keydown never arrives: WKWebView claims text-editing key
+      // equivalents (Cmd+Z, Cmd+;, ...) before the DOM, so Fit Width is
+      // intercepted by a native NSEvent monitor in src-tauri/src/lib.rs instead.
+      // This branch covers Ctrl+; on the other platforms.
+      const isFitWidthShortcut = (event.key === ";" || event.code === "Semicolon")
+        && usesPrimaryModifier
+        && !event.altKey
+        && !event.shiftKey;
+
+      if ((!isPageJumpShortcut && !isFitWidthShortcut) || isEditableShortcutTarget(event.target)) {
+        return;
+      }
+
+      event.preventDefault();
+      if (isFitWidthShortcut) {
+        handleFitWidth();
+      } else {
+        handlePromptPageJump();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [active, numPages]);
+
+  useEffect(() => {
+    if (!active) {
+      return;
+    }
+
+    const element = scrollRef.current;
+    if (!element) {
+      return;
+    }
+
+    const handleGestureStart = (event: Event) => {
+      event.preventDefault();
+      gestureStartZoomRef.current = zoomRef.current;
+    };
+    const handleGestureChange = (event: Event) => {
+      event.preventDefault();
+      const scale = (event as WebKitGestureEvent).scale;
+      if (!Number.isFinite(scale)) {
+        return;
+      }
+
+      setHasExplicitZoom(true);
+      setZoom(clamp(gestureStartZoomRef.current * scale, minZoom, maxZoom));
+    };
+
+    const handleWheelZoom = (event: WheelEvent) => {
+      if (!event.ctrlKey) {
+        return;
+      }
+
+      event.preventDefault();
+      const scale = Math.exp(-event.deltaY * 0.002);
+      setHasExplicitZoom(true);
+      setZoom((current) => clamp(current * scale, minZoom, maxZoom));
+    };
+
+    element.addEventListener("gesturestart", handleGestureStart);
+    element.addEventListener("gesturechange", handleGestureChange);
+    // React attaches `onWheel` as a passive listener, which silently ignores
+    // preventDefault(); registering natively with {passive: false} is required
+    // to stop the browser's own ctrl+wheel zoom.
+    element.addEventListener("wheel", handleWheelZoom, { passive: false });
+    return () => {
+      element.removeEventListener("gesturestart", handleGestureStart);
+      element.removeEventListener("gesturechange", handleGestureChange);
+      element.removeEventListener("wheel", handleWheelZoom);
+    };
+  }, [active]);
+
+  useEffect(() => {
+    if (!active) {
+      return;
+    }
+
     let unlisten: (() => void) | undefined;
     let disposed = false;
 
@@ -157,6 +318,7 @@ export function PdfReader({
       if (command.startsWith("zoom:")) {
         const nextZoom = Number.parseFloat(command.slice("zoom:".length));
         if (Number.isFinite(nextZoom)) {
+          setHasExplicitZoom(true);
           setZoom(nextZoom);
         }
       }
@@ -172,9 +334,13 @@ export function PdfReader({
       disposed = true;
       unlisten?.();
     };
-  }, [numPages]);
+  }, [active, numPages]);
 
   function handleContextMenu(event: React.MouseEvent) {
+    if (!active) {
+      return;
+    }
+
     const existingAnnotation = findAnnotationAtPoint(scrollRef.current, event.clientX, event.clientY, visibleAnnotations);
     if (existingAnnotation) {
       event.preventDefault();
@@ -208,6 +374,10 @@ export function PdfReader({
   }
 
   function handleSelectionPointerUp(event: React.PointerEvent) {
+    if (!active) {
+      return;
+    }
+
     if (event.button !== 0) {
       return;
     }
@@ -301,6 +471,7 @@ export function PdfReader({
   }
 
   function handleFitWidth() {
+    setHasExplicitZoom(false);
     setZoom(1);
   }
 
@@ -309,10 +480,15 @@ export function PdfReader({
       return;
     }
 
-    const pageValue = window.prompt(`Go to page (1-${numPages})`);
-    if (pageValue !== null) {
-      handleJumpToPage(pageValue);
-    }
+    setContextMenu(undefined);
+    setPageJumpValue("");
+    setPageJumpOpen(true);
+  }
+
+  function handleSubmitPageJump(event: { preventDefault: () => void }) {
+    event.preventDefault();
+    handleJumpToPage(pageJumpValue);
+    setPageJumpOpen(false);
   }
 
   function handleJumpToPage(pageValue: string | number) {
@@ -323,6 +499,39 @@ export function PdfReader({
 
     const clampedPage = Math.min(Math.max(nextPage, 1), numPages);
     pageRefs.current[clampedPage - 1]?.scrollIntoView({ block: "start", behavior: "smooth" });
+  }
+
+  function handleReaderScroll() {
+    if (restoringScrollRef.current) {
+      return;
+    }
+
+    onViewStateChange?.({
+      scrollTop: scrollRef.current?.scrollTop ?? 0,
+      zoom: hasExplicitZoom ? zoom : undefined
+    });
+  }
+
+  function restorePendingScroll() {
+    if (!restoringScrollRef.current && pendingScrollRestoreRef.current === undefined) {
+      return 0;
+    }
+
+    return requestAnimationFrame(() => {
+      const scrollTop = pendingScrollRestoreRef.current ?? 0;
+      if (scrollRef.current) {
+        scrollRef.current.scrollTop = scrollTop;
+      }
+
+      requestAnimationFrame(() => {
+        const nextScrollTop = pendingScrollRestoreRef.current ?? scrollTop;
+        if (scrollRef.current) {
+          scrollRef.current.scrollTop = nextScrollTop;
+        }
+        pendingScrollRestoreRef.current = undefined;
+        restoringScrollRef.current = false;
+      });
+    });
   }
 
   async function handleTranslate(quote: string) {
@@ -387,7 +596,13 @@ export function PdfReader({
   return (
     <section className="reader">
       <div className="reader-body">
-        <div ref={scrollRef} className="pdf-scroll" onContextMenu={handleContextMenu} onPointerUp={handleSelectionPointerUp}>
+        <div
+          ref={scrollRef}
+          className="pdf-scroll"
+          onContextMenu={handleContextMenu}
+          onPointerUp={handleSelectionPointerUp}
+          onScroll={handleReaderScroll}
+        >
           <Document
             file={documentFile}
             loading={<div className="pdf-status">Loading PDF...</div>}
@@ -404,7 +619,13 @@ export function PdfReader({
                   pageRefs.current[index] = element;
                 }}
               >
-                <Page pageNumber={index + 1} width={pageWidth * zoom} renderAnnotationLayer renderTextLayer />
+                <Page
+                  pageNumber={index + 1}
+                  width={pageWidth * zoom}
+                  renderAnnotationLayer
+                  renderTextLayer
+                  onRenderSuccess={restorePendingScroll}
+                />
                 <AnnotationOverlay
                   annotations={visibleAnnotations.filter((annotation) => annotation.pageIndex === index)}
                   onMoveAnnotation={(annotation, position) => onCreateAnnotation(moveNoteMarker(annotation, position))}
@@ -461,9 +682,71 @@ export function PdfReader({
             }}
           />
         )}
+        {pageJumpOpen && (
+          <div className="page-jump-popover" role="dialog" aria-modal="true" aria-label="Go to page">
+            <form onSubmit={handleSubmitPageJump}>
+              <label htmlFor="page-jump-input">Go to page</label>
+              <div>
+                <input
+                  ref={pageJumpInputRef}
+                  id="page-jump-input"
+                  type="number"
+                  min={1}
+                  max={numPages}
+                  value={pageJumpValue}
+                  placeholder={`1-${numPages}`}
+                  onChange={(event) => setPageJumpValue(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      setPageJumpOpen(false);
+                    }
+                  }}
+                />
+                <button type="submit">Go</button>
+              </div>
+            </form>
+          </div>
+        )}
       </div>
     </section>
   );
+}
+
+export const PdfReader = memo(PdfReaderComponent, arePdfReaderPropsEqual);
+
+function arePdfReaderPropsEqual(previous: PdfReaderProps, next: PdfReaderProps) {
+  return previous.paper?.id === next.paper?.id
+    && previous.paper?.title === next.paper?.title
+    && previous.fileAsset?.id === next.fileAsset?.id
+    && previous.fileData === next.fileData
+    && previous.active === next.active
+    && previous.viewState?.scrollTop === next.viewState?.scrollTop
+    && previous.viewState?.zoom === next.viewState?.zoom
+    && annotationsEqual(previous.annotations, next.annotations);
+}
+
+function annotationsEqual(previous: Annotation[], next: Annotation[]) {
+  if (previous === next) {
+    return true;
+  }
+
+  if (previous.length !== next.length) {
+    return false;
+  }
+
+  return previous.every((annotation, index) => {
+    const nextAnnotation = next[index];
+    return annotation.id === nextAnnotation.id
+      && annotation.updatedAt === nextAnnotation.updatedAt
+      && annotation.deletedAt === nextAnnotation.deletedAt
+      && annotation.kind === nextAnnotation.kind
+      && annotation.color === nextAnnotation.color
+      && annotation.comment === nextAnnotation.comment
+      && annotation.pageIndex === nextAnnotation.pageIndex
+      && annotation.rects === nextAnnotation.rects
+      && annotation.notePosition === nextAnnotation.notePosition;
+  });
 }
 
 function AnnotationOverlay({
@@ -997,4 +1280,16 @@ function readCurrentSelection(container: HTMLElement | null): PendingSelection |
     rects: mergeNearbyRects(firstPage[1]),
     quote
   };
+}
+
+function isEditableShortcutTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+
+  return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
 }
