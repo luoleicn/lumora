@@ -134,6 +134,87 @@ button {
   outline: 0;
 }
 
+/* PDF find bar — replaces .global-search when a paper tab is active. */
+.pdf-find-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  border: 1px solid #bfc9d3;
+  border-radius: 18px;
+  background: #ffffff;
+  padding: 0 8px 0 12px;
+  min-width: 280px;
+  max-width: 420px;
+}
+
+.pdf-find-bar input {
+  flex: 1;
+  min-width: 60px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #202226;
+  font-size: 13px;
+}
+
+.pdf-find-bar .find-search-icon {
+  flex-shrink: 0;
+  color: #6b7480;
+}
+
+.find-match-count {
+  flex-shrink: 0;
+  color: #68727d;
+  font-size: 12px;
+  min-width: 60px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.find-nav-button {
+  display: inline-grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border: 1px solid #cfd7df;
+  border-radius: 5px;
+  background: #ffffff;
+  color: #4c5661;
+  padding: 0;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.find-nav-button:hover:not(:disabled) {
+  background: #eef6f3;
+  border-color: #a0b7ae;
+}
+
+.find-nav-button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.find-close-button {
+  display: inline-grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #68727d;
+  padding: 0;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.find-close-button:hover {
+  background: #edf2f5;
+  color: #26313a;
+}
+
 .toolbar-status {
   display: flex;
   align-items: center;
@@ -1388,6 +1469,21 @@ body.paper-pointer-dragging * {
   position: absolute;
   mix-blend-mode: multiply;
   opacity: 0.55;
+}
+
+/* Temporary search-result highlight overlay rendered by PdfReader's find-in-PDF.
+   Distinct from user annotations: warmer yellow + orange active state. */
+.search-highlight-rect {
+  position: absolute;
+  pointer-events: none;
+  background: rgba(255, 213, 0, 0.45);
+  mix-blend-mode: multiply;
+  border-radius: 1px;
+}
+
+.search-highlight-rect.active {
+  background: rgba(255, 152, 0, 0.6);
+  box-shadow: 0 0 0 1px rgba(255, 152, 0, 0.8);
 }
 
 .note-marker {

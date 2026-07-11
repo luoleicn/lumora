@@ -6,6 +6,7 @@ import { Languages, MessageSquare, StickyNote, Trash2, X } from "lucide-react";
 import type { Annotation, FileAsset, Paper } from "@lumora/shared";
 import { clamp01, mergeNearbyRects, normalizeRect } from "@lumora/shared";
 import { createId } from "../lib/id";
+import { findInPageTextLayer, type PdfSearchMatch } from "../lib/pdfSearch";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
 
@@ -52,6 +53,11 @@ type ExistingAnnotationContextMenu = {
 
 type AnnotationContextMenu = NewAnnotationContextMenu | ExistingAnnotationContextMenu;
 
+export type PdfSearchState = {
+  totalMatches: number;
+  activeMatchIndex: number;
+};
+
 type PdfReaderProps = {
   paper?: Paper;
   fileAsset?: FileAsset;
@@ -62,6 +68,8 @@ type PdfReaderProps = {
   onViewStateChange?: (viewState: PdfReaderViewState) => void;
   onCreateAnnotation: (annotation: Annotation) => void;
   onDeleteAnnotation: (annotation: Annotation) => void;
+  pdfSearchQuery?: string;
+  onPdfSearchUpdate?: (state: PdfSearchState) => void;
 };
 
 type WebKitGestureEvent = Event & {
@@ -87,7 +95,9 @@ function PdfReaderComponent({
   viewState,
   onViewStateChange,
   onCreateAnnotation,
-  onDeleteAnnotation
+  onDeleteAnnotation,
+  pdfSearchQuery,
+  onPdfSearchUpdate
 }: PdfReaderProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const pageJumpInputRef = useRef<HTMLInputElement>(null);
@@ -105,6 +115,9 @@ function PdfReaderComponent({
   const [pageJumpOpen, setPageJumpOpen] = useState(false);
   const [pageJumpValue, setPageJumpValue] = useState("");
   const [loadError, setLoadError] = useState<string>();
+  const [findMatches, setFindMatches] = useState<PdfSearchMatch[]>([]);
+  const [activeMatchIndex, setActiveMatchIndex] = useState(-1);
+  const findMatchesRef = useRef<PdfSearchMatch[]>([]);
   const documentFile = useMemo(() => (fileData ? { data: fileData.slice() } : undefined), [fileData]);
 
   const visibleAnnotations = useMemo(
@@ -230,6 +243,24 @@ function PdfReaderComponent({
         && !event.altKey
         && !event.shiftKey;
 
+      // Cmd+F / Ctrl+F — focus the global search bar which, on a paper tab,
+      // acts as the find-in-document bar. On macOS WKWebView may intercept
+      // Cmd+F for its own find bar before it reaches the DOM; the shortcut
+      // still works on other platforms.
+      const isFindShortcut = event.key.toLowerCase() === "f"
+        && usesPrimaryModifier
+        && !event.altKey
+        && !event.shiftKey;
+
+      if (isFindShortcut) {
+        event.preventDefault();
+        // Focus the app-toolbar search/find input so the user can start typing.
+        const toolbarInput = document.querySelector<HTMLInputElement>(".app-toolbar input[type='text']");
+        toolbarInput?.focus();
+        toolbarInput?.select();
+        return;
+      }
+
       if ((!isPageJumpShortcut && !isFitWidthShortcut) || isEditableShortcutTarget(event.target)) {
         return;
       }
@@ -335,6 +366,89 @@ function PdfReaderComponent({
       unlisten?.();
     };
   }, [active, numPages]);
+
+  // PDF text search: runs when the global search bar query changes while this
+  // paper tab is active. Walks every rendered page's text layer and collects
+  // match positions as normalised rects.
+  useEffect(() => {
+    const query = pdfSearchQuery?.trim();
+    if (!query || numPages === 0 || !active) {
+      setFindMatches([]);
+      setActiveMatchIndex(-1);
+      findMatchesRef.current = [];
+      onPdfSearchUpdate?.({ totalMatches: 0, activeMatchIndex: -1 });
+      return undefined;
+    }
+
+    const lowerQuery = query.toLowerCase();
+    let cancelled = false;
+
+    const timer = window.setTimeout(() => {
+      const allMatches: PdfSearchMatch[] = [];
+      for (let i = 0; i < numPages; i += 1) {
+        const pageEl = pageRefs.current[i];
+        if (!pageEl) continue;
+        const pageMatches = findInPageTextLayer(pageEl, i, lowerQuery);
+        allMatches.push(...pageMatches);
+      }
+
+      if (cancelled) return;
+
+      setFindMatches(allMatches);
+      findMatchesRef.current = allMatches;
+      const activeIdx = allMatches.length > 0 ? 0 : -1;
+      setActiveMatchIndex(activeIdx);
+      onPdfSearchUpdate?.({ totalMatches: allMatches.length, activeMatchIndex: activeIdx });
+
+      // Scroll to the first match.
+      if (allMatches.length > 0) {
+        scrollToFindMatch(allMatches[0]);
+      }
+    }, 150);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [pdfSearchQuery, numPages, active, onPdfSearchUpdate]);
+
+  function scrollToFindMatch(match: PdfSearchMatch) {
+    const pageEl = pageRefs.current[match.pageIndex];
+    if (!pageEl) return;
+    pageEl.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+
+  function goToNextFindMatch() {
+    const matches = findMatchesRef.current;
+    if (matches.length === 0) return;
+    const next = activeMatchIndex < 0 || activeMatchIndex >= matches.length - 1 ? 0 : activeMatchIndex + 1;
+    setActiveMatchIndex(next);
+    onPdfSearchUpdate?.({ totalMatches: matches.length, activeMatchIndex: next });
+    scrollToFindMatch(matches[next]);
+  }
+
+  function goToPrevFindMatch() {
+    const matches = findMatchesRef.current;
+    if (matches.length === 0) return;
+    const prev = activeMatchIndex <= 0 ? matches.length - 1 : activeMatchIndex - 1;
+    setActiveMatchIndex(prev);
+    onPdfSearchUpdate?.({ totalMatches: matches.length, activeMatchIndex: prev });
+    scrollToFindMatch(matches[prev]);
+  }
+
+  // Expose the navigation functions so App.tsx (via the toolbar) can drive them.
+  // We update the refs on every render so the parent always sees the latest.
+  const navRef = useRef({ goToNextFindMatch, goToPrevFindMatch });
+  navRef.current = { goToNextFindMatch, goToPrevFindMatch };
+
+  // Store nav in a DOM data attribute so the parent can retrieve it imperatively
+  // without threading callbacks through the memo comparison.
+  const readerBodyRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = readerBodyRef.current;
+    if (!el) return;
+    (el as HTMLDivElement & { __pdfSearchNav?: typeof navRef.current }).__pdfSearchNav = navRef.current;
+  });
 
   function handleContextMenu(event: React.MouseEvent) {
     if (!active) {
@@ -595,7 +709,7 @@ function PdfReaderComponent({
 
   return (
     <section className="reader">
-      <div className="reader-body">
+      <div className="reader-body" ref={readerBodyRef}>
         <div
           ref={scrollRef}
           className="pdf-scroll"
@@ -642,6 +756,25 @@ function PdfReaderComponent({
                     });
                   }}
                 />
+                {findMatches
+                  .filter((match) => match.pageIndex === index)
+                  .map((match) => (
+                    <span
+                      key={match.key}
+                      className={
+                        match === findMatches[activeMatchIndex]
+                          ? "search-highlight-rect active"
+                          : "search-highlight-rect"
+                      }
+                      aria-hidden
+                      style={{
+                        left: `${match.rect.x * 100}%`,
+                        top: `${match.rect.y * 100}%`,
+                        width: `${match.rect.width * 100}%`,
+                        height: `${match.rect.height * 100}%`
+                      }}
+                    />
+                  ))}
               </div>
             ))}
           </Document>
@@ -723,6 +856,7 @@ function arePdfReaderPropsEqual(previous: PdfReaderProps, next: PdfReaderProps) 
     && previous.active === next.active
     && previous.viewState?.scrollTop === next.viewState?.scrollTop
     && previous.viewState?.zoom === next.viewState?.zoom
+    && previous.pdfSearchQuery === next.pdfSearchQuery
     && annotationsEqual(previous.annotations, next.annotations);
 }
 

@@ -1,3 +1,15 @@
+// PdfReader stores its find-navigation callbacks on the reader-body DOM element
+// so the parent can drive next/prev from toolbar buttons without threading refs
+// through the React memo comparison.
+declare global {
+  interface HTMLDivElement {
+    __pdfSearchNav?: {
+      goToNextFindMatch: () => void;
+      goToPrevFindMatch: () => void;
+    };
+  }
+}
+
 import { useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
@@ -157,6 +169,8 @@ export default function App() {
   const [pdfViewStates, setPdfViewStates] = useState<Record<string, PdfReaderViewState>>({});
   const [search, setSearch] = useState("");
   const [searchHits, setSearchHits] = useState<SearchHit[]>();
+  const [pdfSearchQuery, setPdfSearchQuery] = useState("");
+  const [pdfSearchState, setPdfSearchState] = useState({ totalMatches: 0, activeMatchIndex: -1 });
   const backfillRunningRef = useRef(false);
   const [fileDataById, setFileDataById] = useState<Record<string, Uint8Array>>({});
   const [settings, setSettings] = useState<SyncSettings>(() => loadSyncSettings());
@@ -311,6 +325,25 @@ export default function App() {
             event.preventDefault();
             handleActivateWorkspaceTab(tab);
           }
+          return;
+        }
+      }
+
+      // Cmd+F / Ctrl+F on a paper tab: focus the global search bar which acts as
+      // the find-in-document bar. WKWebView may intercept this on macOS before
+      // the DOM sees it; the contextual toolbar (auto-switch to PDF find mode)
+      // covers the macOS case.
+      const isFindShortcut = event.key.toLowerCase() === "f"
+        && usesPrimaryModifier
+        && !event.altKey
+        && !event.shiftKey;
+      if (isFindShortcut) {
+        const activeTab = workspaceTabs.find((tab) => tab.id === activeWorkspaceTabId);
+        if (activeTab?.kind === "paper") {
+          event.preventDefault();
+          const toolbarInput = document.querySelector<HTMLInputElement>(".app-toolbar input[type='text']");
+          toolbarInput?.focus();
+          toolbarInput?.select();
           return;
         }
       }
@@ -496,8 +529,10 @@ export default function App() {
       });
   }, [library, selectedAuthor, selectedCollectionId, selectedTag]);
 
-  // A non-empty query searches the whole library via the FTS index, bypassing
-  // the collection/author/tag filters; clearing it restores the filtered view.
+  // A non-empty query searches the whole library via the FTS index; clearing it
+  // restores the filtered view. Adding selectedCollectionId to the deps re-runs
+  // the debounced fetch when the user clicks a different folder while a query is
+  // active, so the frontend filter in displayedPapers can rescope results.
   useEffect(() => {
     const query = search.trim();
     if (!query) {
@@ -525,13 +560,33 @@ export default function App() {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [search]);
+  }, [search, selectedCollectionId]);
 
   const searchActive = search.trim().length > 0;
-  const displayedPapers = useMemo(
-    () => (searchActive && searchHits ? mapHitsToPapers(searchHits, library.papers) : filteredPapers),
-    [filteredPapers, library.papers, searchActive, searchHits]
-  );
+  const displayedPapers = useMemo(() => {
+    if (!searchActive || !searchHits) {
+      return filteredPapers;
+    }
+    const hitsToPapers = mapHitsToPapers(searchHits, library.papers);
+    // Scope search results to the selected folder and its descendants when a
+    // real collection is selected. Virtual collections ("all", "favorites",
+    // etc.) are identified by their fixed string IDs and always show all hits.
+    const isRealCollection = selectedCollectionId !== "all"
+      && selectedCollectionId !== "recently_added"
+      && selectedCollectionId !== "favorites"
+      && selectedCollectionId !== "unsorted"
+      && selectedCollectionId !== "trash";
+    if (!isRealCollection) {
+      return hitsToPapers;
+    }
+    const collectionIds = getCollectionAndDescendantIds(library.collections, selectedCollectionId);
+    const paperIdsInCollection = new Set(
+      library.paperCollections
+        .filter((pc) => !pc.deletedAt && collectionIds.has(pc.collectionId))
+        .map((pc) => pc.paperId)
+    );
+    return hitsToPapers.filter((paper) => paperIdsInCollection.has(paper.id));
+  }, [filteredPapers, library.papers, library.collections, library.paperCollections, searchActive, searchHits, selectedCollectionId]);
   const searchMetaByPaperId = useMemo(() => {
     if (!searchActive || !searchHits) {
       return undefined;
@@ -613,6 +668,16 @@ export default function App() {
     )
     : false;
   const activeWorkspaceTab = workspaceTabs.find((tab) => tab.id === activeWorkspaceTabId) ?? documentsTab;
+  const searchMode = activeWorkspaceTab.kind === "paper" ? "pdf" as const : "library" as const;
+
+  // Clear PDF search when switching away from a paper tab.
+  useEffect(() => {
+    if (activeWorkspaceTab.kind !== "paper") {
+      setPdfSearchQuery("");
+      setPdfSearchState({ totalMatches: 0, activeMatchIndex: -1 });
+    }
+  }, [activeWorkspaceTabId]);
+
   const openPaperFileIds = useMemo(() => {
     const fileIds = workspaceTabs.flatMap((tab) => {
       if (tab.kind !== "paper") {
@@ -1467,7 +1532,26 @@ export default function App() {
 
   return (
     <main className="app-frame">
-      <AppToolbar search={search} status={status} onSearchChange={setSearch} />
+      <AppToolbar
+        search={searchMode === "library" ? search : pdfSearchQuery}
+        searchMode={searchMode}
+        status={status}
+        onSearchChange={searchMode === "library" ? setSearch : setPdfSearchQuery}
+        pdfSearchTotalMatches={pdfSearchState.totalMatches}
+        pdfSearchActiveMatchIndex={pdfSearchState.activeMatchIndex}
+        onPdfSearchNext={() => {
+          const el = document.querySelector<HTMLDivElement>(".reader-body");
+          el?.__pdfSearchNav?.goToNextFindMatch();
+        }}
+        onPdfSearchPrev={() => {
+          const el = document.querySelector<HTMLDivElement>(".reader-body");
+          el?.__pdfSearchNav?.goToPrevFindMatch();
+        }}
+        onPdfSearchClose={() => {
+          setPdfSearchQuery("");
+          setPdfSearchState({ totalMatches: 0, activeMatchIndex: -1 });
+        }}
+      />
 
       <section className={resizeDrag ? "app-shell resizing" : "app-shell"}>
       {panelOrder.map((panel, index) => (
@@ -1529,6 +1613,8 @@ export default function App() {
                     selectedCollectionId={selectedCollectionId}
                     fileDataById={fileDataById}
                     pdfViewStates={pdfViewStates}
+                    pdfSearchQuery={searchMode === "pdf" ? pdfSearchQuery : undefined}
+                    onPdfSearchUpdate={setPdfSearchState}
                     onSelectPaper={handleSelectPaper}
                     onOpenPaper={handleOpenPaperTab}
                     onUpdatePaper={handleUpdatePaper}
@@ -1787,6 +1873,8 @@ function WorkspaceTabContent({
   selectedCollectionId,
   fileDataById,
   pdfViewStates,
+  pdfSearchQuery,
+  onPdfSearchUpdate,
   onSelectPaper,
   onOpenPaper,
   onUpdatePaper,
@@ -1811,6 +1899,8 @@ function WorkspaceTabContent({
   selectedCollectionId: string;
   fileDataById: Record<string, Uint8Array>;
   pdfViewStates: Record<string, PdfReaderViewState>;
+  pdfSearchQuery?: string;
+  onPdfSearchUpdate?: (state: { totalMatches: number; activeMatchIndex: number }) => void;
   onSelectPaper: (paperId: string) => void;
   onOpenPaper: (paperId: string) => void;
   onUpdatePaper: (paper: Paper) => void;
@@ -1879,6 +1969,8 @@ function WorkspaceTabContent({
       onViewStateChange={(viewState) => onUpdatePdfViewState(tab.paperId, viewState)}
       onCreateAnnotation={onCreateAnnotation}
       onDeleteAnnotation={onDeleteAnnotation}
+      pdfSearchQuery={pdfSearchQuery}
+      onPdfSearchUpdate={onPdfSearchUpdate}
     />
   );
 }

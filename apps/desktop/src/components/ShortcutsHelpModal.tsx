@@ -31,6 +31,7 @@ const sections: ShortcutSection[] = [
   {
     title: "PDF Reading",
     entries: [
+      { keys: [`${mod} F`], description: "Find in document" },
       { keys: ["Pinch", isApplePlatform ? "⌃ Scroll" : "Ctrl Scroll"], description: "Zoom in / out" },
       { keys: [`${mod} ;`], description: "Fit page to width" },
       { keys: [`${mod} G`], description: "Go to page..." }
