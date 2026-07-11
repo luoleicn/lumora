@@ -107,6 +107,26 @@ describe("Mendeley annotations", () => {
     expect(remote.positions?.[0].top_left).toEqual({ x: 61.2, y: 712.8 });
     expect(remote.filehash).toBe("sha1");
   });
+
+  it("maps native Mendeley corners, which store the smaller y in top_left, to a full-height block", () => {
+    const annotation = mendeleyAnnotationToLocal({
+      id: "ma-2",
+      type: "highlight",
+      document_id: "md-1",
+      color: { r: 255, g: 245, b: 173 },
+      positions: [{
+        page: 1,
+        top_left: { x: 180.2, y: 359.7 },
+        bottom_right: { x: 280.1, y: 371.1 }
+      }]
+    }, "paper-1", "file-1");
+
+    const rect = annotation.rects[0];
+    expect(rect.x).toBeCloseTo(180.2 / 612);
+    expect(rect.y).toBeCloseTo(1 - 371.1 / 792);
+    expect(rect.width).toBeCloseTo((280.1 - 180.2) / 612);
+    expect(rect.height).toBeCloseTo((371.1 - 359.7) / 792);
+  });
 });
 
 describe("syncWithMendeley", () => {
@@ -125,7 +145,7 @@ describe("syncWithMendeley", () => {
 
     await syncWithMendeley({
       papers: [], fileAssets: [], collections: [], paperCollections: [], annotations: []
-    }, { clientId: "id", clientSecret: "secret" });
+    }, { clientId: "id", clientSecret: "secret" }, { nameTemplate: "{title}-{year}-{author}" });
 
     expect(invokeMock.mock.calls.some(([, args]) => String(args?.path).startsWith("/annotations?limit=100"))).toBe(true);
   });
@@ -146,7 +166,7 @@ describe("syncWithMendeley", () => {
 
     const result = await syncWithMendeley({
       papers: [], fileAssets: [], collections: [], paperCollections: [], annotations: []
-    }, { clientId: "id", clientSecret: "secret" });
+    }, { clientId: "id", clientSecret: "secret" }, { nameTemplate: "{title}-{year}-{author}" });
 
     expect(result.summary.unavailableResources).toEqual(["trash"]);
     expect(result.state.papers).toEqual([]);
@@ -190,6 +210,7 @@ describe("syncWithMendeley", () => {
     const task = syncWithMendeley(
       { papers: [], fileAssets: [], collections: [], paperCollections: [], annotations: [] },
       { clientId: "id", clientSecret: "secret" },
+      { nameTemplate: "{title}-{year}-{author}" },
       undefined,
       {
         isCancelled: () => cancelled,
@@ -204,6 +225,77 @@ describe("syncWithMendeley", () => {
     expect(partialState?.collections.map((folder) => folder.name)).toContain("Research");
     expect(partialState?.paperCollections).toHaveLength(1);
     expect(invokeMock.mock.calls.some(([command]) => command === "mendeley_download_file")).toBe(false);
+  });
+
+  it("only pulls changes since the stored cursor on subsequent syncs", async () => {
+    const cursor = "2026-07-01T00:00:00.000Z";
+    invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "db_get_meta") return cursor;
+      if (command === "db_set_meta") return undefined;
+      if (command !== "mendeley_request") throw new Error(`Unexpected command: ${command}`);
+      const path = String(args?.path);
+      if (path === "/folders?limit=500") {
+        return { status: 200, body: JSON.stringify([{ id: "mf-1", name: "Research", modified: "2026-06-01T00:00:00.000Z" }]) };
+      }
+      return { status: 200, body: "[]" };
+    });
+
+    const result = await syncWithMendeley({
+      papers: [{ id: "p1", title: "T", authors: [], mendeleyId: "md-1", createdAt: now, updatedAt: "2026-06-01T00:00:00.000Z" }],
+      fileAssets: [{
+        id: "f1", paperId: "p1", sha256: "abc", size: 1, mime: "application/pdf", fileName: "a.pdf",
+        mendeleyId: "file-1", downloadState: "local", createdAt: now, updatedAt: "2026-06-01T00:00:00.000Z"
+      }],
+      collections: [{ id: "col-1", name: "Research", mendeleyId: "mf-1", sortOrder: 0, createdAt: now, updatedAt: "2026-06-01T00:00:00.000Z" }],
+      paperCollections: [{
+        id: "rel-1", paperId: "p1", collectionId: "col-1", mendeleyId: "mendeley_relation_mf-1_md-1",
+        createdAt: now, updatedAt: "2026-06-01T00:00:00.000Z"
+      }],
+      annotations: []
+    }, { clientId: "id", clientSecret: "secret" }, { nameTemplate: "{title}-{year}-{author}" });
+
+    const since = encodeURIComponent(cursor);
+    const paths = invokeMock.mock.calls
+      .filter(([command]) => command === "mendeley_request")
+      .map(([, args]) => String((args as Record<string, unknown>)?.path));
+    expect(paths).toContain(`/documents?limit=500&view=all&modified_since=${since}`);
+    expect(paths).toContain(`/trash?limit=500&view=all&modified_since=${since}`);
+    expect(paths).toContain(`/files?limit=500&added_since=${since}`);
+    expect(paths).toContain(`/files?limit=500&deleted_since=${since}`);
+    expect(paths.some((path) => path.startsWith("/folders/mf-1/documents"))).toBe(false);
+    expect(result.state.fileAssets[0].deletedAt).toBeUndefined();
+    expect(result.state.paperCollections[0].deletedAt).toBeUndefined();
+    expect(result.summary.pushed).toBe(0);
+  });
+
+  it("applies membership removals for folders modified since the cursor", async () => {
+    const cursor = "2026-07-01T00:00:00.000Z";
+    invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "db_get_meta") return cursor;
+      if (command === "db_set_meta") return undefined;
+      if (command !== "mendeley_request") throw new Error(`Unexpected command: ${command}`);
+      const path = String(args?.path);
+      if (path === "/folders?limit=500") {
+        return { status: 200, body: JSON.stringify([{ id: "mf-1", name: "Research", modified: "2026-07-05T00:00:00.000Z" }]) };
+      }
+      return { status: 200, body: "[]" };
+    });
+
+    const result = await syncWithMendeley({
+      papers: [{ id: "p1", title: "T", authors: [], mendeleyId: "md-1", createdAt: now, updatedAt: "2026-06-01T00:00:00.000Z" }],
+      fileAssets: [],
+      collections: [{ id: "col-1", name: "Research", mendeleyId: "mf-1", sortOrder: 0, createdAt: now, updatedAt: "2026-06-01T00:00:00.000Z" }],
+      paperCollections: [{
+        id: "rel-1", paperId: "p1", collectionId: "col-1", mendeleyId: "mendeley_relation_mf-1_md-1",
+        createdAt: now, updatedAt: "2026-06-01T00:00:00.000Z"
+      }],
+      annotations: []
+    }, { clientId: "id", clientSecret: "secret" }, { nameTemplate: "{title}-{year}-{author}" });
+
+    expect(invokeMock.mock.calls.some(([, args]) =>
+      String((args as Record<string, unknown>)?.path).startsWith("/folders/mf-1/documents")
+    )).toBe(true);
+    expect(result.state.paperCollections[0].deletedAt).toBeDefined();
   });
 
   it("does not POST folder membership that was just pulled from Mendeley", async () => {
@@ -222,7 +314,7 @@ describe("syncWithMendeley", () => {
 
     const result = await syncWithMendeley({
       papers: [], fileAssets: [], collections: [], paperCollections: [], annotations: []
-    }, { clientId: "id", clientSecret: "secret" });
+    }, { clientId: "id", clientSecret: "secret" }, { nameTemplate: "{title}-{year}-{author}" });
 
     expect(result.state.paperCollections).toHaveLength(1);
     expect(invokeMock.mock.calls.some(([command, args]) =>

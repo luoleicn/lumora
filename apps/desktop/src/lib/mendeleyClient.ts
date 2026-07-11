@@ -1,7 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Annotation, Author, Collection, FileAsset, LibraryState, Paper, PaperCollection } from "@lumora/shared";
 import { createId } from "./id";
-import { putFileBlob } from "./localStore";
+import { deleteFileBlob, getFileBytes, putFileBlob } from "./localStore";
+import { buildPdfFileName, storePdfToDisk, type FileStorageSettings } from "./fileStorage";
 
 export type MendeleySettings = {
   clientId: string;
@@ -122,6 +123,7 @@ const mendeleySyncedAtMetaKey = "mendeleySyncedAt";
 const documentContentType = "application/vnd.mendeley-document.1+json";
 const folderContentType = "application/vnd.mendeley-folder.1+json";
 const annotationContentType = "application/vnd.mendeley-annotation.1+json";
+const fileContentType = "application/vnd.mendeley-file.1+json";
 
 export const mendeleyRedirectUri = "http://localhost:53682/mendeley/callback";
 
@@ -337,12 +339,19 @@ export function mendeleyAnnotationToLocal(
   const now = new Date().toISOString();
   const positions = annotation.positions ?? [];
   const page = positions[0]?.page ?? 1;
-  const rects = positions.filter((position) => position.page === page).map((position) => ({
-    x: position.top_left.x / fallbackPdfWidth,
-    y: 1 - position.top_left.y / fallbackPdfHeight,
-    width: Math.max(0.002, (position.bottom_right.x - position.top_left.x) / fallbackPdfWidth),
-    height: Math.max(0.002, (position.top_left.y - position.bottom_right.y) / fallbackPdfHeight)
-  }));
+  // Positions are PDF points with a bottom-left origin, but Mendeley's own
+  // clients store the smaller y in top_left while older Lumora pushes stored
+  // the larger one, so take min/max instead of trusting the corner names.
+  const rects = positions.filter((position) => position.page === page).map((position) => {
+    const left = Math.min(position.top_left.x, position.bottom_right.x);
+    const top = Math.max(position.top_left.y, position.bottom_right.y);
+    return {
+      x: left / fallbackPdfWidth,
+      y: 1 - top / fallbackPdfHeight,
+      width: Math.max(0.002, Math.abs(position.bottom_right.x - position.top_left.x) / fallbackPdfWidth),
+      height: Math.max(0.002, Math.abs(position.top_left.y - position.bottom_right.y) / fallbackPdfHeight)
+    };
+  });
   const rgb = annotation.color ?? { r: 255, g: 235, b: 59 };
   const color = `#${[rgb.r, rgb.g, rgb.b].map((value) => Math.max(0, Math.min(255, value)).toString(16).padStart(2, "0")).join("")}`;
   const sticky = annotation.type === "sticky_note" || (positions.length > 0 && positions.every((position) =>
@@ -380,11 +389,13 @@ export function localAnnotationToMendeley(annotation: Annotation, paper: Paper, 
       bottom_right: position.bottomRight
     }))
     : annotation.rects.map((rect) => ({
+      // Mendeley's own clients put the smaller y in top_left (PDF y grows
+      // upward), so mirror that ordering for annotations created here.
       page: annotation.pageIndex + 1,
-      top_left: { x: rect.x * fallbackPdfWidth, y: (1 - rect.y) * fallbackPdfHeight },
+      top_left: { x: rect.x * fallbackPdfWidth, y: (1 - rect.y - rect.height) * fallbackPdfHeight },
       bottom_right: {
         x: (rect.x + rect.width) * fallbackPdfWidth,
-        y: (1 - rect.y - rect.height) * fallbackPdfHeight
+        y: (1 - rect.y) * fallbackPdfHeight
       }
     }));
   return {
@@ -502,9 +513,16 @@ export function mergeBackgroundSyncState(
 // documents and full metadata, folders and membership, file attachment
 // metadata, and annotations. Pulling precedes pushing so server changes win
 // when both sides changed since the previous cursor.
+//
+// After the first full sync, every pull is incremental against the stored
+// cursor: documents, trash, and annotations via modified_since, files via
+// added_since/deleted_since, and folder membership only for folders that
+// changed. Folders themselves are always listed in full because the API has
+// no deleted-folder feed, but that is a single request.
 export async function syncWithMendeley(
   state: LibraryState,
   settings: MendeleySettings,
+  storageSettings: FileStorageSettings,
   onProgress?: (progress: MendeleySyncProgress) => void,
   syncOptions?: MendeleySyncOptions
 ): Promise<{ state: LibraryState; summary: MendeleySyncSummary }> {
@@ -581,12 +599,22 @@ export async function syncWithMendeley(
 
   report("trash", "Checking Mendeley trash…", 1);
   // Trash is a separate Mendeley collection and is not returned by /documents.
-  const trashedDocuments = await fetchResource<MendeleyDocument>(
-    "/trash?limit=500&view=all", documentContentType, {
+  const fetchTrash = (since?: string | null) => fetchResource<MendeleyDocument>(
+    `/trash?limit=500&view=all${since ? `&modified_since=${encodeURIComponent(since)}` : ""}`,
+    documentContentType,
+    {
       allowNotFound: true,
       onNotFound: () => summary.unavailableResources.push("trash")
     }
   );
+  let trashedDocuments: MendeleyDocument[];
+  try {
+    trashedDocuments = await fetchTrash(cursor);
+  } catch (error) {
+    // Older deployments reject modified_since on /trash; refetch in full.
+    if (!cursor || error instanceof MendeleySyncCancelledError) throw error;
+    trashedDocuments = await fetchTrash();
+  }
   for (const document of trashedDocuments) {
     const existing = findLocal(document);
     if (existing) {
@@ -706,8 +734,11 @@ export async function syncWithMendeley(
 
   report("files", "Reading attachment list…", 3);
   ensureActive();
-  const remoteFiles = await fetchResource<MendeleyFile>("/files?limit=500", "application/vnd.mendeley-file.1+json");
-  const remoteFileIds = new Set(remoteFiles.map((file) => file.id));
+  // Files are immutable in Mendeley, so added_since covers every change.
+  const remoteFiles = await fetchResource<MendeleyFile>(
+    `/files?limit=500${cursor ? `&added_since=${encodeURIComponent(cursor)}` : ""}`,
+    fileContentType
+  );
   for (const file of remoteFiles) {
     ensureActive();
     const paper = papers.find((item) => item.mendeleyId === file.document_id);
@@ -730,9 +761,24 @@ export async function syncWithMendeley(
     fileAssets = existing ? fileAssets.map((item) => item.id === existing.id ? mapped : item) : [mapped, ...fileAssets];
     summary.files += 1;
   }
-  fileAssets = fileAssets.map((item) => item.mendeleyId && !remoteFileIds.has(item.mendeleyId)
-    ? { ...item, deletedAt: item.deletedAt ?? startedAt, updatedAt: startedAt }
-    : item);
+  if (cursor) {
+    const deletedFiles = await fetchResource<{ id: string }>(
+      `/files?limit=500&deleted_since=${encodeURIComponent(cursor)}`, fileContentType,
+      {
+        allowNotFound: true,
+        onNotFound: () => summary.unavailableResources.push("deleted files")
+      }
+    );
+    const deletedFileIds = new Set(deletedFiles.map((file) => file.id));
+    fileAssets = fileAssets.map((item) => item.mendeleyId && deletedFileIds.has(item.mendeleyId)
+      ? { ...item, deletedAt: item.deletedAt ?? startedAt, updatedAt: startedAt }
+      : item);
+  } else {
+    const remoteFileIds = new Set(remoteFiles.map((file) => file.id));
+    fileAssets = fileAssets.map((item) => item.mendeleyId && !remoteFileIds.has(item.mendeleyId)
+      ? { ...item, deletedAt: item.deletedAt ?? startedAt, updatedAt: startedAt }
+      : item);
+  }
 
   report("annotations", "Syncing highlights and notes…", 4);
   const remoteAnnotations = await fetchResource<MendeleyAnnotation>(
@@ -776,13 +822,23 @@ export async function syncWithMendeley(
   }
 
   report("memberships", "Syncing folder membership…", 5);
-  // Folder membership is also fetched in full, allowing removals to propagate.
+  // The API exposes no membership change feed, so membership is re-pulled
+  // per folder — but only for folders whose timestamp passed the cursor, or
+  // for every folder when documents changed (moving a document between
+  // folders does not touch the folder's modified timestamp).
+  const remoteDocumentsChanged = documents.length > 0 || trashedDocuments.length > 0 || summary.deletedLocally > 0;
   const remoteRelationIds = new Set<string>();
+  // Relations of remotely deleted folders still need their removals applied.
+  const refreshedCollectionIds = new Set(
+    collections.flatMap((item) => item.mendeleyId && !remoteFolderIds.has(item.mendeleyId) ? [item.id] : [])
+  );
   for (const folder of remoteFolders) {
     ensureActive();
     if (!folder.id) continue;
+    if (cursor && !remoteDocumentsChanged && (folder.modified ?? folder.created ?? startedAt) <= cursor) continue;
     const collection = collections.find((item) => item.mendeleyId === folder.id);
     if (!collection) continue;
+    refreshedCollectionIds.add(collection.id);
     const entries = await fetchResource<{ id: string }>(
       `/folders/${folder.id}/documents?limit=500`, documentContentType
     );
@@ -806,7 +862,7 @@ export async function syncWithMendeley(
     }
   }
   paperCollections = paperCollections.map((item) => {
-    if (item.mendeleyId && !remoteRelationIds.has(item.mendeleyId)) {
+    if (item.mendeleyId && refreshedCollectionIds.has(item.collectionId) && !remoteRelationIds.has(item.mendeleyId)) {
       pulledRelationIds.add(item.id);
       return { ...item, deletedAt: item.deletedAt ?? startedAt, updatedAt: startedAt };
     }
@@ -887,8 +943,37 @@ export async function syncWithMendeley(
     const bytes = new Uint8Array(buffer);
     const digest = await crypto.subtle.digest("SHA-256", bytes);
     const sha256 = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, "0")).join("");
-    await putFileBlob(file.id, new Blob([bytes], { type: file.mime }));
-    fileAssets = fileAssets.map((item) => item.id === file.id ? { ...item, sha256, downloadState: "local" } : item);
+    let localPath: string | undefined;
+    if (storageSettings.directory) {
+      const paper = papers.find((item) => item.id === file.paperId && !item.deletedAt);
+      const targetName = paper ? buildPdfFileName(paper, storageSettings.nameTemplate) : file.fileName;
+      const storedName = await storePdfToDisk(storageSettings.directory, targetName, bytes);
+      localPath = storedName;
+    } else {
+      await putFileBlob(file.id, new Blob([bytes], { type: file.mime }));
+    }
+    fileAssets = fileAssets.map((item) => item.id === file.id
+      ? { ...item, sha256, downloadState: "local", localPath, fileName: localPath || item.fileName }
+      : item);
+  }
+
+  // Migrate existing IndexedDB-only files to disk when a storage directory is configured.
+  if (storageSettings.directory) {
+    const paperById = new Map(papers.filter((item) => !item.deletedAt).map((item) => [item.id, item]));
+    for (const fileAsset of fileAssets) {
+      ensureActive();
+      if (fileAsset.deletedAt || fileAsset.localPath || fileAsset.downloadState !== "local") continue;
+      const paper = paperById.get(fileAsset.paperId);
+      if (!paper) continue;
+      const blobBytes = await getFileBytes(fileAsset.id);
+      if (!blobBytes) continue;
+      const targetName = buildPdfFileName(paper, storageSettings.nameTemplate);
+      const storedName = await storePdfToDisk(storageSettings.directory, targetName, blobBytes);
+      await deleteFileBlob(fileAsset.id);
+      fileAssets = fileAssets.map((item) => item.id === fileAsset.id
+        ? { ...item, fileName: storedName, localPath: storedName, updatedAt: startedAt }
+        : item);
+    }
   }
 
   ensureActive();

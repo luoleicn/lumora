@@ -1365,6 +1365,7 @@ export default function App() {
       const { state: nextState, summary } = await syncWithMendeley(
         baseState,
         mendeleySettings,
+        fileStorageSettings,
         (progress: MendeleySyncProgress) => {
           setMendeleySyncActivity({
             state: "running",
