@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { FileAsset, LibraryState, Paper } from "@lumora/shared";
-import { deleteFileBlob, getFileBytes, importPdfFile, type ImportedPdf } from "./localStore";
+import { deleteFileBlob, getFileBytes, importPdfFile, putFileBlob, type ImportedPdf } from "./localStore";
+import { createId } from "./id";
 import { persistEntities } from "./libraryDb";
 
 export type FileStorageSettings = {
@@ -103,6 +104,10 @@ export async function readPdfFromDisk(directory: string, fileName: string): Prom
   return new Uint8Array(buffer);
 }
 
+export async function deleteStoredPdf(directory: string, fileName: string): Promise<void> {
+  await invoke("delete_stored_pdf", { dir: directory, fileName });
+}
+
 export async function movePdfOnDisk(directory: string, fileName: string, newDirectory: string, newFileName: string): Promise<string> {
   return invoke<string>("move_stored_pdf", {
     dir: directory,
@@ -145,6 +150,61 @@ export async function importPdf(current: LibraryState, file: File, settings: Fil
     state: {
       ...imported.state,
       fileAssets: imported.state.fileAssets.map((item) => (item.id === fileAsset.id ? fileAsset : item))
+    }
+  };
+}
+
+export async function bindPdfToPaper(
+  current: LibraryState,
+  paperId: string,
+  file: File,
+  settings: FileStorageSettings
+): Promise<{ state: LibraryState; fileAsset: FileAsset }> {
+  const paper = current.papers.find((item) => item.id === paperId && !item.deletedAt);
+  if (!paper) throw new Error("The selected document no longer exists.");
+  if (!/\.pdf$/i.test(file.name) && file.type !== "application/pdf") throw new Error("Select a PDF file.");
+
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const sha256 = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  const existing = current.fileAssets.find((item) =>
+    item.paperId === paperId && !item.deletedAt && (item.mime === "application/pdf" || /\.pdf$/i.test(item.fileName))
+  );
+  const id = existing?.id ?? createId("file");
+  const targetName = buildPdfFileName(paper, settings.nameTemplate);
+  let fileName = targetName;
+  let localPath: string | undefined;
+
+  if (settings.directory) {
+    fileName = await storePdfToDisk(settings.directory, targetName, bytes);
+    localPath = fileName;
+    await deleteFileBlob(id);
+  } else {
+    await putFileBlob(id, file);
+  }
+
+  const now = new Date().toISOString();
+  const fileAsset: FileAsset = {
+    ...existing,
+    id,
+    paperId,
+    sha256,
+    size: bytes.length,
+    mime: "application/pdf",
+    fileName,
+    localPath,
+    downloadState: "local",
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
+    deletedAt: undefined
+  };
+  return {
+    fileAsset,
+    state: {
+      ...current,
+      fileAssets: existing
+        ? current.fileAssets.map((item) => item.id === existing.id ? fileAsset : item)
+        : [fileAsset, ...current.fileAssets]
     }
   };
 }

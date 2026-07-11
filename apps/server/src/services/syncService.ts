@@ -14,6 +14,18 @@ type Transaction = Prisma.TransactionClient;
 
 const toDate = (value?: string) => (value ? new Date(value) : undefined);
 const toIso = (value?: Date | null) => (value ? value.toISOString() : undefined);
+const asJson = (value: object) => JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+
+function paperMendeleyData(data: Paper) {
+  const { mendeleyId, isbn, issn, scopus, ssrn, month, day, revision, websites, city, edition,
+    institution, series, chapter, editors, accessedAt, authored, hidden, fileAttached, citationKey,
+    sourceType, language, shortTitle, reprintEdition, genre, country, translators, seriesEditor, code,
+    medium, userContext, department, patentOwner, patentApplicationNumber, patentLegalStatus } = data;
+  return asJson({ mendeleyId, isbn, issn, scopus, ssrn, month, day, revision, websites, city, edition,
+    institution, series, chapter, editors, accessedAt, authored, hidden, fileAttached, citationKey,
+    sourceType, language, shortTitle, reprintEdition, genre, country, translators, seriesEditor, code,
+    medium, userContext, department, patentOwner, patentApplicationNumber, patentLegalStatus });
+}
 
 export async function applySyncChange(db: PrismaClient, userId: string, clientId: string, change: SyncChange) {
   await db.$transaction(async (tx) => {
@@ -123,6 +135,7 @@ async function upsertPaper(tx: Transaction, userId: string, data: Paper) {
       favorite: data.favorite ?? false,
       needsReview: data.needsReview ?? false,
       unread: data.unread ?? true,
+      mendeleyData: paperMendeleyData(data),
       updatedAt: toDate(data.updatedAt) ?? new Date(),
       deletedAt: toDate(data.deletedAt)
     },
@@ -149,6 +162,7 @@ async function upsertPaper(tx: Transaction, userId: string, data: Paper) {
       favorite: data.favorite ?? false,
       needsReview: data.needsReview ?? false,
       unread: data.unread ?? true,
+      mendeleyData: paperMendeleyData(data),
       createdAt: toDate(data.createdAt) ?? new Date(),
       updatedAt: toDate(data.updatedAt) ?? new Date(),
       deletedAt: toDate(data.deletedAt)
@@ -170,6 +184,7 @@ async function upsertFileAsset(tx: Transaction, userId: string, data: FileAsset)
       localPath: data.localPath,
       objectKey: data.objectKey,
       downloadState: data.downloadState,
+      mendeleyData: asJson({ mendeleyId: data.mendeleyId, mendeleyFileHash: data.mendeleyFileHash }),
       updatedAt: toDate(data.updatedAt) ?? new Date(),
       deletedAt: toDate(data.deletedAt)
     },
@@ -184,6 +199,7 @@ async function upsertFileAsset(tx: Transaction, userId: string, data: FileAsset)
       localPath: data.localPath,
       objectKey: data.objectKey,
       downloadState: data.downloadState,
+      mendeleyData: asJson({ mendeleyId: data.mendeleyId, mendeleyFileHash: data.mendeleyFileHash }),
       createdAt: toDate(data.createdAt) ?? new Date(),
       updatedAt: toDate(data.updatedAt) ?? new Date(),
       deletedAt: toDate(data.deletedAt)
@@ -202,6 +218,7 @@ async function upsertCollection(tx: Transaction, userId: string, data: Collectio
       name: data.name,
       parentId: data.parentId,
       sortOrder: data.sortOrder,
+      mendeleyData: asJson({ mendeleyId: data.mendeleyId }),
       updatedAt: toDate(data.updatedAt) ?? new Date(),
       deletedAt: toDate(data.deletedAt)
     },
@@ -211,6 +228,7 @@ async function upsertCollection(tx: Transaction, userId: string, data: Collectio
       name: data.name,
       parentId: data.parentId,
       sortOrder: data.sortOrder,
+      mendeleyData: asJson({ mendeleyId: data.mendeleyId }),
       createdAt: toDate(data.createdAt) ?? new Date(),
       updatedAt: toDate(data.updatedAt) ?? new Date(),
       deletedAt: toDate(data.deletedAt)
@@ -227,6 +245,7 @@ async function upsertPaperCollection(tx: Transaction, userId: string, data: Pape
     update: {
       paperId: data.paperId,
       collectionId: data.collectionId,
+      mendeleyData: asJson({ mendeleyId: data.mendeleyId }),
       updatedAt: toDate(data.updatedAt) ?? new Date(),
       deletedAt: toDate(data.deletedAt)
     },
@@ -235,6 +254,7 @@ async function upsertPaperCollection(tx: Transaction, userId: string, data: Pape
       userId,
       paperId: data.paperId,
       collectionId: data.collectionId,
+      mendeleyData: asJson({ mendeleyId: data.mendeleyId }),
       createdAt: toDate(data.createdAt) ?? new Date(),
       updatedAt: toDate(data.updatedAt) ?? new Date(),
       deletedAt: toDate(data.deletedAt)
@@ -258,6 +278,12 @@ async function upsertAnnotation(tx: Transaction, userId: string, data: Annotatio
       notePosition: data.notePosition as unknown as Prisma.InputJsonValue,
       quote: data.quote,
       comment: data.comment,
+      mendeleyData: asJson({
+        mendeleyId: data.mendeleyId,
+        mendeleyFileHash: data.mendeleyFileHash,
+        mendeleyPrivacyLevel: data.mendeleyPrivacyLevel,
+        mendeleyPositions: data.mendeleyPositions
+      }),
       updatedAt: toDate(data.updatedAt) ?? new Date(),
       deletedAt: toDate(data.deletedAt)
     },
@@ -273,6 +299,12 @@ async function upsertAnnotation(tx: Transaction, userId: string, data: Annotatio
       notePosition: data.notePosition as unknown as Prisma.InputJsonValue,
       quote: data.quote,
       comment: data.comment,
+      mendeleyData: asJson({
+        mendeleyId: data.mendeleyId,
+        mendeleyFileHash: data.mendeleyFileHash,
+        mendeleyPrivacyLevel: data.mendeleyPrivacyLevel,
+        mendeleyPositions: data.mendeleyPositions
+      }),
       createdAt: toDate(data.createdAt) ?? new Date(),
       updatedAt: toDate(data.updatedAt) ?? new Date(),
       deletedAt: toDate(data.deletedAt)
@@ -319,6 +351,7 @@ function serializePaper(data: Awaited<ReturnType<PrismaClient["paper"]["findFirs
   }
 
   return {
+    ...(data.mendeleyData as unknown as Partial<Paper> ?? {}),
     id: data.id,
     title: data.title,
     authors: data.authors as Paper["authors"],
@@ -352,6 +385,7 @@ function serializeFileAsset(data: Awaited<ReturnType<PrismaClient["fileAsset"]["
   }
 
   return {
+    ...(data.mendeleyData as unknown as Partial<FileAsset> ?? {}),
     id: data.id,
     paperId: data.paperId,
     sha256: data.sha256,
@@ -373,6 +407,7 @@ function serializeCollection(data: Awaited<ReturnType<PrismaClient["collection"]
   }
 
   return {
+    ...(data.mendeleyData as unknown as Partial<Collection> ?? {}),
     id: data.id,
     name: data.name,
     parentId: data.parentId ?? undefined,
@@ -389,6 +424,7 @@ function serializePaperCollection(data: Awaited<ReturnType<PrismaClient["paperCo
   }
 
   return {
+    ...(data.mendeleyData as unknown as Partial<PaperCollection> ?? {}),
     id: data.id,
     paperId: data.paperId,
     collectionId: data.collectionId,
@@ -404,6 +440,7 @@ function serializeAnnotation(data: Awaited<ReturnType<PrismaClient["annotation"]
   }
 
   return {
+    ...(data.mendeleyData as unknown as Partial<Annotation> ?? {}),
     id: data.id,
     paperId: data.paperId,
     fileId: data.fileId,

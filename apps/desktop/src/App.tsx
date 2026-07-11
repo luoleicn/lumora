@@ -5,7 +5,7 @@ import type { Annotation, Collection, FileAsset, LibraryState, Paper } from "@lu
 import { FileText, X } from "lucide-react";
 import { AppToolbar } from "./components/AppToolbar";
 import { CollectionModal, DeleteCollectionModal, RenameCollectionModal } from "./components/CollectionModal";
-import { LibrarySidebar } from "./components/LibrarySidebar";
+import { LibrarySidebar, type LibrarySyncActivity } from "./components/LibrarySidebar";
 import { ManualReferenceModal, type ManualReferenceDraft } from "./components/ManualReferenceModal";
 import { ShortcutsHelpModal } from "./components/ShortcutsHelpModal";
 import { AboutModal } from "./components/AboutModal";
@@ -22,17 +22,21 @@ import {
   getCollectionPaperCount,
   removePaperFromCollectionTree,
   renameCollection,
-  restorePaperFromTrash
+  restorePaperFromTrash,
+  permanentlyDeletePaperFromTrash
 } from "./lib/libraryActions";
 import {
   loadLibraryState,
+  deleteFileBlob,
   markAnnotationDeleted,
   saveLibraryState,
   upsertById
 } from "./lib/localStore";
-import { enqueueLibraryPersist, importStateToDb, loadLibraryFromDb } from "./lib/libraryDb";
+import { deletePersistedEntities, enqueueLibraryPersist, importStateToDb, loadLibraryFromDb } from "./lib/libraryDb";
 import {
   buildPdfFileName,
+  bindPdfToPaper,
+  deleteStoredPdf,
   fileNameMatchesTarget,
   importPdf,
   loadFileStorageSettings,
@@ -43,14 +47,40 @@ import {
   type FileStorageSettings
 } from "./lib/fileStorage";
 import { FileStorageSettingsModal } from "./components/FileStorageSettingsModal";
+import { MendeleySyncModal } from "./components/MendeleySyncModal";
+import { ProxySettingsModal } from "./components/ProxySettingsModal";
+import { DuplicateDocumentsModal } from "./components/DuplicateDocumentsModal";
 import { parseReferenceFile } from "./lib/referenceImport";
 import {
+  extractPdfBodyText,
+  getSearchIndexStatus,
+  indexPaperBody,
+  mapHitsToPapers,
+  planBodyBackfill,
+  searchLibrary,
+  type PaperSearchMeta,
+  type SearchHit
+} from "./lib/searchIndex";
+import { downloadMissingArxivFiles, formatFileSize, type ArxivDownloadProgress } from "./lib/arxivFiles";
+import { defaultProxySettings, loadProxySettings, saveProxySettings, type ProxySettings } from "./lib/proxySettings";
+import {
   login,
-  mendeleyOAuthUrl,
-  startMendeleyImport,
   syncLibrary,
   type SyncSettings
 } from "./lib/syncClient";
+import {
+  connectMendeley,
+  disconnectMendeley,
+  getMendeleyConnection,
+  loadMendeleySettings,
+  mergeBackgroundSyncState,
+  saveMendeleySettings,
+  syncWithMendeley,
+  MendeleySyncCancelledError,
+  type MendeleyConnection,
+  type MendeleySyncProgress,
+  type MendeleySettings
+} from "./lib/mendeleyClient";
 
 const settingsKey = "lumora:sync-settings";
 const workspaceLayoutKey = "lumora:workspace-layout";
@@ -100,11 +130,19 @@ type WorkspaceTab =
 
 const documentsTab: WorkspaceTab = { id: "documents", kind: "documents", title: "Documents" };
 
+function isPdfFile(fileAsset: FileAsset) {
+  return fileAsset.mime === "application/pdf" || /\.pdf$/i.test(fileAsset.fileName);
+}
+
 export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const referenceInputRef = useRef<HTMLInputElement>(null);
+  const bindPdfInputRef = useRef<HTMLInputElement>(null);
+  const bindPdfPaperIdRef = useRef<string | undefined>(undefined);
   const importTargetCollectionIdRef = useRef<string | undefined>(undefined);
   const pdfRenameInFlightRef = useRef(false);
+  const mendeleyCancelRequestedRef = useRef(false);
+  const arxivDownloadInFlightRef = useRef(false);
   const libraryRef = useRef<LibraryState | undefined>(undefined);
   const lastPersistedLibraryRef = useRef<LibraryState | undefined>(undefined);
   const libraryLoadedRef = useRef(false);
@@ -118,10 +156,23 @@ export default function App() {
   const [activeWorkspaceTabId, setActiveWorkspaceTabId] = useState(documentsTab.id);
   const [pdfViewStates, setPdfViewStates] = useState<Record<string, PdfReaderViewState>>({});
   const [search, setSearch] = useState("");
+  const [searchHits, setSearchHits] = useState<SearchHit[]>();
+  const backfillRunningRef = useRef(false);
   const [fileDataById, setFileDataById] = useState<Record<string, Uint8Array>>({});
   const [settings, setSettings] = useState<SyncSettings>(() => loadSyncSettings());
   const [fileStorageSettings, setFileStorageSettings] = useState<FileStorageSettings>(() => loadFileStorageSettings());
   const [fileStorageModalOpen, setFileStorageModalOpen] = useState(false);
+  const [mendeleySyncOpen, setMendeleySyncOpen] = useState(false);
+  const [proxySettingsOpen, setProxySettingsOpen] = useState(false);
+  const [duplicateDocumentsOpen, setDuplicateDocumentsOpen] = useState(false);
+  const [proxySettings, setProxySettings] = useState<ProxySettings>(defaultProxySettings);
+  const [proxySettingsBusy, setProxySettingsBusy] = useState(false);
+  const [proxySettingsError, setProxySettingsError] = useState<string>();
+  const [mendeleySettings, setMendeleySettings] = useState<MendeleySettings>(() => loadMendeleySettings());
+  const [mendeleyConnection, setMendeleyConnection] = useState<MendeleyConnection>();
+  const [mendeleySyncBusy, setMendeleySyncBusy] = useState(false);
+  const [arxivDownloadBusy, setArxivDownloadBusy] = useState(false);
+  const [mendeleySyncActivity, setMendeleySyncActivity] = useState<LibrarySyncActivity>();
   const [fileStorageBusy, setFileStorageBusy] = useState(false);
   const [workspaceLayout, setWorkspaceLayout] = useState<WorkspaceLayout>(() => loadWorkspaceLayout());
   const [resizeDrag, setResizeDrag] = useState<ResizeDrag>();
@@ -140,6 +191,12 @@ export default function App() {
   useEffect(() => {
     libraryRef.current = library;
   }, [library]);
+
+  useEffect(() => {
+    void loadProxySettings().then(setProxySettings).catch((error) => {
+      setStatus(error instanceof Error ? error.message : String(error));
+    });
+  }, []);
 
   // Startup: SQLite is the source of truth. When it is empty this is a first
   // run on the new storage layer, so the legacy localStorage state (already in
@@ -215,6 +272,18 @@ export default function App() {
   }, [fileStorageSettings]);
 
   useEffect(() => {
+    saveMendeleySettings(mendeleySettings);
+  }, [mendeleySettings]);
+
+  useEffect(() => {
+    if (!mendeleySyncOpen) {
+      return;
+    }
+
+    void getMendeleyConnection().then(setMendeleyConnection).catch(() => setMendeleyConnection(undefined));
+  }, [mendeleySyncOpen]);
+
+  useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       const isApplePlatform = /Mac|iPhone|iPad|iPod/i.test(navigator.platform);
       const usesPrimaryModifier = isApplePlatform ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
@@ -287,6 +356,15 @@ export default function App() {
         setAboutOpen(true);
       } else if (event.payload === "show-file-storage-settings") {
         setFileStorageModalOpen(true);
+      } else if (event.payload === "show-mendeley-sync") {
+        setMendeleySyncOpen(true);
+      } else if (event.payload === "show-proxy-settings") {
+        setProxySettingsError(undefined);
+        setProxySettingsOpen(true);
+      } else if (event.payload === "show-duplicate-documents") {
+        setDuplicateDocumentsOpen(true);
+      } else if (event.payload === "download-arxiv-files") {
+        void handleDownloadArxivFiles();
       }
     }).then((nextUnlisten) => {
       if (disposed) {
@@ -300,7 +378,7 @@ export default function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [activeWorkspaceTabId, workspaceTabs]);
+  }, [activeWorkspaceTabId, workspaceTabs, fileStorageSettings]);
 
   useEffect(() => {
     if (!resizeDrag) {
@@ -369,7 +447,6 @@ export default function App() {
   }, [resizeDrag]);
 
   const filteredPapers = useMemo(() => {
-    const query = search.trim().toLowerCase();
     const selectedCollectionIds = getCollectionAndDescendantIds(library.collections, selectedCollectionId);
     const collectionPaperIds = new Set(
       library.paperCollections
@@ -410,18 +487,6 @@ export default function App() {
 
         return paper.tags?.includes(selectedTag);
       })
-      .filter((paper) => {
-        if (!query) {
-          return true;
-        }
-
-        const authors = paper.authors.map((author) => author.fullName).join(" ");
-        const tags = paper.tags?.join(" ") ?? "";
-        const keywords = paper.keywords?.join(" ") ?? "";
-        return `${paper.title} ${authors} ${paper.venue ?? ""} ${paper.doi ?? ""} ${tags} ${keywords} ${paper.abstract ?? ""}`
-          .toLowerCase()
-          .includes(query);
-      })
       .sort((a, b) => {
         if (selectedCollectionId === "recently_added") {
           return b.createdAt.localeCompare(a.createdAt);
@@ -429,7 +494,107 @@ export default function App() {
 
         return b.updatedAt.localeCompare(a.updatedAt);
       });
-  }, [library, search, selectedAuthor, selectedCollectionId, selectedTag]);
+  }, [library, selectedAuthor, selectedCollectionId, selectedTag]);
+
+  // A non-empty query searches the whole library via the FTS index, bypassing
+  // the collection/author/tag filters; clearing it restores the filtered view.
+  useEffect(() => {
+    const query = search.trim();
+    if (!query) {
+      setSearchHits(undefined);
+      return undefined;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      searchLibrary(query)
+        .then((hits) => {
+          if (!cancelled) {
+            setSearchHits(hits);
+          }
+        })
+        .catch((error) => {
+          if (!cancelled) {
+            setSearchHits([]);
+            setStatus(`Search failed: ${error}`);
+          }
+        });
+    }, 200);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [search]);
+
+  const searchActive = search.trim().length > 0;
+  const displayedPapers = useMemo(
+    () => (searchActive && searchHits ? mapHitsToPapers(searchHits, library.papers) : filteredPapers),
+    [filteredPapers, library.papers, searchActive, searchHits]
+  );
+  const searchMetaByPaperId = useMemo(() => {
+    if (!searchActive || !searchHits) {
+      return undefined;
+    }
+    return new Map<string, PaperSearchMeta>(
+      searchHits.map((hit) => [hit.paperId, { matchedFields: hit.matchedFields, snippet: hit.snippet }])
+    );
+  }, [searchActive, searchHits]);
+
+  // Body-text backfill: extract and index the full text of any local PDF whose
+  // sha256 is not in the search index yet. Depending on `library.fileAssets`
+  // covers every ingest path (import, arXiv download, Mendeley sync, re-bind)
+  // without per-path hooks; the sha diff makes re-runs idempotent.
+  useEffect(() => {
+    let cancelled = false;
+
+    const timer = window.setTimeout(() => {
+      if (backfillRunningRef.current || !libraryLoadedRef.current) {
+        return;
+      }
+      backfillRunningRef.current = true;
+
+      void (async () => {
+        try {
+          const status = await getSearchIndexStatus();
+          const current = libraryRef.current;
+          if (!current || cancelled) {
+            return;
+          }
+
+          for (const item of planBodyBackfill(current, status)) {
+            if (cancelled) {
+              return;
+            }
+            try {
+              const bytes = await readFileBytes(item.fileAsset, fileStorageSettings);
+              if (bytes) {
+                // Extraction failures (encrypted or scanned PDFs) still record
+                // the sha so the file is not retried on every startup.
+                const text = await extractPdfBodyText(bytes).catch(() => "");
+                if (cancelled) {
+                  return;
+                }
+                await indexPaperBody(item.paperId, item.fileAsset.sha256, text);
+              }
+            } catch {
+              // Unreadable file: leave it unindexed and retry on the next run.
+            }
+            await new Promise((resolve) => setTimeout(resolve, 250));
+          }
+        } catch {
+          // Index status unavailable; retried on the next fileAssets change.
+        } finally {
+          backfillRunningRef.current = false;
+        }
+      })();
+    }, 3000);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [fileStorageSettings, library.fileAssets]);
 
   const selectedPaper = library.papers.find((paper) => paper.id === selectedPaperId && !paper.deletedAt);
   const selectedFile = selectedPaper
@@ -439,6 +604,14 @@ export default function App() {
     ? library.annotations.filter((annotation) => annotation.paperId === selectedPaper.id)
     : [];
   const selectedFileData = selectedFile ? fileDataById[selectedFile.id] : undefined;
+  const selectedHasLocalPdf = selectedPaper
+    ? library.fileAssets.some((fileAsset) =>
+      fileAsset.paperId === selectedPaper.id
+      && !fileAsset.deletedAt
+      && isPdfFile(fileAsset)
+      && Boolean(fileDataById[fileAsset.id]?.length)
+    )
+    : false;
   const activeWorkspaceTab = workspaceTabs.find((tab) => tab.id === activeWorkspaceTabId) ?? documentsTab;
   const openPaperFileIds = useMemo(() => {
     const fileIds = workspaceTabs.flatMap((tab) => {
@@ -455,11 +628,15 @@ export default function App() {
 
     // The Details panel (Extract PDF, metadata preview) needs bytes for the
     // selected paper even when its reader tab isn't open.
-    const selectedFileId = selectedPaperId
-      ? library.fileAssets.find((item) => item.paperId === selectedPaperId && !item.deletedAt)?.id
-      : undefined;
-    if (selectedFileId && !fileIds.includes(selectedFileId)) {
-      fileIds.push(selectedFileId);
+    const selectedFileIds = selectedPaperId
+      ? library.fileAssets
+        .filter((item) => item.paperId === selectedPaperId && !item.deletedAt && isPdfFile(item))
+        .map((item) => item.id)
+      : [];
+    for (const selectedFileId of selectedFileIds) {
+      if (!fileIds.includes(selectedFileId)) {
+        fileIds.push(selectedFileId);
+      }
     }
 
     return fileIds;
@@ -558,6 +735,28 @@ export default function App() {
     setSelectedAuthor(undefined);
     setSelectedTag(undefined);
     setStatus(targetCollection ? `Imported ${file.name} to ${targetCollection.name}.` : `Imported ${file.name}.`);
+  }
+
+  async function handleBindLocalPdf(file?: File) {
+    const paperId = bindPdfPaperIdRef.current;
+    bindPdfPaperIdRef.current = undefined;
+    if (!file || !paperId) return;
+    try {
+      const current = libraryRef.current ?? library;
+      const result = await bindPdfToPaper(current, paperId, file, fileStorageSettings);
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      setLibrary(result.state);
+      setFileDataById((items) => ({ ...items, [result.fileAsset.id]: bytes }));
+      const paper = result.state.papers.find((item) => item.id === paperId);
+      setStatus(`Bound ${result.fileAsset.fileName} to ${paper?.title ?? "document"}.`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function handleRequestBindLocalPdf(paperId: string) {
+    bindPdfPaperIdRef.current = paperId;
+    bindPdfInputRef.current?.click();
   }
 
   async function handleImportReferenceFile(file?: File) {
@@ -821,6 +1020,41 @@ export default function App() {
     setStatus(`Restored ${paper.title} to Unsorted.`);
   }
 
+  async function handlePermanentlyDeletePaper(paperId: string) {
+    const paper = library.papers.find((item) => item.id === paperId && item.deletedAt);
+    if (!paper) {
+      return;
+    }
+    if (!window.confirm(`Permanently delete “${paper.title}”? This cannot be undone.`)) {
+      return;
+    }
+
+    const files = library.fileAssets.filter((item) => item.paperId === paperId);
+    const annotations = library.annotations.filter((item) => item.paperId === paperId);
+    const memberships = library.paperCollections.filter((item) => item.paperId === paperId);
+    setLibrary((current) => permanentlyDeletePaperFromTrash(current, paperId));
+    if (selectedPaperId === paperId) setSelectedPaperId(undefined);
+    setFileDataById((current) => Object.fromEntries(
+      Object.entries(current).filter(([fileId]) => !files.some((file) => file.id === fileId))
+    ));
+    setWorkspaceTabs((current) => current.filter((tab) => !(tab.kind === "paper" && tab.paperId === paperId)));
+    if (activeWorkspaceTabId === `paper:${paperId}`) setActiveWorkspaceTabId(documentsTab.id);
+
+    const diskDeletes = files.flatMap((file) =>
+      file.localPath && fileStorageSettings.directory
+        ? [deleteStoredPdf(fileStorageSettings.directory, file.localPath)]
+        : []
+    );
+    await Promise.allSettled([...files.map((file) => deleteFileBlob(file.id)), ...diskDeletes]);
+    await deletePersistedEntities([
+      { entityType: "paper", id: paperId },
+      ...files.map((file) => ({ entityType: "fileAsset" as const, id: file.id })),
+      ...annotations.map((annotation) => ({ entityType: "annotation" as const, id: annotation.id })),
+      ...memberships.map((membership) => ({ entityType: "paperCollection" as const, id: membership.id }))
+    ]);
+    setStatus(`Permanently deleted ${paper.title}.`);
+  }
+
   function handleCreateAnnotation(annotation: Annotation) {
     setLibrary((current) => ({
       ...current,
@@ -987,6 +1221,74 @@ export default function App() {
     }
   }
 
+  async function handleDownloadArxivFiles(
+    paperId?: string,
+    detailProgress?: (progress: ArxivDownloadProgress) => void
+  ): Promise<string> {
+    if (arxivDownloadInFlightRef.current) {
+      const message = "arXiv file download is already running.";
+      setStatus(message);
+      return message;
+    }
+    arxivDownloadInFlightRef.current = true;
+    setArxivDownloadBusy(true);
+    const startingState = libraryRef.current ?? library;
+    const startingFiles = new Map(startingState.fileAssets.map((file) => [file.id, file]));
+    try {
+      const result = await downloadMissingArxivFiles(startingState, fileStorageSettings, {
+        paperIds: paperId ? [paperId] : undefined,
+        onProgress: (progress) => {
+          detailProgress?.(progress);
+          const position = Math.min(progress.total, progress.done + (progress.phase === "downloading" ? 1 : 0));
+          const byteProgress = progress.downloadedBytes !== undefined
+            ? ` — ${formatFileSize(progress.downloadedBytes)}${progress.totalBytes ? ` / ${formatFileSize(progress.totalBytes)}` : ""}`
+            : "";
+          setStatus(progress.total === 0
+            ? "No missing arXiv PDFs found."
+            : `${progress.phase === "checking" ? "Checking" : progress.phase === "waiting" ? "Waiting for arXiv" : "Downloading arXiv PDF"} `
+              + `(${position}/${progress.total})${progress.arxivId ? `: ${progress.arxivId}` : ""}${byteProgress}`);
+        },
+        onStateUpdate: (partialState) => {
+          const downloadedFiles = partialState.fileAssets.filter((file) => {
+            const before = startingFiles.get(file.id);
+            return !before || before.sha256 !== file.sha256 || before.downloadState !== file.downloadState || before.localPath !== file.localPath;
+          });
+          setLibrary((current) => ({
+            ...current,
+            fileAssets: downloadedFiles.reduce((items, file) => upsertById(items, file), current.fileAssets)
+          }));
+        }
+      });
+      const message =
+        `arXiv files: ${result.downloaded} downloaded, ${result.alreadyPresent} already present`
+        + (result.failed.length ? `, ${result.failed.length} failed (${result.failed.map((item) => item.arxivId).join(", ")}).` : ".");
+      setStatus(message);
+      return message;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(message);
+      return message;
+    } finally {
+      arxivDownloadInFlightRef.current = false;
+      setArxivDownloadBusy(false);
+    }
+  }
+
+  async function handleSaveProxySettings(settings: ProxySettings) {
+    setProxySettingsBusy(true);
+    setProxySettingsError(undefined);
+    try {
+      await saveProxySettings(settings);
+      setProxySettings(settings);
+      setProxySettingsOpen(false);
+      setStatus(settings.enabled ? `Proxy enabled: ${settings.url}` : "Proxy disabled.");
+    } catch (error) {
+      setProxySettingsError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setProxySettingsBusy(false);
+    }
+  }
+
   async function handleSaveFileStorageSettings(nextSettings: FileStorageSettings) {
     const directoryChanged = nextSettings.directory !== fileStorageSettings.directory;
     const templateChanged = nextSettings.nameTemplate !== fileStorageSettings.nameTemplate;
@@ -1027,19 +1329,101 @@ export default function App() {
     });
   }
 
-  function handleConnectMendeley() {
+  async function handleMendeleyConnect() {
+    setBusy(true);
+    setStatus("Waiting for Mendeley authorization in the browser...");
     try {
-      window.open(mendeleyOAuthUrl(settings), "_blank", "noopener,noreferrer");
-      setStatus("Opened Mendeley OAuth.");
+      const connection = await connectMendeley(mendeleySettings);
+      setMendeleyConnection(connection);
+      setStatus(connection.displayName ? `Connected to Mendeley as ${connection.displayName}.` : "Connected to Mendeley.");
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Failed to open Mendeley OAuth.");
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
     }
   }
 
-  async function handleImportMendeley() {
-    await runBusy("Mendeley import started.", async () => {
-      await startMendeleyImport(settings);
+  async function handleMendeleyDisconnect() {
+    await runBusy("Disconnected from Mendeley.", async () => {
+      await disconnectMendeley();
+      setMendeleyConnection({ connected: false });
     });
+  }
+
+  async function handleMendeleySync() {
+    if (mendeleySyncBusy) {
+      return;
+    }
+    const syncStartedAt = new Date().toISOString();
+    const baseState = libraryRef.current ?? library;
+    let mergeBaseState = baseState;
+    mendeleyCancelRequestedRef.current = false;
+    setMendeleySyncBusy(true);
+    setMendeleySyncActivity({ state: "running", message: "Starting Mendeley sync…", completed: 0, total: 8 });
+    setStatus("Syncing with Mendeley...");
+    try {
+      const { state: nextState, summary } = await syncWithMendeley(
+        baseState,
+        mendeleySettings,
+        (progress: MendeleySyncProgress) => {
+          setMendeleySyncActivity({
+            state: "running",
+            message: progress.message,
+            completed: progress.completed,
+            total: progress.total
+          });
+        },
+        {
+          isCancelled: () => mendeleyCancelRequestedRef.current,
+          onStateUpdate: (partialState) => {
+            const previousMergeBase = mergeBaseState;
+            mergeBaseState = partialState;
+            setLibrary((current) => mergeBackgroundSyncState(previousMergeBase, partialState, current, syncStartedAt));
+          }
+        }
+      );
+      setLibrary((current) => mergeBackgroundSyncState(mergeBaseState, nextState, current, syncStartedAt));
+      const completionMessage =
+        `Mendeley sync complete: ${summary.pulled} pulled, ${summary.pushed} pushed, `
+        + `${summary.folders} folders, ${summary.folderLinks} folder links, ${summary.files} files, `
+        + `${summary.annotations} annotations; ${summary.deletedLocally} deleted locally, `
+        + `${summary.deletedRemotely} deleted remotely.`
+        + (summary.unavailableResources.length
+          ? ` Mendeley did not expose: ${summary.unavailableResources.join(", ")}.`
+          : "");
+      setStatus(completionMessage);
+      setMendeleySyncActivity({
+        state: "success",
+        message: `${summary.pulled} papers, ${summary.folders} folders, ${summary.files} files, ${summary.annotations} annotations`,
+        completed: 8,
+        total: 8
+      });
+    } catch (error) {
+      if (error instanceof MendeleySyncCancelledError) {
+        setStatus("Mendeley sync cancelled.");
+        setMendeleySyncActivity((current) => ({
+          state: "cancelled",
+          message: "Sync cancelled",
+          completed: current?.completed ?? 0,
+          total: current?.total ?? 8
+        }));
+        return;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(message);
+      setMendeleySyncActivity({ state: "error", message, completed: 0, total: 8 });
+    } finally {
+      setMendeleySyncBusy(false);
+    }
+  }
+
+  function handleCancelMendeleySync() {
+    if (!mendeleySyncBusy) return;
+    mendeleyCancelRequestedRef.current = true;
+    setMendeleySyncActivity((current) => current ? {
+      ...current,
+      message: "Cancelling after the current request…"
+    } : current);
   }
 
   async function runBusy(successMessage: string, task: () => Promise<void>) {
@@ -1082,20 +1466,7 @@ export default function App() {
 
   return (
     <main className="app-frame">
-      <AppToolbar
-        search={search}
-        busy={busy}
-        status={status}
-        onSearchChange={setSearch}
-        onAddPdf={() => fileInputRef.current?.click()}
-        onAddManual={() => setManualModalOpen(true)}
-        onImportReferences={() => referenceInputRef.current?.click()}
-        onOpenNotebook={handleOpenNotebookTab}
-        onCreateCollection={handleCreateCollection}
-        onSync={handleSync}
-        onConnectMendeley={handleConnectMendeley}
-        onImportMendeley={handleImportMendeley}
-      />
+      <AppToolbar search={search} status={status} onSearchChange={setSearch} />
 
       <section className={resizeDrag ? "app-shell resizing" : "app-shell"}>
       {panelOrder.map((panel, index) => (
@@ -1115,6 +1486,7 @@ export default function App() {
               collectionPaperCounts={collectionPaperCounts}
               dragOverCollectionId={paperDrag?.overCollectionId}
               selectedCollectionId={selectedCollectionId}
+              selectedPaperId={selectedPaperId}
               selectedAuthor={selectedAuthor}
               selectedTag={selectedTag}
               onSelectCollection={setSelectedCollectionId}
@@ -1125,6 +1497,10 @@ export default function App() {
               onDeleteCollection={handleRequestDeleteCollection}
               onAddPaperToCollection={handleAddPaperToCollection}
               onAddPdfToCollection={handleAddPdfToCollection}
+              onSync={handleSync}
+              syncBusy={busy}
+              mendeleySyncActivity={mendeleySyncActivity}
+              onCancelMendeleySync={handleCancelMendeleySync}
             />
           )}
 
@@ -1146,7 +1522,8 @@ export default function App() {
                     active={tab.id === activeWorkspaceTabId}
                     tab={tab}
                     library={library}
-                    filteredPapers={filteredPapers}
+                    filteredPapers={displayedPapers}
+                    searchMeta={searchMetaByPaperId}
                     selectedPaperId={selectedPaperId}
                     selectedCollectionId={selectedCollectionId}
                     fileDataById={fileDataById}
@@ -1160,6 +1537,8 @@ export default function App() {
                     onRemovePaperFromCollection={handleRemovePaperFromSelectedCollection}
                     onDeletePaper={handleDeletePaper}
                     onRestorePaper={handleRestorePaper}
+                    onPermanentlyDeletePaper={(paperId) => void handlePermanentlyDeletePaper(paperId)}
+                    onBindLocalPdf={handleRequestBindLocalPdf}
                     onUpdatePdfViewState={handleUpdatePdfViewState}
                     onCreateAnnotation={handleCreateAnnotation}
                     onDeleteAnnotation={handleDeleteAnnotation}
@@ -1177,13 +1556,14 @@ export default function App() {
               paper={selectedPaper}
               fileAsset={selectedFile}
               fileData={selectedFileData}
+              hasLocalPdf={selectedHasLocalPdf}
               annotations={selectedAnnotations}
               onSettingsChange={setSettings}
               onLogin={handleLogin}
               onSync={handleSync}
-              onConnectMendeley={handleConnectMendeley}
-              onImportMendeley={handleImportMendeley}
               onUpdatePaper={handleUpdatePaper}
+              arxivDownloadBusy={arxivDownloadBusy}
+              onDownloadArxiv={(paperId, onProgress) => handleDownloadArxivFiles(paperId, onProgress)}
               onDeleteAnnotation={handleDeleteAnnotation}
             />
           )}
@@ -1212,6 +1592,16 @@ export default function App() {
           event.currentTarget.value = "";
         }}
       />
+      <input
+        ref={bindPdfInputRef}
+        className="hidden-input"
+        type="file"
+        accept="application/pdf,.pdf"
+        onChange={(event) => {
+          void handleBindLocalPdf(event.target.files?.[0]);
+          event.currentTarget.value = "";
+        }}
+      />
       </section>
 
       <ManualReferenceModal
@@ -1228,6 +1618,37 @@ export default function App() {
         busy={fileStorageBusy}
         onClose={() => setFileStorageModalOpen(false)}
         onSave={(nextSettings) => void handleSaveFileStorageSettings(nextSettings)}
+      />
+      <MendeleySyncModal
+        open={mendeleySyncOpen}
+        settings={mendeleySettings}
+        connection={mendeleyConnection}
+        busy={busy}
+        syncing={mendeleySyncBusy}
+        status={status}
+        onSettingsChange={setMendeleySettings}
+        onConnect={() => void handleMendeleyConnect()}
+        onDisconnect={() => void handleMendeleyDisconnect()}
+        onSync={() => void handleMendeleySync()}
+        onClose={() => setMendeleySyncOpen(false)}
+      />
+      <ProxySettingsModal
+        open={proxySettingsOpen}
+        settings={proxySettings}
+        busy={proxySettingsBusy}
+        error={proxySettingsError}
+        onClose={() => setProxySettingsOpen(false)}
+        onSave={(settings) => void handleSaveProxySettings(settings)}
+      />
+      <DuplicateDocumentsModal
+        open={duplicateDocumentsOpen}
+        state={library}
+        onClose={() => setDuplicateDocumentsOpen(false)}
+        onDelete={(paperIds) => {
+          for (const paperId of paperIds) handleDeletePaper(paperId);
+          setDuplicateDocumentsOpen(false);
+          setStatus(`Moved ${paperIds.length} duplicate document${paperIds.length === 1 ? "" : "s"} to Trash.`);
+        }}
       />
       <CollectionModal
         open={collectionModalOpen}
@@ -1360,6 +1781,7 @@ function WorkspaceTabContent({
   tab,
   library,
   filteredPapers,
+  searchMeta,
   selectedPaperId,
   selectedCollectionId,
   fileDataById,
@@ -1373,6 +1795,8 @@ function WorkspaceTabContent({
   onRemovePaperFromCollection,
   onDeletePaper,
   onRestorePaper,
+  onPermanentlyDeletePaper,
+  onBindLocalPdf,
   onUpdatePdfViewState,
   onCreateAnnotation,
   onDeleteAnnotation
@@ -1381,6 +1805,7 @@ function WorkspaceTabContent({
   tab: WorkspaceTab;
   library: LibraryState;
   filteredPapers: Paper[];
+  searchMeta?: Map<string, PaperSearchMeta>;
   selectedPaperId?: string;
   selectedCollectionId: string;
   fileDataById: Record<string, Uint8Array>;
@@ -1394,6 +1819,8 @@ function WorkspaceTabContent({
   onRemovePaperFromCollection: (paperId: string) => void;
   onDeletePaper: (paperId: string) => void;
   onRestorePaper: (paperId: string) => void;
+  onPermanentlyDeletePaper: (paperId: string) => void;
+  onBindLocalPdf: (paperId: string) => void;
   onUpdatePdfViewState: (paperId: string, viewState: PdfReaderViewState) => void;
   onCreateAnnotation: (annotation: Annotation) => void;
   onDeleteAnnotation: (annotation: Annotation) => void;
@@ -1403,6 +1830,7 @@ function WorkspaceTabContent({
       <PaperList
         state={library}
         papers={filteredPapers}
+        searchMeta={searchMeta}
         selectedPaperId={selectedPaperId}
         selectedCollectionId={selectedCollectionId}
         onSelectPaper={onSelectPaper}
@@ -1414,6 +1842,8 @@ function WorkspaceTabContent({
         onRemovePaperFromCollection={onRemovePaperFromCollection}
         onDeletePaper={onDeletePaper}
         onRestorePaper={onRestorePaper}
+        onPermanentlyDeletePaper={onPermanentlyDeletePaper}
+        onBindLocalPdf={onBindLocalPdf}
       />
     );
   }

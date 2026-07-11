@@ -24,6 +24,11 @@ export type Paper = {
   doi?: string;
   arxiv?: string;
   pmid?: string;
+  isbn?: string;
+  issn?: string;
+  scopus?: string;
+  ssrn?: string;
+  mendeleyId?: string;
   abstract?: string;
   source?: "manual" | "mendeley" | "import";
   documentType?: string;
@@ -34,6 +39,36 @@ export type Paper = {
   volume?: string;
   issue?: string;
   publisher?: string;
+  month?: number;
+  day?: number;
+  revision?: string;
+  websites?: string[];
+  city?: string;
+  edition?: string;
+  institution?: string;
+  series?: string;
+  chapter?: string;
+  editors?: Author[];
+  accessedAt?: string;
+  authored?: boolean;
+  hidden?: boolean;
+  fileAttached?: boolean;
+  citationKey?: string;
+  sourceType?: string;
+  language?: string;
+  shortTitle?: string;
+  reprintEdition?: string;
+  genre?: string;
+  country?: string;
+  translators?: Author[];
+  seriesEditor?: string;
+  code?: string;
+  medium?: string;
+  userContext?: string;
+  department?: string;
+  patentOwner?: string;
+  patentApplicationNumber?: string;
+  patentLegalStatus?: string;
   favorite?: boolean;
   needsReview?: boolean;
   unread?: boolean;
@@ -61,6 +96,9 @@ export type FileAsset = {
   id: EntityId;
   paperId: EntityId;
   sha256: string;
+  /** Mendeley exposes a SHA-1 filehash rather than SHA-256. */
+  mendeleyFileHash?: string;
+  mendeleyId?: string;
   size: number;
   mime: string;
   fileName: string;
@@ -77,6 +115,7 @@ export type Collection = {
   name: string;
   parentId?: EntityId;
   sortOrder: number;
+  mendeleyId?: string;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string;
@@ -86,6 +125,7 @@ export type PaperCollection = {
   id: EntityId;
   paperId: EntityId;
   collectionId: EntityId;
+  mendeleyId?: string;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string;
@@ -116,6 +156,15 @@ export type Annotation = {
   notePosition?: NormalizedPoint;
   quote?: string;
   comment?: string;
+  mendeleyId?: string;
+  mendeleyFileHash?: string;
+  mendeleyPrivacyLevel?: "private" | "group" | "public";
+  /** Original PDF-point boxes (bottom-left origin), retained for lossless Mendeley round-trips. */
+  mendeleyPositions?: Array<{
+    page: number;
+    topLeft: NormalizedPoint;
+    bottomRight: NormalizedPoint;
+  }>;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string;

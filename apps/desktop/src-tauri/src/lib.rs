@@ -1,6 +1,13 @@
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID, WINDOW_SUBMENU_ID};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
+#[derive(Clone, serde::Serialize)]
+#[serde(tag = "event", rename_all = "camelCase", rename_all_fields = "camelCase")]
+enum ArxivDownloadEvent {
+    Started { total_bytes: Option<u64> },
+    Progress { downloaded_bytes: u64, total_bytes: Option<u64> },
+}
+
 const PDF_VIEW_EVENT: &str = "lumora-pdf-view-command";
 const PDF_VIEW_FIT_WIDTH: &str = "pdf-view-fit-width";
 const PDF_VIEW_GO_TO_PAGE: &str = "pdf-view-go-to-page";
@@ -10,6 +17,11 @@ const WORKSPACE_CLOSE_ACTIVE_TAB: &str = "workspace-close-active-tab";
 const HELP_KEYBOARD_SHORTCUTS: &str = "help-keyboard-shortcuts";
 const APP_ABOUT: &str = "app-about";
 const APP_FILE_STORAGE_SETTINGS: &str = "app-file-storage-settings";
+const APP_MENDELEY_SYNC: &str = "app-mendeley-sync";
+const APP_PROXY_SETTINGS: &str = "app-proxy-settings";
+const APP_DUPLICATE_DOCUMENTS: &str = "app-duplicate-documents";
+const FILES_DOWNLOAD_ARXIV_FILES: &str = "files-download-arxiv-files";
+const PROXY_SETTINGS_META_KEY: &str = "networkProxySettings";
 
 #[tauri::command]
 fn ping() -> &'static str {
@@ -49,11 +61,14 @@ struct YoudaoTranslation {
     page_url: String,
 }
 
+const EXTERNAL_URL_HOSTS: [&str; 2] = ["dict.youdao.com", "dev.mendeley.com"];
+
 #[tauri::command]
 fn open_external_url(url: String) -> Result<(), String> {
     let parsed = reqwest::Url::parse(&url).map_err(|error| format!("Invalid URL: {error}"))?;
-    if parsed.scheme() != "https" || parsed.host_str() != Some("dict.youdao.com") {
-        return Err("Only Youdao dictionary URLs are allowed.".to_string());
+    let host_allowed = parsed.host_str().is_some_and(|host| EXTERNAL_URL_HOSTS.contains(&host));
+    if parsed.scheme() != "https" || !host_allowed {
+        return Err("URL host is not allowed.".to_string());
     }
 
     open_url_with_system(&url)
@@ -126,7 +141,7 @@ async fn translate_with_youdao(query: String) -> Result<YoudaoTranslation, Strin
 }
 
 #[tauri::command]
-async fn search_arxiv_by_title(title: String) -> Result<Vec<ArxivMetadata>, String> {
+async fn search_arxiv_by_title(app: AppHandle, title: String) -> Result<Vec<ArxivMetadata>, String> {
     let query = title.trim();
     if query.is_empty() {
         return Ok(Vec::new());
@@ -141,7 +156,7 @@ async fn search_arxiv_by_title(title: String) -> Result<Vec<ArxivMetadata>, Stri
         .append_pair("sortBy", "relevance")
         .append_pair("sortOrder", "descending");
 
-    let response = reqwest::Client::new()
+    let response = network_client(&app)?
         .get(url)
         .header("accept", "application/atom+xml")
         .send()
@@ -175,6 +190,13 @@ struct EntityUpsert {
     deleted_at: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EntityDelete {
+    entity_type: String,
+    id: String,
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LoadedEntity {
@@ -189,6 +211,63 @@ struct LoadedLibrary {
     meta: std::collections::HashMap<String, String>,
 }
 
+#[derive(Clone, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProxySettings {
+    enabled: bool,
+    url: String,
+    username: String,
+    password: String,
+}
+
+fn validate_proxy_settings(settings: &ProxySettings) -> Result<(), String> {
+    if !settings.enabled {
+        return Ok(());
+    }
+    let url = reqwest::Url::parse(settings.url.trim())
+        .map_err(|error| format!("Invalid proxy URL: {error}"))?;
+    match url.scheme() {
+        "http" | "https" | "socks5" | "socks5h" => Ok(()),
+        scheme => Err(format!("Unsupported proxy protocol: {scheme}")),
+    }
+}
+
+fn load_proxy_settings<R: Runtime>(app: &AppHandle<R>) -> Result<ProxySettings, String> {
+    let connection = open_library_db(app)?;
+    let Some(raw) = get_meta_value(&connection, PROXY_SETTINGS_META_KEY) else {
+        return Ok(ProxySettings::default());
+    };
+    serde_json::from_str(&raw).map_err(|error| format!("Failed to read proxy settings: {error}"))
+}
+
+fn network_client<R: Runtime>(app: &AppHandle<R>) -> Result<reqwest::Client, String> {
+    let settings = load_proxy_settings(app)?;
+    validate_proxy_settings(&settings)?;
+    let mut builder = reqwest::Client::builder();
+    if settings.enabled {
+        let mut proxy = reqwest::Proxy::all(settings.url.trim())
+            .map_err(|error| format!("Invalid proxy URL: {error}"))?;
+        if !settings.username.is_empty() {
+            proxy = proxy.basic_auth(&settings.username, &settings.password);
+        }
+        builder = builder.proxy(proxy);
+    }
+    builder.build().map_err(|error| format!("Failed to configure network client: {error}"))
+}
+
+#[tauri::command]
+async fn proxy_settings(app: AppHandle) -> Result<ProxySettings, String> {
+    load_proxy_settings(&app)
+}
+
+#[tauri::command]
+async fn set_proxy_settings(app: AppHandle, settings: ProxySettings) -> Result<(), String> {
+    validate_proxy_settings(&settings)?;
+    let connection = open_library_db(&app)?;
+    let value = serde_json::to_string(&settings).map_err(|error| error.to_string())?;
+    set_meta_value(&connection, PROXY_SETTINGS_META_KEY, &value)
+}
+
 fn open_library_db<R: Runtime>(app: &AppHandle<R>) -> Result<rusqlite::Connection, String> {
     let dir = app
         .path()
@@ -198,6 +277,13 @@ fn open_library_db<R: Runtime>(app: &AppHandle<R>) -> Result<rusqlite::Connectio
 
     let connection = rusqlite::Connection::open(dir.join("lumora.db"))
         .map_err(|error| format!("Failed to open library database: {error}"))?;
+    init_library_schema(&connection)?;
+    ensure_search_index(&connection)?;
+
+    Ok(connection)
+}
+
+fn init_library_schema(connection: &rusqlite::Connection) -> Result<(), String> {
     connection
         .execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -214,9 +300,7 @@ fn open_library_db<R: Runtime>(app: &AppHandle<R>) -> Result<rusqlite::Connectio
              CREATE INDEX IF NOT EXISTS idx_entities_local_seq ON entities(local_seq);
              CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )
-        .map_err(|error| format!("Failed to initialize library database: {error}"))?;
-
-    Ok(connection)
+        .map_err(|error| format!("Failed to initialize library database: {error}"))
 }
 
 #[tauri::command]
@@ -298,10 +382,81 @@ async fn db_upsert_entities(app: AppHandle, changes: Vec<EntityUpsert>, source: 
                 ],
             )
             .map_err(|error| error.to_string())?;
+
+        // Index maintenance must never fail the user's save: log and move on.
+        if let Err(error) = sync_search_index_for_change(
+            &transaction,
+            &change.entity_type,
+            &change.id,
+            &change.data,
+            change.deleted_at.as_deref(),
+        ) {
+            eprintln!(
+                "Search index update failed for {} {}: {error}",
+                change.entity_type, change.id
+            );
+        }
     }
 
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+async fn db_delete_entities(app: AppHandle, entities: Vec<EntityDelete>) -> Result<(), String> {
+    if entities.is_empty() {
+        return Ok(());
+    }
+    let mut connection = open_library_db(&app)?;
+    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    for entity in entities {
+        if !LIBRARY_ENTITY_TYPES.contains(&entity.entity_type.as_str()) {
+            return Err(format!("Unknown entity type: {}", entity.entity_type));
+        }
+
+        // The annotation row is gone after the DELETE, so capture its paperId
+        // first to re-aggregate that paper's note text afterwards.
+        let annotation_paper_id: Option<String> = if entity.entity_type == "annotation" {
+            use rusqlite::OptionalExtension;
+            transaction
+                .query_row(
+                    "SELECT json_extract(data, '$.paperId') FROM entities WHERE entity_type = 'annotation' AND id = ?1",
+                    [&entity.id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .flatten()
+        } else {
+            None
+        };
+
+        transaction
+            .execute(
+                "DELETE FROM entities WHERE entity_type = ?1 AND id = ?2",
+                rusqlite::params![entity.entity_type, entity.id],
+            )
+            .map_err(|error| error.to_string())?;
+
+        if entity.entity_type == "paper" {
+            transaction
+                .execute("DELETE FROM search_index WHERE paper_id = ?1", [&entity.id])
+                .map_err(|error| error.to_string())?;
+        } else if let Some(paper_id) = annotation_paper_id {
+            if let Err(error) = refresh_paper_notes(&transaction, &paper_id) {
+                eprintln!("Search index note refresh failed for paper {paper_id}: {error}");
+            }
+        }
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn db_get_meta(app: AppHandle, key: String) -> Result<Option<String>, String> {
+    let connection = open_library_db(&app)?;
+    Ok(get_meta_value(&connection, &key))
 }
 
 #[tauri::command]
@@ -315,6 +470,905 @@ async fn db_set_meta(app: AppHandle, key: String, value: String) -> Result<(), S
         )
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+// --- Library full-text search ------------------------------------------------
+// A content-storing FTS5 table holds one row per paper. Title, authors and note
+// text are maintained synchronously on every entity write; the PDF body column
+// is filled in asynchronously by the frontend extraction backfill and keyed by
+// the file's sha256 so re-extraction only happens when the PDF changes. CJK text
+// is segmented into single-character tokens (spaces injected around each CJK
+// codepoint) at both index and query time, which gives substring semantics for
+// CJK phrases while leaving latin tokenization untouched. Soft-deleted papers
+// keep their row (flagged `deleted`) so a trashed paper's expensive body column
+// survives a restore.
+
+const SEARCH_INDEX_VERSION: &str = "1";
+const SEARCH_INDEX_VERSION_META_KEY: &str = "searchIndexVersion";
+const SEARCH_RESULT_LIMIT: u32 = 200;
+const SEARCH_BODY_MAX_CHARS: usize = 1_000_000;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchHit {
+    paper_id: String,
+    tier: u8,
+    score: f64,
+    matched_fields: Vec<String>,
+    snippet: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BodyIndexStatus {
+    paper_id: String,
+    body_sha: String,
+}
+
+fn ensure_search_index(connection: &rusqlite::Connection) -> Result<(), String> {
+    if get_meta_value(connection, SEARCH_INDEX_VERSION_META_KEY).as_deref() == Some(SEARCH_INDEX_VERSION) {
+        return Ok(());
+    }
+
+    let transaction = connection.unchecked_transaction().map_err(|error| error.to_string())?;
+    transaction
+        .execute_batch(
+            "DROP TABLE IF EXISTS search_index;
+             CREATE VIRTUAL TABLE search_index USING fts5(
+               paper_id UNINDEXED,
+               title,
+               authors,
+               body,
+               notes,
+               body_sha UNINDEXED,
+               deleted UNINDEXED,
+               tokenize = \"unicode61 remove_diacritics 2\"
+             );",
+        )
+        .map_err(|error| format!("Failed to create search index: {error}"))?;
+    rebuild_search_index_rows(&transaction)?;
+    set_meta_value(&transaction, SEARCH_INDEX_VERSION_META_KEY, SEARCH_INDEX_VERSION)?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn rebuild_search_index_rows(connection: &rusqlite::Connection) -> Result<(), String> {
+    let notes_by_paper = collect_notes_by_paper(connection)?;
+
+    let mut statement = connection
+        .prepare("SELECT id, data, deleted_at FROM entities WHERE entity_type = 'paper'")
+        .map_err(|error| error.to_string())?;
+    let papers = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+
+    for (id, data, deleted_at) in papers {
+        let Some(fields) = parse_paper_index_fields(&data) else {
+            continue;
+        };
+        let notes = notes_by_paper
+            .get(&id)
+            .map(|parts| cjk_segment(&parts.join("\n")))
+            .unwrap_or_default();
+        connection
+            .execute(
+                "INSERT INTO search_index (paper_id, title, authors, body, notes, body_sha, deleted)
+                 VALUES (?1, ?2, ?3, '', ?4, '', ?5)",
+                rusqlite::params![id, fields.title, fields.authors, notes, i64::from(deleted_at.is_some())],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn collect_notes_by_paper(
+    connection: &rusqlite::Connection,
+) -> Result<std::collections::HashMap<String, Vec<String>>, String> {
+    let mut statement = connection
+        .prepare("SELECT data FROM entities WHERE entity_type = 'annotation' AND deleted_at IS NULL")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+
+    let mut notes: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for data in rows {
+        let data = data.map_err(|error| error.to_string())?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+        let Some(paper_id) = value.get("paperId").and_then(|item| item.as_str()) else {
+            continue;
+        };
+        push_annotation_note_parts(&value, notes.entry(paper_id.to_string()).or_default());
+    }
+    Ok(notes)
+}
+
+fn push_annotation_note_parts(value: &serde_json::Value, parts: &mut Vec<String>) {
+    for key in ["quote", "comment"] {
+        if let Some(text) = value.get(key).and_then(|item| item.as_str()) {
+            let text = text.trim();
+            if !text.is_empty() {
+                parts.push(text.to_string());
+            }
+        }
+    }
+}
+
+struct PaperIndexFields {
+    title: String,
+    authors: String,
+}
+
+fn parse_paper_index_fields(data: &str) -> Option<PaperIndexFields> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let title = value.get("title").and_then(|item| item.as_str()).unwrap_or("");
+    let authors = value
+        .get("authors")
+        .and_then(|item| item.as_array())
+        .map(|authors| {
+            authors
+                .iter()
+                .filter_map(|author| author.get("fullName").and_then(|name| name.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    Some(PaperIndexFields {
+        title: cjk_segment(title),
+        authors: cjk_segment(&authors),
+    })
+}
+
+fn aggregate_notes(connection: &rusqlite::Connection, paper_id: &str) -> Result<String, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT data FROM entities
+             WHERE entity_type = 'annotation' AND deleted_at IS NULL AND json_extract(data, '$.paperId') = ?1",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([paper_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+
+    let mut parts = Vec::new();
+    for data in rows {
+        let data = data.map_err(|error| error.to_string())?;
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) {
+            push_annotation_note_parts(&value, &mut parts);
+        }
+    }
+    Ok(cjk_segment(&parts.join("\n")))
+}
+
+fn is_cjk_char(ch: char) -> bool {
+    matches!(
+        u32::from(ch),
+        0x3040..=0x30FF   // Hiragana + Katakana
+        | 0x3400..=0x4DBF // CJK extension A
+        | 0x4E00..=0x9FFF // CJK unified ideographs
+        | 0xAC00..=0xD7AF // Hangul syllables
+        | 0xF900..=0xFAFF // CJK compatibility ideographs
+    )
+}
+
+fn cjk_segment(text: &str) -> String {
+    let mut segmented = String::with_capacity(text.len() + text.len() / 2);
+    for ch in text.chars() {
+        if is_cjk_char(ch) {
+            segmented.push(' ');
+            segmented.push(ch);
+            segmented.push(' ');
+        } else {
+            segmented.push(ch);
+        }
+    }
+    segmented.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn build_fts_match_terms(user_query: &str) -> Option<String> {
+    let mut phrases: Vec<String> = user_query
+        .split_whitespace()
+        .filter_map(|term| {
+            let segmented = cjk_segment(&term.replace('"', ""));
+            (segmented.chars().any(char::is_alphanumeric)).then(|| format!("\"{segmented}\""))
+        })
+        .collect();
+
+    let last = phrases.last_mut()?;
+    let prefixable = last
+        .trim_end_matches('"')
+        .chars()
+        .last()
+        .is_some_and(|ch| ch.is_ascii_alphanumeric());
+    if prefixable {
+        last.push('*');
+    }
+    Some(phrases.join(" "))
+}
+
+fn build_fts_column_query(user_query: &str, column: &str) -> Option<String> {
+    build_fts_match_terms(user_query).map(|terms| format!("{{{column}}} : ({terms})"))
+}
+
+fn decode_matched_mask(mask: i64) -> Vec<String> {
+    [(1, "title"), (2, "body"), (3, "authors"), (4, "notes")]
+        .into_iter()
+        .filter(|(tier, _)| mask & (1_i64 << tier) != 0)
+        .map(|(_, name)| name.to_string())
+        .collect()
+}
+
+fn search_library_rows(connection: &rusqlite::Connection, query: &str, limit: u32) -> Result<Vec<SearchHit>, String> {
+    let (Some(q_title), Some(q_body), Some(q_authors), Some(q_notes)) = (
+        build_fts_column_query(query, "title"),
+        build_fts_column_query(query, "body"),
+        build_fts_column_query(query, "authors"),
+        build_fts_column_query(query, "notes"),
+    ) else {
+        return Ok(Vec::new());
+    };
+
+    // Strict tiering: a paper's tier is its highest-priority matching column
+    // (title > body > authors > notes); bm25 only orders within a tier. The
+    // bare `score`/`snip` columns follow the MIN(tier) row per SQLite's
+    // documented bare-column-with-MIN semantics, so the snippet always comes
+    // from the best-tier column. Snippet segments are delimited by \u{1}/\u{2}
+    // control chars (char(1)/char(2)) that the frontend splits on.
+    let sql = "WITH hits(paper_id, tier, score, snip) AS (
+         SELECT paper_id, 1, bm25(search_index), snippet(search_index, 1, char(1), char(2), '…', 14)
+           FROM search_index WHERE search_index MATCH :q_title AND deleted = 0
+         UNION ALL
+         SELECT paper_id, 2, bm25(search_index), snippet(search_index, 3, char(1), char(2), '…', 14)
+           FROM search_index WHERE search_index MATCH :q_body AND deleted = 0
+         UNION ALL
+         SELECT paper_id, 3, bm25(search_index), snippet(search_index, 2, char(1), char(2), '…', 14)
+           FROM search_index WHERE search_index MATCH :q_authors AND deleted = 0
+         UNION ALL
+         SELECT paper_id, 4, bm25(search_index), snippet(search_index, 4, char(1), char(2), '…', 14)
+           FROM search_index WHERE search_index MATCH :q_notes AND deleted = 0
+       )
+       SELECT paper_id, MIN(tier) AS tier, score, snip, SUM(1 << tier) AS matched_mask
+       FROM hits
+       GROUP BY paper_id
+       ORDER BY tier ASC, score ASC
+       LIMIT :limit";
+
+    let mut statement = connection.prepare(sql).map_err(|error| error.to_string())?;
+    let hits = statement
+        .query_map(
+            rusqlite::named_params! {
+                ":q_title": q_title,
+                ":q_body": q_body,
+                ":q_authors": q_authors,
+                ":q_notes": q_notes,
+                ":limit": limit,
+            },
+            |row| {
+                Ok(SearchHit {
+                    paper_id: row.get(0)?,
+                    tier: row.get::<_, i64>(1)? as u8,
+                    score: row.get(2)?,
+                    matched_fields: decode_matched_mask(row.get::<_, i64>(4)?),
+                    snippet: row.get(3)?,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(hits)
+}
+
+fn sync_search_index_for_change(
+    connection: &rusqlite::Connection,
+    entity_type: &str,
+    id: &str,
+    data: &str,
+    deleted_at: Option<&str>,
+) -> Result<(), String> {
+    match entity_type {
+        "paper" => {
+            let Some(fields) = parse_paper_index_fields(data) else {
+                return Ok(());
+            };
+            let deleted = i64::from(deleted_at.is_some());
+            let updated = connection
+                .execute(
+                    "UPDATE search_index SET title = ?2, authors = ?3, deleted = ?4 WHERE paper_id = ?1",
+                    rusqlite::params![id, fields.title, fields.authors, deleted],
+                )
+                .map_err(|error| error.to_string())?;
+            if updated == 0 {
+                let notes = aggregate_notes(connection, id)?;
+                connection
+                    .execute(
+                        "INSERT INTO search_index (paper_id, title, authors, body, notes, body_sha, deleted)
+                         VALUES (?1, ?2, ?3, '', ?4, '', ?5)",
+                        rusqlite::params![id, fields.title, fields.authors, notes, deleted],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
+        "annotation" => {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                return Ok(());
+            };
+            let Some(paper_id) = value.get("paperId").and_then(|item| item.as_str()) else {
+                return Ok(());
+            };
+            refresh_paper_notes(connection, paper_id)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn refresh_paper_notes(connection: &rusqlite::Connection, paper_id: &str) -> Result<(), String> {
+    use rusqlite::OptionalExtension;
+
+    let notes = aggregate_notes(connection, paper_id)?;
+    let updated = connection
+        .execute(
+            "UPDATE search_index SET notes = ?2 WHERE paper_id = ?1",
+            rusqlite::params![paper_id, notes],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated > 0 {
+        return Ok(());
+    }
+
+    // Annotations can arrive before their paper's search row exists (sync ordering).
+    let paper_row: Option<(String, Option<String>)> = connection
+        .query_row(
+            "SELECT data, deleted_at FROM entities WHERE entity_type = 'paper' AND id = ?1",
+            [paper_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((data, deleted_at)) = paper_row else {
+        return Ok(());
+    };
+    let Some(fields) = parse_paper_index_fields(&data) else {
+        return Ok(());
+    };
+    connection
+        .execute(
+            "INSERT INTO search_index (paper_id, title, authors, body, notes, body_sha, deleted)
+             VALUES (?1, ?2, ?3, '', ?4, '', ?5)",
+            rusqlite::params![paper_id, fields.title, fields.authors, notes, i64::from(deleted_at.is_some())],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn index_paper_body(connection: &rusqlite::Connection, paper_id: &str, sha256: &str, text: &str) -> Result<(), String> {
+    use rusqlite::OptionalExtension;
+
+    let capped: String = text.chars().take(SEARCH_BODY_MAX_CHARS).collect();
+    let body = cjk_segment(&capped);
+    let updated = connection
+        .execute(
+            "UPDATE search_index SET body = ?2, body_sha = ?3 WHERE paper_id = ?1",
+            rusqlite::params![paper_id, body, sha256],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated > 0 {
+        return Ok(());
+    }
+
+    let paper_row: Option<(String, Option<String>)> = connection
+        .query_row(
+            "SELECT data, deleted_at FROM entities WHERE entity_type = 'paper' AND id = ?1",
+            [paper_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((data, deleted_at)) = paper_row else {
+        return Ok(());
+    };
+    let Some(fields) = parse_paper_index_fields(&data) else {
+        return Ok(());
+    };
+    let notes = aggregate_notes(connection, paper_id)?;
+    connection
+        .execute(
+            "INSERT INTO search_index (paper_id, title, authors, body, notes, body_sha, deleted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![paper_id, fields.title, fields.authors, body, notes, sha256, i64::from(deleted_at.is_some())],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn db_search_library(app: AppHandle, query: String, limit: Option<u32>) -> Result<Vec<SearchHit>, String> {
+    let connection = open_library_db(&app)?;
+    search_library_rows(&connection, &query, limit.unwrap_or(SEARCH_RESULT_LIMIT))
+}
+
+#[tauri::command]
+async fn db_index_paper_body(app: AppHandle, paper_id: String, sha256: String, text: String) -> Result<(), String> {
+    let connection = open_library_db(&app)?;
+    index_paper_body(&connection, &paper_id, &sha256, &text)
+}
+
+#[tauri::command]
+async fn db_search_index_status(app: AppHandle) -> Result<Vec<BodyIndexStatus>, String> {
+    let connection = open_library_db(&app)?;
+    let mut statement = connection
+        .prepare("SELECT paper_id, body_sha FROM search_index WHERE deleted = 0")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(BodyIndexStatus {
+                paper_id: row.get(0)?,
+                body_sha: row.get(1)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(rows)
+}
+
+// --- Mendeley direct integration -------------------------------------------
+// The desktop app talks to api.mendeley.com itself: OAuth authorization-code
+// flow with a fixed loopback redirect (the URI registered at dev.mendeley.com
+// must match exactly, so the port is fixed), tokens stored in the library
+// database's meta table, and an authenticated request proxy that refreshes the
+// access token transparently.
+
+const MENDELEY_REDIRECT_PORT: u16 = 53682;
+const MENDELEY_REDIRECT_PATH: &str = "/mendeley/callback";
+const MENDELEY_META_ACCESS_TOKEN: &str = "mendeleyAccessToken";
+const MENDELEY_META_REFRESH_TOKEN: &str = "mendeleyRefreshToken";
+const MENDELEY_META_EXPIRES_AT: &str = "mendeleyTokenExpiresAt";
+const MENDELEY_META_DISPLAY_NAME: &str = "mendeleyDisplayName";
+
+#[derive(serde::Deserialize)]
+struct MendeleyTokenResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MendeleyStatus {
+    connected: bool,
+    display_name: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MendeleyResponse {
+    status: u16,
+    body: String,
+    link_next: Option<String>,
+}
+
+fn mendeley_redirect_uri() -> String {
+    format!("http://localhost:{MENDELEY_REDIRECT_PORT}{MENDELEY_REDIRECT_PATH}")
+}
+
+fn get_meta_value(connection: &rusqlite::Connection, key: &str) -> Option<String> {
+    connection
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| row.get(0))
+        .ok()
+}
+
+fn set_meta_value(connection: &rusqlite::Connection, key: &str, value: &str) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn store_mendeley_tokens<R: Runtime>(app: &AppHandle<R>, tokens: &MendeleyTokenResponse) -> Result<(), String> {
+    let connection = open_library_db(app)?;
+    set_meta_value(&connection, MENDELEY_META_ACCESS_TOKEN, &tokens.access_token)?;
+    if let Some(refresh_token) = &tokens.refresh_token {
+        set_meta_value(&connection, MENDELEY_META_REFRESH_TOKEN, refresh_token)?;
+    }
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64 + tokens.expires_in.unwrap_or(3600))
+        .unwrap_or(0);
+    set_meta_value(&connection, MENDELEY_META_EXPIRES_AT, &expires_at.to_string())?;
+    Ok(())
+}
+
+// Waits for the OAuth redirect on the loopback listener and extracts the
+// `code`/`state` query parameters from the request line.
+fn await_oauth_callback(listener: std::net::TcpListener) -> Result<(String, String), String> {
+    use std::io::{BufRead, BufReader, Write};
+
+    listener
+        .set_nonblocking(false)
+        .map_err(|error| error.to_string())?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    for stream in listener.incoming() {
+        if std::time::Instant::now() > deadline {
+            return Err("Timed out waiting for the Mendeley authorization redirect.".to_string());
+        }
+
+        let mut stream = stream.map_err(|error| error.to_string())?;
+        let mut reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).map_err(|error| error.to_string())?;
+
+        let path = request_line.split_whitespace().nth(1).unwrap_or_default().to_string();
+        let responded_ok = path.starts_with(MENDELEY_REDIRECT_PATH);
+        let body = if responded_ok {
+            "<html><body><h2>lumora</h2><p>Mendeley authorization complete. You can close this window.</p></body></html>"
+        } else {
+            "<html><body><p>Unexpected request.</p></body></html>"
+        };
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .as_bytes(),
+        );
+
+        if !responded_ok {
+            continue;
+        }
+
+        let query = path.split_once('?').map(|(_, query)| query).unwrap_or_default();
+        let mut code = None;
+        let mut state = None;
+        for pair in query.split('&') {
+            match pair.split_once('=') {
+                Some(("code", value)) => code = Some(value.to_string()),
+                Some(("state", value)) => state = Some(value.to_string()),
+                _ => {}
+            }
+        }
+
+        return match (code, state) {
+            (Some(code), Some(state)) => Ok((code, state)),
+            _ => Err("Mendeley redirect did not include an authorization code.".to_string()),
+        };
+    }
+
+    Err("Authorization listener closed unexpectedly.".to_string())
+}
+
+#[tauri::command]
+async fn mendeley_connect(app: AppHandle, client_id: String, client_secret: String) -> Result<MendeleyStatus, String> {
+    let client_id = client_id.trim().to_string();
+    let client_secret = client_secret.trim().to_string();
+    if client_id.is_empty() {
+        return Err("Enter the Mendeley client ID first.".to_string());
+    }
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", MENDELEY_REDIRECT_PORT))
+        .map_err(|error| format!("Port {MENDELEY_REDIRECT_PORT} is unavailable for the OAuth callback: {error}"))?;
+
+    let state = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    );
+
+    let mut authorize_url = reqwest::Url::parse("https://api.mendeley.com/oauth/authorize")
+        .map_err(|error| error.to_string())?;
+    authorize_url
+        .query_pairs_mut()
+        .append_pair("client_id", &client_id)
+        .append_pair("redirect_uri", &mendeley_redirect_uri())
+        .append_pair("response_type", "code")
+        .append_pair("scope", "all")
+        .append_pair("state", &state);
+    open_url_with_system(authorize_url.as_str())?;
+
+    let (code, returned_state) = tauri::async_runtime::spawn_blocking(move || await_oauth_callback(listener))
+        .await
+        .map_err(|error| error.to_string())??;
+    if returned_state != state {
+        return Err("OAuth state mismatch; aborting for safety.".to_string());
+    }
+
+    let client = network_client(&app)?;
+    let token_response = client
+        .post("https://api.mendeley.com/oauth/token")
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", &mendeley_redirect_uri()),
+            ("client_id", &client_id),
+            ("client_secret", &client_secret),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("Token exchange failed: {error}"))?;
+
+    if !token_response.status().is_success() {
+        let status = token_response.status();
+        let body = token_response.text().await.unwrap_or_default();
+        return Err(format!("Token exchange failed ({status}): {body}"));
+    }
+
+    let tokens: MendeleyTokenResponse = token_response
+        .json()
+        .await
+        .map_err(|error| format!("Failed to parse token response: {error}"))?;
+    store_mendeley_tokens(&app, &tokens)?;
+
+    // Confirm the connection and capture the profile name for display.
+    let profile_response = client
+        .get("https://api.mendeley.com/profiles/me")
+        .bearer_auth(&tokens.access_token)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let display_name = if profile_response.status().is_success() {
+        let profile: serde_json::Value = profile_response.json().await.unwrap_or_default();
+        profile
+            .get("display_name")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| profile.get("email").and_then(serde_json::Value::as_str).map(ToString::to_string))
+    } else {
+        None
+    };
+
+    let connection = open_library_db(&app)?;
+    set_meta_value(&connection, MENDELEY_META_DISPLAY_NAME, display_name.as_deref().unwrap_or(""))?;
+
+    Ok(MendeleyStatus { connected: true, display_name })
+}
+
+#[tauri::command]
+async fn mendeley_status(app: AppHandle) -> Result<MendeleyStatus, String> {
+    let connection = open_library_db(&app)?;
+    let connected = get_meta_value(&connection, MENDELEY_META_REFRESH_TOKEN).is_some()
+        || get_meta_value(&connection, MENDELEY_META_ACCESS_TOKEN).is_some();
+    let display_name = get_meta_value(&connection, MENDELEY_META_DISPLAY_NAME).filter(|name| !name.is_empty());
+    Ok(MendeleyStatus { connected, display_name })
+}
+
+#[tauri::command]
+async fn mendeley_disconnect(app: AppHandle) -> Result<(), String> {
+    let connection = open_library_db(&app)?;
+    for key in [
+        MENDELEY_META_ACCESS_TOKEN,
+        MENDELEY_META_REFRESH_TOKEN,
+        MENDELEY_META_EXPIRES_AT,
+        MENDELEY_META_DISPLAY_NAME,
+    ] {
+        let _ = connection.execute("DELETE FROM meta WHERE key = ?1", [key]);
+    }
+    Ok(())
+}
+
+async fn refresh_mendeley_token<R: Runtime>(
+    app: &AppHandle<R>,
+    client_id: &str,
+    client_secret: &str,
+) -> Result<String, String> {
+    let refresh_token = {
+        let connection = open_library_db(app)?;
+        get_meta_value(&connection, MENDELEY_META_REFRESH_TOKEN)
+            .ok_or_else(|| "Not connected to Mendeley.".to_string())?
+    };
+
+    let response = network_client(app)?
+        .post("https://api.mendeley.com/oauth/token")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.as_str()),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("Token refresh failed: {error}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Token refresh failed ({}). Reconnect Mendeley.", response.status()));
+    }
+
+    let tokens: MendeleyTokenResponse = response
+        .json()
+        .await
+        .map_err(|error| format!("Failed to parse refresh response: {error}"))?;
+    store_mendeley_tokens(app, &tokens)?;
+    Ok(tokens.access_token)
+}
+
+// Authenticated proxy to api.mendeley.com so the frontend never handles tokens
+// or CORS. Refreshes the access token once on 401.
+#[tauri::command]
+async fn mendeley_request(
+    app: AppHandle,
+    client_id: String,
+    client_secret: String,
+    method: String,
+    path: String,
+    body: Option<String>,
+    content_type: Option<String>,
+) -> Result<MendeleyResponse, String> {
+    if !path.starts_with('/') {
+        return Err("Mendeley API path must start with '/'.".to_string());
+    }
+
+    let mut access_token = {
+        let connection = open_library_db(&app)?;
+        let expires_at = get_meta_value(&connection, MENDELEY_META_EXPIRES_AT)
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let token = get_meta_value(&connection, MENDELEY_META_ACCESS_TOKEN);
+        if expires_at - now < 60 { None } else { token }
+    };
+
+    if access_token.is_none() {
+        access_token = Some(refresh_mendeley_token(&app, &client_id, &client_secret).await?);
+    }
+
+    let url = format!("https://api.mendeley.com{path}");
+    let client = network_client(&app)?;
+
+    for attempt in 0..2 {
+        let mut request = match method.as_str() {
+            "GET" => client.get(&url),
+            "POST" => client.post(&url),
+            "PATCH" => client.patch(&url),
+            "DELETE" => client.delete(&url),
+            _ => return Err(format!("Unsupported method: {method}")),
+        }
+        .bearer_auth(access_token.as_deref().unwrap_or_default());
+
+        if let Some(content_type) = &content_type {
+            request = request.header("content-type", content_type).header("accept", content_type);
+        }
+        if let Some(body) = &body {
+            request = request.body(body.clone());
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|error| format!("Mendeley request failed: {error}"))?;
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+            access_token = Some(refresh_mendeley_token(&app, &client_id, &client_secret).await?);
+            continue;
+        }
+
+        let status = response.status().as_u16();
+        let link_next = response
+            .headers()
+            .get("link")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_next_link);
+        let response_body = response.text().await.unwrap_or_default();
+        return Ok(MendeleyResponse { status, body: response_body, link_next });
+    }
+
+    Err("Mendeley request failed after token refresh.".to_string())
+}
+
+// Downloads the attachment bytes after Mendeley's short-lived 303 redirect.
+// Keeping this in Rust means OAuth tokens and signed URLs never enter WebView JS.
+#[tauri::command]
+async fn mendeley_download_file(
+    app: AppHandle,
+    client_id: String,
+    client_secret: String,
+    file_id: String,
+) -> Result<tauri::ipc::Response, String> {
+    let token = {
+        let connection = open_library_db(&app)?;
+        let expires_at = get_meta_value(&connection, MENDELEY_META_EXPIRES_AT)
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        if expires_at - now >= 60 {
+            get_meta_value(&connection, MENDELEY_META_ACCESS_TOKEN)
+        } else {
+            None
+        }
+    };
+    let access_token = match token {
+        Some(token) => token,
+        None => refresh_mendeley_token(&app, &client_id, &client_secret).await?,
+    };
+    let response = network_client(&app)?
+        .get(format!("https://api.mendeley.com/files/{file_id}"))
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|error| format!("Mendeley file download failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("Mendeley file download failed ({})", response.status()));
+    }
+    let bytes = response.bytes().await
+        .map_err(|error| format!("Failed to read Mendeley file: {error}"))?;
+    Ok(tauri::ipc::Response::new(bytes.to_vec()))
+}
+
+#[tauri::command]
+async fn download_arxiv_pdf(
+    app: AppHandle,
+    arxiv_id: String,
+    on_progress: tauri::ipc::Channel<ArxivDownloadEvent>,
+) -> Result<tauri::ipc::Response, String> {
+    let arxiv_id = arxiv_id.trim();
+    let modern = regex::Regex::new(r"^\d{4}\.\d{4,5}(v\d+)?$").map_err(|error| error.to_string())?;
+    let legacy = regex::Regex::new(r"^[A-Za-z-]+(?:\.[A-Za-z-]+)?/\d{7}(v\d+)?$")
+        .map_err(|error| error.to_string())?;
+    if !modern.is_match(arxiv_id) && !legacy.is_match(arxiv_id) {
+        return Err(format!("Invalid arXiv identifier: {arxiv_id}"));
+    }
+
+    let url = format!("https://arxiv.org/pdf/{arxiv_id}");
+    let mut response = network_client(&app)?
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, "lumora/0.1 desktop research library")
+        .header(reqwest::header::ACCEPT, "application/pdf")
+        .send()
+        .await
+        .map_err(|error| format!("Failed to download arXiv:{arxiv_id}: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("arXiv PDF download failed for {arxiv_id} ({})", response.status()));
+    }
+    let total_bytes = response.content_length();
+    let _ = on_progress.send(ArxivDownloadEvent::Started { total_bytes });
+    let mut bytes = Vec::with_capacity(total_bytes.unwrap_or(0).min(usize::MAX as u64) as usize);
+    while let Some(chunk) = response.chunk().await
+        .map_err(|error| format!("Failed to read arXiv PDF {arxiv_id}: {error}"))? {
+        bytes.extend_from_slice(&chunk);
+        let _ = on_progress.send(ArxivDownloadEvent::Progress {
+            downloaded_bytes: bytes.len() as u64,
+            total_bytes,
+        });
+    }
+    if !bytes.starts_with(b"%PDF-") {
+        return Err(format!("arXiv returned non-PDF content for {arxiv_id}"));
+    }
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+// Extracts the rel="next" URL from an RFC 5988 Link header and returns it as a
+// path+query relative to api.mendeley.com.
+fn parse_next_link(header: &str) -> Option<String> {
+    for part in header.split(',') {
+        let (url_part, params) = part.split_once(';')?;
+        if params.contains("rel=\"next\"") {
+            let url = url_part.trim().trim_start_matches('<').trim_end_matches('>');
+            return url.strip_prefix("https://api.mendeley.com").map(ToString::to_string);
+        }
+    }
+    None
 }
 
 const STORE_PDF_DIR_HEADER: &str = "x-lumora-dir";
@@ -397,6 +1451,16 @@ async fn read_stored_pdf(dir: String, file_name: String) -> Result<tauri::ipc::R
 }
 
 #[tauri::command]
+async fn delete_stored_pdf(dir: String, file_name: String) -> Result<(), String> {
+    validate_stored_file_name(&file_name)?;
+    let path = std::path::Path::new(&dir).join(&file_name);
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::remove_file(&path).map_err(|error| format!("Failed to delete {}: {error}", path.display()))
+}
+
+#[tauri::command]
 async fn move_stored_pdf(dir: String, file_name: String, new_dir: String, new_file_name: String) -> Result<String, String> {
     validate_stored_file_name(&file_name)?;
     validate_stored_file_name(&new_file_name)?;
@@ -450,6 +1514,14 @@ pub fn run() {
                 let _ = app.emit(WORKSPACE_EVENT, "show-about");
             } else if id == APP_FILE_STORAGE_SETTINGS {
                 let _ = app.emit(WORKSPACE_EVENT, "show-file-storage-settings");
+            } else if id == APP_MENDELEY_SYNC {
+                let _ = app.emit(WORKSPACE_EVENT, "show-mendeley-sync");
+            } else if id == APP_PROXY_SETTINGS {
+                let _ = app.emit(WORKSPACE_EVENT, "show-proxy-settings");
+            } else if id == APP_DUPLICATE_DOCUMENTS {
+                let _ = app.emit(WORKSPACE_EVENT, "show-duplicate-documents");
+            } else if id == FILES_DOWNLOAD_ARXIV_FILES {
+                let _ = app.emit(WORKSPACE_EVENT, "download-arxiv-files");
             } else if let Some(zoom) = id.strip_prefix(PDF_VIEW_ZOOM_PREFIX) {
                 let _ = app.emit(PDF_VIEW_EVENT, format!("zoom:{zoom}"));
             }
@@ -462,10 +1534,24 @@ pub fn run() {
             search_arxiv_by_title,
             store_pdf,
             read_stored_pdf,
+            delete_stored_pdf,
             move_stored_pdf,
             db_load_library,
             db_upsert_entities,
-            db_set_meta
+            db_delete_entities,
+            db_get_meta,
+            db_set_meta,
+            db_search_library,
+            db_index_paper_body,
+            db_search_index_status,
+            proxy_settings,
+            set_proxy_settings,
+            mendeley_connect,
+            mendeley_status,
+            mendeley_disconnect,
+            mendeley_request,
+            mendeley_download_file,
+            download_arxiv_pdf
         ])
         .run(tauri::generate_context!())
         .expect("error while running lumora");
@@ -563,7 +1649,8 @@ fn build_menu<R: Runtime>(app_handle: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         &[
             &MenuItem::with_id(app_handle, APP_ABOUT, format!("About {}", pkg_info.name), true, None::<&str>)?,
             &PredefinedMenuItem::separator(app_handle)?,
-            &MenuItem::with_id(app_handle, APP_FILE_STORAGE_SETTINGS, "File Storage Settings...", true, None::<&str>)?,
+            &MenuItem::with_id(app_handle, APP_MENDELEY_SYNC, "Mendeley Sync...", true, None::<&str>)?,
+            &MenuItem::with_id(app_handle, APP_PROXY_SETTINGS, "Proxy...", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app_handle)?,
             &PredefinedMenuItem::services(app_handle, None)?,
             &PredefinedMenuItem::separator(app_handle)?,
@@ -571,6 +1658,18 @@ fn build_menu<R: Runtime>(app_handle: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             &PredefinedMenuItem::hide_others(app_handle, None)?,
             &PredefinedMenuItem::separator(app_handle)?,
             &PredefinedMenuItem::quit(app_handle, None)?,
+        ],
+    )?;
+
+    let files_menu = Submenu::with_items(
+        app_handle,
+        "Files",
+        true,
+        &[
+            &MenuItem::with_id(app_handle, APP_FILE_STORAGE_SETTINGS, "File Storage Settings...", true, None::<&str>)?,
+            &MenuItem::with_id(app_handle, FILES_DOWNLOAD_ARXIV_FILES, "Download arXiv Files", true, None::<&str>)?,
+            &PredefinedMenuItem::separator(app_handle)?,
+            &MenuItem::with_id(app_handle, APP_DUPLICATE_DOCUMENTS, "Duplicate Documents...", true, None::<&str>)?,
         ],
     )?;
 
@@ -623,7 +1722,7 @@ fn build_menu<R: Runtime>(app_handle: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         &[&MenuItem::with_id(app_handle, HELP_KEYBOARD_SHORTCUTS, "Keyboard Shortcuts", true, None::<&str>)?],
     )?;
 
-    Menu::with_items(app_handle, &[&app_menu, &edit_menu, &view_menu, &window_menu, &help_menu])
+    Menu::with_items(app_handle, &[&app_menu, &files_menu, &edit_menu, &view_menu, &window_menu, &help_menu])
 }
 
 #[cfg(desktop)]
@@ -820,23 +1919,18 @@ fn decode_xml_entities(value: &str) -> String {
         .replace("&apos;", "'")
 }
 
+// Keeps the version suffix (2301.12345v2): the versioned id links to the exact
+// revision the metadata describes, and the PDF-extraction path keeps it too.
 fn normalize_arxiv_id(value: &str) -> String {
-    let id = value
+    value
         .split("arxiv.org/abs/")
         .nth(1)
         .unwrap_or(value)
         .split(['?', '#', ' '])
         .next()
         .unwrap_or(value)
-        .trim_start_matches("arXiv:");
-
-    if let Some(version_index) = id.rfind('v') {
-        if id[version_index + 1..].chars().all(|char| char.is_ascii_digit()) {
-            return id[..version_index].to_string();
-        }
-    }
-
-    id.to_string()
+        .trim_start_matches("arXiv:")
+        .to_string()
 }
 
 fn score_title_match(query_title: &str, candidate_title: &str) -> f64 {
@@ -863,4 +1957,258 @@ fn tokenize(value: &str) -> Vec<String> {
         .filter(|token| token.len() > 2)
         .map(ToString::to_string)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_fts_column_query, cjk_segment, ensure_search_index, index_paper_body, init_library_schema,
+        normalize_arxiv_id, search_library_rows, sync_search_index_for_change, validate_proxy_settings,
+        ProxySettings, SEARCH_RESULT_LIMIT,
+    };
+
+    fn test_connection() -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        init_library_schema(&connection).unwrap();
+        ensure_search_index(&connection).unwrap();
+        connection
+    }
+
+    fn upsert_entity(
+        connection: &rusqlite::Connection,
+        entity_type: &str,
+        id: &str,
+        data: &str,
+        deleted_at: Option<&str>,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO entities (entity_type, id, data, updated_at, deleted_at, local_seq)
+                 VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', ?4, 0)
+                 ON CONFLICT(entity_type, id) DO UPDATE SET data = excluded.data, deleted_at = excluded.deleted_at",
+                rusqlite::params![entity_type, id, data, deleted_at],
+            )
+            .unwrap();
+        sync_search_index_for_change(connection, entity_type, id, data, deleted_at).unwrap();
+    }
+
+    fn paper_json(id: &str, title: &str, authors: &[&str]) -> String {
+        let authors = authors
+            .iter()
+            .map(|name| format!(r#"{{"fullName":"{name}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"id":"{id}","title":"{title}","authors":[{authors}]}}"#)
+    }
+
+    fn annotation_json(id: &str, paper_id: &str, quote: &str, comment: &str) -> String {
+        format!(r#"{{"id":"{id}","paperId":"{paper_id}","quote":"{quote}","comment":"{comment}"}}"#)
+    }
+
+    fn search_ids(connection: &rusqlite::Connection, query: &str) -> Vec<String> {
+        search_library_rows(connection, query, SEARCH_RESULT_LIMIT)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.paper_id)
+            .collect()
+    }
+
+    #[test]
+    fn fts5_is_available() {
+        // Guards the assumption that rusqlite's bundled SQLite ships FTS5.
+        let connection = test_connection();
+        connection
+            .execute(
+                "INSERT INTO search_index (paper_id, title, authors, body, notes, body_sha, deleted)
+                 VALUES ('p1', 'hello world', '', '', '', '', 0)",
+                [],
+            )
+            .unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM search_index WHERE search_index MATCH '{title} : (\"hello\")'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn segments_cjk_into_single_char_tokens() {
+        assert_eq!(cjk_segment("机器学习"), "机 器 学 习");
+        assert_eq!(cjk_segment("GPT模型"), "GPT 模 型");
+        assert_eq!(cjk_segment("plain latin text"), "plain latin text");
+        assert_eq!(cjk_segment("  spaced   out  "), "spaced out");
+    }
+
+    #[test]
+    fn builds_sanitized_column_queries() {
+        assert_eq!(
+            build_fts_column_query("attention vaswani", "title"),
+            Some(r#"{title} : ("attention" "vaswani"*)"#.to_string())
+        );
+        // FTS5 operators are neutralized by phrase quoting; embedded quotes stripped.
+        assert_eq!(
+            build_fts_column_query(r#"a OR b"c"#, "body"),
+            Some(r#"{body} : ("a" "OR" "bc"*)"#.to_string())
+        );
+        // CJK terms become single-char phrases with no prefix star.
+        assert_eq!(
+            build_fts_column_query("机器学习", "notes"),
+            Some(r#"{notes} : ("机 器 学 习")"#.to_string())
+        );
+        // Operator-only input yields no query at all.
+        assert_eq!(build_fts_column_query("- * ( )", "title"), None);
+        assert_eq!(build_fts_column_query("   ", "title"), None);
+    }
+
+    #[test]
+    fn ranks_title_over_body_over_authors_over_notes() {
+        let connection = test_connection();
+        upsert_entity(&connection, "paper", "p-title", &paper_json("p-title", "Quantum computing survey", &["Alice"]), None);
+        upsert_entity(&connection, "paper", "p-body", &paper_json("p-body", "Fast inference", &["Bob"]), None);
+        upsert_entity(&connection, "paper", "p-author", &paper_json("p-author", "Graph networks", &["John Quantum"]), None);
+        upsert_entity(&connection, "paper", "p-note", &paper_json("p-note", "Sparse attention", &["Carol"]), None);
+        index_paper_body(&connection, "p-body", "sha-b", "we study quantum entanglement at scale").unwrap();
+        upsert_entity(
+            &connection,
+            "annotation",
+            "a1",
+            &annotation_json("a1", "p-note", "quantum supremacy claim", "check this"),
+            None,
+        );
+
+        let hits = search_library_rows(&connection, "quantum", SEARCH_RESULT_LIMIT).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|hit| hit.paper_id.as_str()).collect();
+        assert_eq!(ids, ["p-title", "p-body", "p-author", "p-note"]);
+        assert_eq!(hits[0].tier, 1);
+        assert_eq!(hits[0].matched_fields, ["title"]);
+        assert_eq!(hits[1].matched_fields, ["body"]);
+        assert_eq!(hits[2].matched_fields, ["authors"]);
+        assert_eq!(hits[3].matched_fields, ["notes"]);
+        assert!(hits[1].snippet.contains('\u{1}'), "snippet should carry highlight markers");
+    }
+
+    #[test]
+    fn reports_all_matched_fields_at_best_tier() {
+        let connection = test_connection();
+        upsert_entity(&connection, "paper", "p1", &paper_json("p1", "Diffusion models", &["Dana"]), None);
+        index_paper_body(&connection, "p1", "sha", "diffusion in pixel space").unwrap();
+
+        let hits = search_library_rows(&connection, "diffusion", SEARCH_RESULT_LIMIT).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].tier, 1);
+        assert_eq!(hits[0].matched_fields, ["title", "body"]);
+    }
+
+    #[test]
+    fn matches_cjk_substrings_in_notes() {
+        let connection = test_connection();
+        upsert_entity(&connection, "paper", "p1", &paper_json("p1", "Attention is all you need", &["Vaswani"]), None);
+        upsert_entity(
+            &connection,
+            "annotation",
+            "a1",
+            &annotation_json("a1", "p1", "", "注意力机制的核心思想"),
+            None,
+        );
+
+        assert_eq!(search_ids(&connection, "注意力"), ["p1"]);
+        assert_eq!(search_ids(&connection, "机制"), ["p1"]);
+        assert!(search_ids(&connection, "力注").is_empty(), "non-consecutive CJK chars must not match");
+    }
+
+    #[test]
+    fn soft_delete_hides_paper_and_restore_keeps_body() {
+        let connection = test_connection();
+        let data = paper_json("p1", "Neural tangent kernels", &["Eve"]);
+        upsert_entity(&connection, "paper", "p1", &data, None);
+        index_paper_body(&connection, "p1", "sha", "tangent kernel dynamics").unwrap();
+        assert_eq!(search_ids(&connection, "tangent"), ["p1"]);
+
+        upsert_entity(&connection, "paper", "p1", &data, Some("2026-01-02T00:00:00Z"));
+        assert!(search_ids(&connection, "tangent").is_empty());
+
+        upsert_entity(&connection, "paper", "p1", &data, None);
+        // Body survives the trash/restore round trip without re-extraction.
+        assert_eq!(search_ids(&connection, "kernel dynamics"), ["p1"]);
+    }
+
+    #[test]
+    fn annotation_soft_delete_reaggregates_notes() {
+        let connection = test_connection();
+        upsert_entity(&connection, "paper", "p1", &paper_json("p1", "Some title", &[]), None);
+        let annotation = annotation_json("a1", "p1", "wavelet transform trick", "");
+        upsert_entity(&connection, "annotation", "a1", &annotation, None);
+        assert_eq!(search_ids(&connection, "wavelet"), ["p1"]);
+
+        upsert_entity(&connection, "annotation", "a1", &annotation, Some("2026-01-02T00:00:00Z"));
+        assert!(search_ids(&connection, "wavelet").is_empty());
+    }
+
+    #[test]
+    fn rebuilds_index_from_existing_entities() {
+        // Simulates upgrading an existing library: entities exist, index does not.
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        init_library_schema(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO entities (entity_type, id, data, updated_at, deleted_at, local_seq)
+                 VALUES ('paper', 'p1', ?1, '2026-01-01T00:00:00Z', NULL, 0)",
+                [paper_json("p1", "Legacy 论文 title", &["Frank"])],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO entities (entity_type, id, data, updated_at, deleted_at, local_seq)
+                 VALUES ('annotation', 'a1', ?1, '2026-01-01T00:00:00Z', NULL, 0)",
+                [annotation_json("a1", "p1", "老笔记", "legacy note")],
+            )
+            .unwrap();
+
+        ensure_search_index(&connection).unwrap();
+        assert_eq!(search_ids(&connection, "论文"), ["p1"]);
+        assert_eq!(search_ids(&connection, "legacy"), ["p1"]);
+        assert_eq!(search_ids(&connection, "老笔记"), ["p1"]);
+    }
+
+    #[test]
+    fn keeps_version_suffix_on_modern_ids() {
+        assert_eq!(normalize_arxiv_id("http://arxiv.org/abs/2301.12345v2"), "2301.12345v2");
+        assert_eq!(normalize_arxiv_id("arXiv:2301.12345v1"), "2301.12345v1");
+    }
+
+    #[test]
+    fn keeps_version_suffix_on_legacy_ids() {
+        assert_eq!(normalize_arxiv_id("http://arxiv.org/abs/cs/0112017v3"), "cs/0112017v3");
+    }
+
+    #[test]
+    fn handles_unversioned_ids_and_url_noise() {
+        assert_eq!(normalize_arxiv_id("http://arxiv.org/abs/2301.12345"), "2301.12345");
+        assert_eq!(normalize_arxiv_id("https://arxiv.org/abs/2301.12345v2?context=cs"), "2301.12345v2");
+    }
+
+    #[test]
+    fn accepts_http_and_socks_proxy_urls() {
+        for url in ["http://127.0.0.1:8080", "https://proxy.example:8443", "socks5://127.0.0.1:1080", "socks5h://localhost:1080"] {
+            assert!(validate_proxy_settings(&ProxySettings {
+                enabled: true,
+                url: url.to_string(),
+                username: String::new(),
+                password: String::new(),
+            }).is_ok());
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_proxy_protocols() {
+        assert!(validate_proxy_settings(&ProxySettings {
+            enabled: true,
+            url: "ftp://localhost:21".to_string(),
+            username: String::new(),
+            password: String::new(),
+        }).is_err());
+    }
 }

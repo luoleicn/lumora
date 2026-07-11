@@ -1,7 +1,8 @@
-import { Cloud, DatabaseZap, FileSearch, LogIn, RefreshCw, Search, Send, Trash2 } from "lucide-react";
+import { Cloud, DatabaseZap, Download, FileSearch, LogIn, RefreshCw, Search, Send, Trash2 } from "lucide-react";
 import { useState } from "react";
 import type { Annotation, ArxivMetadata, FileAsset, Paper } from "@lumora/shared";
 import { searchArxivMetadata, type SyncSettings } from "../lib/syncClient";
+import { formatFileSize, type ArxivDownloadProgress } from "../lib/arxivFiles";
 
 type SyncPanelProps = {
   settings: SyncSettings;
@@ -10,13 +11,14 @@ type SyncPanelProps = {
   paper?: Paper;
   fileAsset?: FileAsset;
   fileData?: Uint8Array;
+  hasLocalPdf: boolean;
   annotations: Annotation[];
   onSettingsChange: (settings: SyncSettings) => void;
   onLogin: () => void;
   onSync: () => void;
-  onConnectMendeley: () => void;
-  onImportMendeley: () => void;
   onUpdatePaper: (paper: Paper) => void;
+  arxivDownloadBusy: boolean;
+  onDownloadArxiv: (paperId: string, onProgress: (progress: ArxivDownloadProgress) => void) => Promise<string>;
   onDeleteAnnotation: (annotation: Annotation) => void;
 };
 
@@ -27,13 +29,14 @@ export function SyncPanel({
   paper,
   fileAsset,
   fileData,
+  hasLocalPdf,
   annotations,
   onSettingsChange,
   onLogin,
   onSync,
-  onConnectMendeley,
-  onImportMendeley,
   onUpdatePaper,
+  arxivDownloadBusy,
+  onDownloadArxiv,
   onDeleteAnnotation
 }: SyncPanelProps) {
   const [activeTab, setActiveTab] = useState<"details" | "notes" | "sync">("details");
@@ -59,7 +62,10 @@ export function SyncPanel({
           paper={paper}
           fileAsset={fileAsset}
           fileData={fileData}
+          hasLocalPdf={hasLocalPdf}
           onUpdatePaper={onUpdatePaper}
+          arxivDownloadBusy={arxivDownloadBusy}
+          onDownloadArxiv={onDownloadArxiv}
         />
       )}
       {activeTab === "notes" && <NotesTab annotations={visibleAnnotations} onDeleteAnnotation={onDeleteAnnotation} />}
@@ -101,16 +107,6 @@ export function SyncPanel({
               Sync
             </button>
           </div>
-          <div className="sync-actions">
-            <button type="button" onClick={onConnectMendeley} disabled={busy || !settings.token}>
-              <Send size={16} />
-              Mendeley OAuth
-            </button>
-            <button type="button" onClick={onImportMendeley} disabled={busy || !settings.token}>
-              <DatabaseZap size={16} />
-              Import
-            </button>
-          </div>
           {status && <p className="sync-status">{status}</p>}
         </>
       )}
@@ -133,18 +129,26 @@ function DetailsTab({
   paper,
   fileAsset,
   fileData,
-  onUpdatePaper
+  hasLocalPdf,
+  onUpdatePaper,
+  arxivDownloadBusy,
+  onDownloadArxiv
 }: {
   settings: SyncSettings;
   paper?: Paper;
   fileAsset?: FileAsset;
   fileData?: Uint8Array;
+  hasLocalPdf: boolean;
   onUpdatePaper: (paper: Paper) => void;
+  arxivDownloadBusy: boolean;
+  onDownloadArxiv: (paperId: string, onProgress: (progress: ArxivDownloadProgress) => void) => Promise<string>;
 }) {
   const [arxivLookupStatus, setArxivLookupStatus] = useState<string>();
   const [arxivLookupBusy, setArxivLookupBusy] = useState(false);
   const [arxivResults, setArxivResults] = useState<ArxivMetadata[]>([]);
   const [arxivResultsOpen, setArxivResultsOpen] = useState(false);
+  const [arxivDownloadStatus, setArxivDownloadStatus] = useState<string>();
+  const [arxivDownloadProgress, setArxivDownloadProgress] = useState<ArxivDownloadProgress>();
   const [pdfMetadataStatus, setPdfMetadataStatus] = useState<string>();
   const [pdfMetadataBusy, setPdfMetadataBusy] = useState(false);
 
@@ -193,6 +197,20 @@ function DetailsTab({
     setArxivLookupStatus(`Applied arXiv:${metadata.arxivId}`);
   }
 
+  async function handleArxivDownload() {
+    setArxivDownloadStatus(undefined);
+    setArxivDownloadProgress(undefined);
+    setArxivDownloadStatus(await onDownloadArxiv(currentPaper.id, (progress) => {
+      setArxivDownloadProgress(progress);
+      if (progress.downloadedBytes !== undefined) {
+        setArxivDownloadStatus(
+          `${formatFileSize(progress.downloadedBytes)}`
+          + (progress.totalBytes ? ` / ${formatFileSize(progress.totalBytes)}` : " downloaded")
+        );
+      }
+    }));
+  }
+
   async function handlePdfMetadataExtract() {
     if (!fileData) {
       setPdfMetadataStatus("No local PDF file available.");
@@ -227,14 +245,42 @@ function DetailsTab({
             <FileSearch size={15} />
             {pdfMetadataBusy ? "Extracting..." : "Extract PDF"}
           </button>
-          <button type="button" onClick={handleArxivLookup} disabled={arxivLookupBusy || !paper.title.trim()}>
-            <Search size={15} />
-            {arxivLookupBusy ? "Searching..." : "Search arXiv"}
-          </button>
+          <div className="arxiv-action-stack">
+            <button type="button" onClick={handleArxivLookup} disabled={arxivLookupBusy || !paper.title.trim()}>
+              <Search size={15} />
+              {arxivLookupBusy ? "Searching..." : "Search arXiv"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleArxivDownload()}
+              disabled={arxivDownloadBusy || !paper.arxiv || hasLocalPdf}
+              title={hasLocalPdf ? "A local PDF is already available." : undefined}
+            >
+              <Download className={arxivDownloadBusy ? "spinning" : undefined} size={15} />
+              {arxivDownloadBusy ? "Downloading..." : "Download from arXiv"}
+            </button>
+          </div>
         </div>
       </div>
       {pdfMetadataStatus && <p className="metadata-lookup-status">{pdfMetadataStatus}</p>}
       {arxivLookupStatus && <p className="metadata-lookup-status">{arxivLookupStatus}</p>}
+      {arxivDownloadStatus && <p className="metadata-lookup-status">{arxivDownloadStatus}</p>}
+      {arxivDownloadBusy && arxivDownloadProgress?.phase === "downloading" && (
+        <div className="arxiv-download-progress" aria-label="arXiv PDF download progress">
+          <div className={arxivDownloadProgress.totalBytes ? "determinate" : "indeterminate"}>
+            <span style={arxivDownloadProgress.totalBytes ? {
+              width: `${Math.min(100, ((arxivDownloadProgress.downloadedBytes ?? 0) / arxivDownloadProgress.totalBytes) * 100)}%`
+            } : undefined} />
+          </div>
+          <small>
+            {formatFileSize(arxivDownloadProgress.downloadedBytes ?? 0)}
+            {arxivDownloadProgress.totalBytes ? ` / ${formatFileSize(arxivDownloadProgress.totalBytes)}` : ""}
+            {arxivDownloadProgress.totalBytes
+              ? ` (${Math.round(((arxivDownloadProgress.downloadedBytes ?? 0) / arxivDownloadProgress.totalBytes) * 100)}%)`
+              : ""}
+          </small>
+        </div>
+      )}
       {arxivResultsOpen && (
         <div className="arxiv-results-popover">
           <header>

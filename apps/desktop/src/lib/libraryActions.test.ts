@@ -4,11 +4,14 @@ import {
   addPaperToCollection,
   deleteCollectionAndReassignPapers,
   deletePaperFromLibrary,
+  getActivePaperCollectionIds,
   getCollectionAndDescendantIds,
   getCollectionPaperCount,
   removePaperFromCollectionTree,
+  permanentlyDeletePaperFromTrash,
   renameCollection,
-  restorePaperFromTrash
+  restorePaperFromTrash,
+  sortCollectionsAlphabetically
 } from "./libraryActions";
 
 const now = "2026-07-06T00:00:00.000Z";
@@ -58,6 +61,39 @@ function state(): LibraryState {
 }
 
 describe("library actions", () => {
+  it("returns every active folder assigned to the selected paper and all of their ancestors", () => {
+    const current = state();
+    current.paperCollections.find((item) => item.id === "pc-parent-a")!.deletedAt = now;
+    current.paperCollections.find((item) => item.id === "pc-target-a")!.deletedAt = now;
+
+    expect([...getActivePaperCollectionIds(current, "paper-a")].sort()).toEqual([
+      "folder-child",
+      "folder-grandchild",
+      "folder-parent"
+    ]);
+    expect(getActivePaperCollectionIds(current)).toEqual(new Set());
+  });
+
+  it("sorts folders alphabetically with case-insensitive numeric ordering", () => {
+    const folders = [collection("zeta"), collection("Folder 10"), collection("alpha"), collection("Folder 2")]
+      .map((item) => ({ ...item, name: item.id }));
+
+    expect(sortCollectionsAlphabetically(folders).map((item) => item.name)).toEqual([
+      "alpha", "Folder 2", "Folder 10", "zeta"
+    ]);
+  });
+
+  it("permanently removes only a paper that is already in trash and its dependents", () => {
+    const trashed = deletePaperFromLibrary(state(), "paper-a", now);
+    const next = permanentlyDeletePaperFromTrash(trashed, "paper-a");
+
+    expect(next.papers.find((paper) => paper.id === "paper-a")).toBeUndefined();
+    expect(next.fileAssets.some((file) => file.paperId === "paper-a")).toBe(false);
+    expect(next.annotations.some((annotation) => annotation.paperId === "paper-a")).toBe(false);
+    expect(next.paperCollections.some((membership) => membership.paperId === "paper-a")).toBe(false);
+    const active = state();
+    expect(permanentlyDeletePaperFromTrash(active, "paper-a")).toBe(active);
+  });
   it("collects a folder and all descendant folder ids", () => {
     expect([...getCollectionAndDescendantIds(state().collections, "folder-parent")].sort()).toEqual([
       "folder-child",

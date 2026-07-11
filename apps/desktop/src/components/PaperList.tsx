@@ -1,6 +1,14 @@
-import { FileText, FolderMinus, RotateCcw, Star, Trash2 } from "lucide-react";
+import { FileCheck2, FilePlus2, FileQuestion, FileText, FolderMinus, RotateCcw, Star, Trash2 } from "lucide-react";
 import type { FileAsset, LibraryState, Paper } from "@lumora/shared";
 import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { collapseCjkSpaces, splitSnippet, type PaperSearchMeta, type SearchMatchedField } from "../lib/searchIndex";
+
+const matchedFieldLabels: Record<SearchMatchedField, string> = {
+  title: "Title",
+  body: "Full text",
+  authors: "Author",
+  notes: "Note"
+};
 
 type SortKey = "authors" | "title" | "year" | "venue" | "added";
 type PaperColumnKey = "favorite" | SortKey;
@@ -51,6 +59,7 @@ const paperColumns: PaperColumn[] = [
 type PaperListProps = {
   state: LibraryState;
   papers: Paper[];
+  searchMeta?: Map<string, PaperSearchMeta>;
   selectedPaperId?: string;
   selectedCollectionId: string;
   onSelectPaper: (id: string) => void;
@@ -62,11 +71,14 @@ type PaperListProps = {
   onRemovePaperFromCollection: (paperId: string) => void;
   onDeletePaper: (paperId: string) => void;
   onRestorePaper: (paperId: string) => void;
+  onPermanentlyDeletePaper: (paperId: string) => void;
+  onBindLocalPdf: (paperId: string) => void;
 };
 
 export function PaperList({
   state,
   papers,
+  searchMeta,
   selectedPaperId,
   selectedCollectionId,
   onSelectPaper,
@@ -77,20 +89,32 @@ export function PaperList({
   onPaperDragEnd,
   onRemovePaperFromCollection,
   onDeletePaper,
-  onRestorePaper
+  onRestorePaper,
+  onPermanentlyDeletePaper,
+  onBindLocalPdf
 }: PaperListProps) {
   const isTrash = selectedCollectionId === "trash";
   const [sortKey, setSortKey] = useState<SortKey>("added");
   const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
+  const [searchSortOverride, setSearchSortOverride] = useState(false);
   const [columnWidths, setColumnWidths] = useState<PaperColumnWidths>(() => loadColumnWidths());
   const [resizingColumn, setResizingColumn] = useState<PaperColumnKey>();
   const [contextMenu, setContextMenu] = useState<PaperContextMenu>();
   const columnResizeRef = useRef<ColumnResizeDrag | undefined>(undefined);
   const internalPaperDragRef = useRef<InternalPaperDrag | undefined>(undefined);
+  // Search results arrive relevance-ordered; keep that order until the user
+  // explicitly clicks a column header, and reset once the search ends.
+  const relevanceOrdered = Boolean(searchMeta) && !searchSortOverride;
   const sortedPapers = useMemo(
-    () => [...papers].sort((a, b) => comparePapers(a, b, sortKey, sortDirection)),
-    [papers, sortDirection, sortKey]
+    () => (relevanceOrdered ? papers : [...papers].sort((a, b) => comparePapers(a, b, sortKey, sortDirection))),
+    [papers, relevanceOrdered, sortDirection, sortKey]
   );
+
+  useEffect(() => {
+    if (!searchMeta) {
+      setSearchSortOverride(false);
+    }
+  }, [searchMeta]);
   const tableMinWidth = useMemo(
     () => paperColumns.reduce((total, column) => total + columnWidths[column.key], 0),
     [columnWidths]
@@ -124,6 +148,9 @@ export function PaperList({
   }, [contextMenu]);
 
   function handleSort(nextSortKey: SortKey) {
+    if (searchMeta) {
+      setSearchSortOverride(true);
+    }
     if (nextSortKey === sortKey) {
       setSortDirection((current) => current === "asc" ? "desc" : "asc");
       return;
@@ -276,7 +303,7 @@ export function PaperList({
         {sortedPapers.length === 0 ? (
           <div className="empty-list">
             <FileText size={24} />
-            <p>No papers in this collection.</p>
+            <p>{searchMeta ? "No matches in library." : "No papers in this collection."}</p>
           </div>
         ) : (
           <table className={resizingColumn ? "paper-table resizing-columns" : "paper-table"} style={{ minWidth: tableMinWidth }}>
@@ -308,7 +335,13 @@ export function PaperList({
                 <PaperRow
                   key={paper.id}
                   paper={paper}
-                  fileAsset={state.fileAssets.find((file) => file.paperId === paper.id && !file.deletedAt)}
+                  searchMeta={searchMeta?.get(paper.id)}
+                  fileAsset={state.fileAssets.find((file) =>
+                    file.paperId === paper.id
+                    && !file.deletedAt
+                    && file.downloadState === "local"
+                    && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName))
+                  )}
                   active={paper.id === selectedPaperId}
                   onClick={() => onSelectPaper(paper.id)}
                   onDoubleClick={() => onOpenPaper(paper.id)}
@@ -327,12 +360,18 @@ export function PaperList({
           y={contextMenu.y}
           isTrash={isTrash}
           canRemoveFromCollection={isRealCollectionId(selectedCollectionId)}
+          hasLocalPdf={state.fileAssets.some((file) => file.paperId === contextMenu.paperId && !file.deletedAt && file.downloadState === "local" && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName)))}
+          onBindLocalPdf={() => { onBindLocalPdf(contextMenu.paperId); setContextMenu(undefined); }}
           onRemoveFromCollection={() => {
             onRemovePaperFromCollection(contextMenu.paperId);
             setContextMenu(undefined);
           }}
           onRestorePaper={() => {
             onRestorePaper(contextMenu.paperId);
+            setContextMenu(undefined);
+          }}
+          onPermanentlyDeletePaper={() => {
+            onPermanentlyDeletePaper(contextMenu.paperId);
             setContextMenu(undefined);
           }}
           onDeletePaper={() => {
@@ -400,6 +439,7 @@ function ResizableHeader({
 
 function PaperRow({
   paper,
+  searchMeta,
   fileAsset,
   active,
   onClick,
@@ -409,6 +449,7 @@ function PaperRow({
   onContextMenu
 }: {
   paper: Paper;
+  searchMeta?: PaperSearchMeta;
   fileAsset?: FileAsset;
   active: boolean;
   onClick: () => void;
@@ -442,8 +483,32 @@ function PaperRow({
       </td>
       <td title={authorLine || "No authors"}>{authorLine || "No authors"}</td>
       <td className="paper-title-cell" title={paper.title}>
-        {fileAsset && <FileText size={14} />}
-        <span>{paper.title}</span>
+        <div className="paper-title-line">
+          <span
+            className={`paper-file-status ${fileAsset ? "has-pdf" : "no-pdf"}`}
+            title={fileAsset ? `PDF attached: ${fileAsset.fileName}` : "No PDF attached"}
+            aria-label={fileAsset ? "PDF attached" : "No PDF attached"}
+          >
+            {fileAsset ? <FileCheck2 size={16} /> : <FileQuestion size={16} />}
+          </span>
+          <span>{paper.title}</span>
+        </div>
+        {searchMeta && (
+          <div className="paper-search-meta">
+            {searchMeta.matchedFields.map((field) => (
+              <span key={field} className="search-match-badge">{matchedFieldLabels[field]}</span>
+            ))}
+            {searchMeta.snippet && (
+              <span className="search-snippet">
+                {splitSnippet(collapseCjkSpaces(searchMeta.snippet)).map((segment, index) =>
+                  segment.highlighted
+                    ? <mark key={index}>{segment.text}</mark>
+                    : <span key={index}>{segment.text}</span>
+                )}
+              </span>
+            )}
+          </div>
+        )}
       </td>
       <td>{paper.year ?? ""}</td>
       <td title={paper.venue || fileAsset?.fileName || "PDF"}>
@@ -461,7 +526,10 @@ function PaperContextMenu({
   canRemoveFromCollection,
   onRemoveFromCollection,
   onRestorePaper,
-  onDeletePaper
+  onPermanentlyDeletePaper,
+  onDeletePaper,
+  hasLocalPdf,
+  onBindLocalPdf
 }: {
   x: number;
   y: number;
@@ -469,7 +537,10 @@ function PaperContextMenu({
   canRemoveFromCollection: boolean;
   onRemoveFromCollection: () => void;
   onRestorePaper: () => void;
+  onPermanentlyDeletePaper: () => void;
   onDeletePaper: () => void;
+  hasLocalPdf: boolean;
+  onBindLocalPdf: () => void;
 }) {
   return (
     <div
@@ -480,12 +551,24 @@ function PaperContextMenu({
       onContextMenu={(event) => event.preventDefault()}
     >
       {isTrash ? (
-        <button type="button" role="menuitem" onClick={onRestorePaper}>
-          <RotateCcw size={15} />
-          <span>Restore to Unsorted</span>
-        </button>
+        <>
+          <button type="button" role="menuitem" onClick={onRestorePaper}>
+            <RotateCcw size={15} />
+            <span>Restore to Unsorted</span>
+          </button>
+          <button type="button" className="danger" role="menuitem" onClick={onPermanentlyDeletePaper}>
+            <Trash2 size={15} />
+            <span>Delete Permanently</span>
+          </button>
+        </>
       ) : (
         <>
+          {!hasLocalPdf && (
+            <button type="button" role="menuitem" onClick={onBindLocalPdf}>
+              <FilePlus2 size={15} />
+              <span>Bind Local PDF…</span>
+            </button>
+          )}
           {canRemoveFromCollection && (
             <button type="button" role="menuitem" onClick={onRemoveFromCollection}>
               <FolderMinus size={15} />

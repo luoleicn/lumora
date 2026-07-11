@@ -1,28 +1,35 @@
 import {
+  AlertCircle,
   Archive,
   ChevronDown,
   ChevronRight,
   Clock,
+  CircleCheck,
+  CircleX,
   FilePlus,
   FileText,
   Folder,
   FolderPlus,
   Pencil,
+  RefreshCw,
   Star,
   Tags,
   Trash2,
   UserRound,
+  X,
   type LucideIcon
 } from "lucide-react";
 import type { Collection, LibraryState } from "@lumora/shared";
 import { useEffect, useState } from "react";
 import lumoraLogoUrl from "../assets/lumora-logo-64.png";
+import { getActivePaperCollectionIds, sortCollectionsAlphabetically } from "../lib/libraryActions";
 
 type LibrarySidebarProps = {
   state: LibraryState;
   collectionPaperCounts: Record<string, number>;
   dragOverCollectionId?: string;
   selectedCollectionId: string;
+  selectedPaperId?: string;
   selectedAuthor?: string;
   selectedTag?: string;
   onSelectCollection: (id: string) => void;
@@ -33,6 +40,17 @@ type LibrarySidebarProps = {
   onDeleteCollection: (collectionId: string) => void;
   onAddPaperToCollection: (paperId: string, collectionId: string) => void;
   onAddPdfToCollection: (collectionId: string) => void;
+  onSync: () => void;
+  syncBusy: boolean;
+  mendeleySyncActivity?: LibrarySyncActivity;
+  onCancelMendeleySync: () => void;
+};
+
+export type LibrarySyncActivity = {
+  state: "running" | "success" | "error" | "cancelled";
+  message: string;
+  completed: number;
+  total: number;
 };
 
 type CollectionContextMenu = {
@@ -47,6 +65,7 @@ export function LibrarySidebar({
   collectionPaperCounts,
   dragOverCollectionId,
   selectedCollectionId,
+  selectedPaperId,
   selectedAuthor,
   selectedTag,
   onSelectCollection,
@@ -56,7 +75,11 @@ export function LibrarySidebar({
   onRenameCollection,
   onDeleteCollection,
   onAddPaperToCollection,
-  onAddPdfToCollection
+  onAddPdfToCollection,
+  onSync,
+  syncBusy,
+  mendeleySyncActivity,
+  onCancelMendeleySync
 }: LibrarySidebarProps) {
   const [authorsExpanded, setAuthorsExpanded] = useState(false);
   const [tagsExpanded, setTagsExpanded] = useState(false);
@@ -80,10 +103,11 @@ export function LibrarySidebar({
     };
   }, [contextMenu]);
   const visibleDragOverCollectionId = dragOverCollectionId ?? nativeDragOverCollectionId;
-  const collections = state.collections
-    .filter((collection) => !collection.deletedAt)
-    .sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
+  const collections = sortCollectionsAlphabetically(
+    state.collections.filter((collection) => !collection.deletedAt)
+  );
   const collectionTree = buildCollectionTree(collections);
+  const selectedPaperCollectionIds = getActivePaperCollectionIds(state, selectedPaperId);
   const activePapers = state.papers.filter((paper) => !paper.deletedAt);
   const deletedPapers = state.papers.filter((paper) => paper.deletedAt);
   const unfiledPaperCount = activePapers.filter(
@@ -149,6 +173,7 @@ export function LibrarySidebar({
                 node={node}
                 depth={0}
                 selectedCollectionId={selectedCollectionId}
+                selectedPaperCollectionIds={selectedPaperCollectionIds}
                 dragOverCollectionId={visibleDragOverCollectionId}
                 collapsedCollections={collapsedCollections}
                 getCount={(collectionId) => collectionPaperCounts[collectionId] ?? 0}
@@ -252,6 +277,44 @@ export function LibrarySidebar({
         )}
       </section>
 
+      <div className="library-sync-footer">
+        {mendeleySyncActivity && (
+          <div
+            className={`library-sync-activity ${mendeleySyncActivity.state}`}
+            role="status"
+            aria-live="polite"
+          >
+            <div className="library-sync-activity-heading">
+              {mendeleySyncActivity.state === "running" && <RefreshCw className="spinning" size={14} />}
+              {mendeleySyncActivity.state === "success" && <CircleCheck size={14} />}
+              {mendeleySyncActivity.state === "error" && <AlertCircle size={14} />}
+              {mendeleySyncActivity.state === "cancelled" && <CircleX size={14} />}
+              <span>{mendeleySyncActivity.state === "running" ? "Mendeley syncing" : mendeleySyncActivity.state === "success" ? "Mendeley synced" : mendeleySyncActivity.state === "cancelled" ? "Mendeley sync cancelled" : "Mendeley sync failed"}</span>
+              <small>{Math.round((mendeleySyncActivity.completed / Math.max(1, mendeleySyncActivity.total)) * 100)}%</small>
+              {mendeleySyncActivity.state === "running" && (
+                <button
+                  type="button"
+                  className="library-sync-cancel"
+                  onClick={onCancelMendeleySync}
+                  aria-label="Cancel Mendeley sync"
+                  title="Cancel sync"
+                >
+                  <X size={13} />
+                </button>
+              )}
+            </div>
+            <div className="library-sync-progress" aria-hidden>
+              <span style={{ width: `${Math.min(100, (mendeleySyncActivity.completed / Math.max(1, mendeleySyncActivity.total)) * 100)}%` }} />
+            </div>
+            <p title={mendeleySyncActivity.message}>{mendeleySyncActivity.message}</p>
+          </div>
+        )}
+        <button type="button" onClick={onSync} disabled={syncBusy}>
+          <RefreshCw size={15} />
+          {syncBusy ? "Syncing..." : "Sync"}
+        </button>
+      </div>
+
       {contextMenu && (
         <div
           className="paper-context-menu"
@@ -322,6 +385,7 @@ function CollectionTreeNode({
   node,
   depth,
   selectedCollectionId,
+  selectedPaperCollectionIds,
   dragOverCollectionId,
   collapsedCollections,
   getCount,
@@ -334,6 +398,7 @@ function CollectionTreeNode({
   node: CollectionNode;
   depth: number;
   selectedCollectionId: string;
+  selectedPaperCollectionIds: Set<string>;
   dragOverCollectionId?: string;
   collapsedCollections: Record<string, boolean>;
   getCount: (collectionId: string) => number;
@@ -347,6 +412,8 @@ function CollectionTreeNode({
   const collapsed = Boolean(collapsedCollections[collection.id]);
   const hasChildren = children.length > 0;
   const dragOver = dragOverCollectionId === collection.id;
+  const containsSelectedPaper = selectedPaperCollectionIds.has(collection.id);
+  const selectedCollection = selectedCollectionId === collection.id;
 
   return (
     <>
@@ -402,10 +469,10 @@ function CollectionTreeNode({
           <span className="collection-toggle-spacer" />
         )}
         <button
-          className={selectedCollectionId === collection.id ? "collection-button active" : "collection-button"}
+          className={`collection-button${selectedCollection ? " active" : ""}${containsSelectedPaper ? " contains-selected-paper" : ""}`}
           type="button"
           onClick={() => onSelectCollection(collection.id)}
-          title={collection.name}
+          title={containsSelectedPaper ? `${collection.name} — contains selected document` : collection.name}
         >
           <Folder size={16} />
           <span>{collection.name}</span>
@@ -418,6 +485,7 @@ function CollectionTreeNode({
           node={child}
           depth={depth + 1}
           selectedCollectionId={selectedCollectionId}
+          selectedPaperCollectionIds={selectedPaperCollectionIds}
           dragOverCollectionId={dragOverCollectionId}
           collapsedCollections={collapsedCollections}
           getCount={getCount}

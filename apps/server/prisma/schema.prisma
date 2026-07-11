@@ -47,6 +47,7 @@ model Paper {
   favorite         Boolean           @default(false)
   needsReview      Boolean           @default(false)
   unread           Boolean           @default(true)
+  mendeleyData     Json?
   createdAt        DateTime
   updatedAt        DateTime
   deletedAt        DateTime?
@@ -73,6 +74,7 @@ model FileAsset {
   localPath     String?
   objectKey     String?
   downloadState String
+  mendeleyData  Json?
   createdAt     DateTime
   updatedAt     DateTime
   deletedAt     DateTime?
@@ -91,6 +93,7 @@ model Collection {
   name             String
   parentId         String?
   sortOrder        Int               @default(0)
+  mendeleyData     Json?
   createdAt        DateTime
   updatedAt        DateTime
   deletedAt        DateTime?
@@ -106,6 +109,7 @@ model PaperCollection {
   userId       String
   paperId      String
   collectionId String
+  mendeleyData Json?
   createdAt    DateTime
   updatedAt    DateTime
   deletedAt    DateTime?
@@ -130,6 +134,7 @@ model Annotation {
   notePosition Json?
   quote     String?
   comment   String?
+  mendeleyData Json?
   createdAt DateTime
   updatedAt DateTime
   deletedAt DateTime?

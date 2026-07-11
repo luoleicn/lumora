@@ -61,6 +61,13 @@ export async function persistEntities(changes: EntityChange[], source: WriteSour
   });
 }
 
+export async function deletePersistedEntities(entities: Array<{ entityType: SyncEntity; id: string }>): Promise<void> {
+  if (entities.length === 0) {
+    return;
+  }
+  await invoke("db_delete_entities", { entities });
+}
+
 export async function persistSyncCursor(cursor: number): Promise<void> {
   await invoke("db_set_meta", { key: lastSyncCursorMetaKey, value: String(cursor) });
 }

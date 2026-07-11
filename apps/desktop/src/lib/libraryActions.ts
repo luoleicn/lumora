@@ -1,6 +1,39 @@
 import type { Collection, EntityId, LibraryState, PaperCollection } from "@lumora/shared";
 import { createId } from "./id";
 
+export function sortCollectionsAlphabetically(collections: Collection[]): Collection[] {
+  return [...collections].sort((a, b) => a.name.localeCompare(b.name, undefined, {
+    sensitivity: "base",
+    numeric: true
+  }));
+}
+
+export function getActivePaperCollectionIds(state: LibraryState, paperId?: EntityId): Set<EntityId> {
+  if (!paperId) return new Set();
+  const collectionById = new Map(
+    state.collections
+      .filter((collection) => !collection.deletedAt)
+      .map((collection) => [collection.id, collection])
+  );
+  const highlightedIds = new Set(state.paperCollections
+    .filter((membership) => membership.paperId === paperId && !membership.deletedAt)
+    .map((membership) => membership.collectionId));
+
+  for (const collectionId of [...highlightedIds]) {
+    let parentId = collectionById.get(collectionId)?.parentId;
+    const visited = new Set<EntityId>();
+    while (parentId && !visited.has(parentId)) {
+      visited.add(parentId);
+      const parent = collectionById.get(parentId);
+      if (!parent) break;
+      highlightedIds.add(parent.id);
+      parentId = parent.parentId;
+    }
+  }
+
+  return highlightedIds;
+}
+
 export function getCollectionAndDescendantIds(collections: Collection[], collectionId: string) {
   const ids = new Set<string>([collectionId]);
   let added = true;
@@ -103,6 +136,24 @@ export function restorePaperFromTrash(state: LibraryState, paperId: EntityId, no
     annotations: state.annotations.map((item) =>
       item.paperId === paperId && item.deletedAt ? { ...item, deletedAt: undefined, updatedAt: now } : item
     )
+  };
+}
+
+// Removes an already-trashed paper and every local entity that belongs to it.
+// This is intentionally separate from ordinary delete, which remains a
+// reversible soft-delete so sync can propagate the tombstone.
+export function permanentlyDeletePaperFromTrash(state: LibraryState, paperId: EntityId): LibraryState {
+  const paper = state.papers.find((item) => item.id === paperId && item.deletedAt);
+  if (!paper) {
+    return state;
+  }
+
+  return {
+    ...state,
+    papers: state.papers.filter((item) => item.id !== paperId),
+    fileAssets: state.fileAssets.filter((item) => item.paperId !== paperId),
+    paperCollections: state.paperCollections.filter((item) => item.paperId !== paperId),
+    annotations: state.annotations.filter((item) => item.paperId !== paperId)
   };
 }
 
