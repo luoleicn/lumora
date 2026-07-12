@@ -1,7 +1,7 @@
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use qiniu_sdk::{
     credential::Credential,
-    objects::ObjectsManager,
+    objects::{apis::http_client::ResponseErrorKind, ObjectsManager},
     upload::{AutoUploader, AutoUploaderObjectParams, UploadManager, UploadTokenSigner},
 };
 use rusqlite::{params, OptionalExtension};
@@ -37,6 +37,13 @@ pub struct QiniuSyncConfig {
     pub prefix: String,
     #[serde(default)]
     pub configured: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QiniuObjectStat {
+    pub exists: bool,
+    pub size: Option<u64>,
 }
 
 fn default_prefix() -> String {
@@ -266,7 +273,7 @@ async fn upload_bytes<R: Runtime>(
     // nothing actually landed in the bucket — surface that instead of reporting
     // success, which would otherwise mark the file as synced while other devices
     // can never download it.
-    let (_, _, stored_size) = stat_object(config, secret, &object_key).map_err(|error| {
+    let (_, _, stored_size) = stat_object(config, secret, &object_key).await.map_err(|error| {
         format!(
             "Qiniu accepted the upload of {object_key} but the object is missing afterwards ({error}). \
              Verify the bucket name and that its region matches this account."
@@ -318,19 +325,63 @@ async fn download_bytes(config: &QiniuSyncConfig, secret: &str, key: &str) -> Re
     response.bytes().await.map(|bytes| bytes.to_vec()).map_err(|error| error.to_string())
 }
 
-fn stat_object(config: &QiniuSyncConfig, secret: &str, key: &str) -> Result<(u64, String, u64), String> {
-    let manager = ObjectsManager::new(credential(config, secret));
-    let response = manager
-        .bucket(&config.bucket)
-        .stat_object(key)
-        .call()
-        .map_err(|error| error.to_string())?;
-    let object = response.into_body();
-    Ok((object.get_put_time_as_u64(), object.get_hash_as_str().to_string(), object.get_size_as_u64()))
+/// Runs a blocking Qiniu SDK call on a worker thread with a hard timeout, so a
+/// stalled region query or connection can never hang the whole sync forever.
+async fn run_blocking_timeout<T, F>(label: &str, secs: u64, task: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    let handle = tauri::async_runtime::spawn_blocking(task);
+    match tokio::time::timeout(Duration::from_secs(secs), handle).await {
+        Err(_) => Err(format!(
+            "{label} timed out after {secs}s — Qiniu did not respond. Check the bucket's region and any required network proxy."
+        )),
+        Ok(joined) => joined.map_err(|error| error.to_string())?,
+    }
 }
 
-fn object_exists(config: &QiniuSyncConfig, secret: &str, key: &str) -> bool {
-    stat_object(config, secret, key).is_ok()
+async fn stat_object(config: &QiniuSyncConfig, secret: &str, key: &str) -> Result<(u64, String, u64), String> {
+    let config = config.clone();
+    let secret = secret.to_string();
+    let key_owned = key.to_string();
+    run_blocking_timeout(&format!("Qiniu stat of {key}"), 60, move || {
+        let manager = ObjectsManager::new(credential(&config, &secret));
+        let response = manager
+            .bucket(&config.bucket)
+            .stat_object(&key_owned)
+            .call()
+            .map_err(|error| error.to_string())?;
+        let object = response.into_body();
+        Ok((object.get_put_time_as_u64(), object.get_hash_as_str().to_string(), object.get_size_as_u64()))
+    })
+    .await
+}
+
+async fn object_exists(config: &QiniuSyncConfig, secret: &str, key: &str) -> bool {
+    stat_object(config, secret, key).await.is_ok()
+}
+
+async fn stat_object_if_exists(
+    config: &QiniuSyncConfig,
+    secret: &str,
+    key: &str,
+) -> Result<Option<u64>, String> {
+    let config = config.clone();
+    let secret = secret.to_string();
+    let key_owned = key.to_string();
+    run_blocking_timeout(&format!("Qiniu stat of {key}"), 60, move || {
+        let manager = ObjectsManager::new(credential(&config, &secret));
+        match manager.bucket(&config.bucket).stat_object(&key_owned).call() {
+            Ok(response) => Ok(Some(response.into_body().get_size_as_u64())),
+            Err(error) if matches!(
+                error.kind(),
+                ResponseErrorKind::StatusCodeError(status) if status.as_u16() == 612 || status.as_u16() == 404
+            ) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    })
+    .await
 }
 
 fn device_id(connection: &rusqlite::Connection) -> Result<String, String> {
@@ -671,18 +722,38 @@ async fn upload_device_state<R: Runtime>(
     upload_bytes(app, config, secret, &format!("{PREFIX}/devices/{device}.json"), &serde_json::to_vec(&state).unwrap()).await
 }
 
-fn list_device_keys(config: &QiniuSyncConfig, secret: &str) -> Result<Vec<String>, String> {
-    let manager = ObjectsManager::new(credential(config, secret));
-    let bucket = manager.bucket(&config.bucket);
-    let mut keys = Vec::new();
-    for entry in bucket.list().iter() {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let key = entry.get_key_as_str();
-        if key.starts_with(&format!("{PREFIX}/devices/")) && key.ends_with(".json") {
-            keys.push(key.to_string());
+async fn delete_object(config: &QiniuSyncConfig, secret: &str, key: &str) -> Result<(), String> {
+    let config = config.clone();
+    let secret = secret.to_string();
+    let key_owned = key.to_string();
+    run_blocking_timeout(&format!("Qiniu delete of {key}"), 60, move || {
+        ObjectsManager::new(credential(&config, &secret))
+            .bucket(&config.bucket)
+            .delete_object(&key_owned)
+            .call()
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    })
+    .await
+}
+
+async fn list_device_keys(config: &QiniuSyncConfig, secret: &str) -> Result<Vec<String>, String> {
+    let config = config.clone();
+    let secret = secret.to_string();
+    run_blocking_timeout("Qiniu device list", 60, move || {
+        let manager = ObjectsManager::new(credential(&config, &secret));
+        let bucket = manager.bucket(&config.bucket);
+        let mut keys = Vec::new();
+        for entry in bucket.list().iter() {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let key = entry.get_key_as_str();
+            if key.starts_with(&format!("{PREFIX}/devices/")) && key.ends_with(".json") {
+                keys.push(key.to_string());
+            }
         }
-    }
-    Ok(keys)
+        Ok(keys)
+    })
+    .await
 }
 
 async fn pull_remote<R: Runtime>(
@@ -690,7 +761,7 @@ async fn pull_remote<R: Runtime>(
     config: &QiniuSyncConfig,
     secret: &str,
 ) -> Result<usize, String> {
-    let keys = list_device_keys(config, secret)?;
+    let keys = list_device_keys(config, secret).await?;
     let mut applied = 0;
     for key in keys {
         let state: DeviceState = serde_json::from_slice(&download_bytes(config, secret, &key).await?)
@@ -708,7 +779,7 @@ async fn pull_remote<R: Runtime>(
         };
         for seq in (current + 1)..=state.latest_batch_seq {
             let batch_key = format!("{PREFIX}/changes/{}/{seq:020}.json.gz", state.device_id);
-            let (put_time, _, _) = stat_object(config, secret, &batch_key)?;
+            let (put_time, _, _) = stat_object(config, secret, &batch_key).await?;
             let batch: CloudBatch = ungzip_json(&download_bytes(config, secret, &batch_key).await?)?;
             if batch.protocol_version != PROTOCOL_VERSION || batch.device_id != state.device_id || batch.batch_seq != seq {
                 return Err(format!("Invalid cloud batch {batch_key}"));
@@ -792,11 +863,10 @@ pub async fn qiniu_test_sync_connection<R: Runtime>(app: AppHandle<R>) -> Result
         .await
         .map_err(|error| format!("Qiniu connection test failed during test-object upload: {error}"))?;
     stat_object(&config, &secret, &key)
+        .await
         .map_err(|error| format!("Qiniu connection test uploaded the object, but Stat failed: {error}"))?;
-    ObjectsManager::new(credential(&config, &secret))
-        .bucket(&config.bucket)
-        .delete_object(&key)
-        .call()
+    delete_object(&config, &secret, &key)
+        .await
         .map_err(|error| format!("Qiniu connection test uploaded and verified the object, but cleanup deletion failed: {error}"))?;
     Ok(())
 }
@@ -835,10 +905,32 @@ pub async fn qiniu_upload_blob<R: Runtime>(
     let config = load_config(&app)?;
     let secret = load_secret(&config)?;
     let key = format!("{PREFIX}/blobs/sha256/{expected}");
-    if !object_exists(&config, &secret, &key) {
+    if !object_exists(&config, &secret, &key).await {
         upload_bytes(&app, &config, &secret, &key, &bytes).await?;
     }
     Ok(())
+}
+
+/// Checks a content-addressed blob without transferring any file bytes.
+/// A missing object is a normal result; authentication, timeout, region and
+/// other service failures remain errors so callers never mistake an outage for
+/// a reason to read and re-upload the whole local library.
+#[tauri::command]
+pub async fn qiniu_object_exists<R: Runtime>(
+    app: AppHandle<R>,
+    sha256: String,
+) -> Result<QiniuObjectStat, String> {
+    let expected = sha256.trim().to_ascii_lowercase();
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Expected a 64-character SHA-256 value.".to_string());
+    }
+    let config = load_config(&app)?;
+    let secret = load_secret(&config)?;
+    let key = format!("{PREFIX}/blobs/sha256/{expected}");
+    match stat_object_if_exists(&config, &secret, &key).await? {
+        Some(size) => Ok(QiniuObjectStat { exists: true, size: Some(size) }),
+        None => Ok(QiniuObjectStat { exists: false, size: None }),
+    }
 }
 
 #[tauri::command]
@@ -862,14 +954,10 @@ pub async fn qiniu_delete_blob<R: Runtime>(app: AppHandle<R>, sha256: String) ->
     let config = load_config(&app)?;
     let secret = load_secret(&config)?;
     let key = format!("{PREFIX}/blobs/sha256/{}", sha256.trim().to_ascii_lowercase());
-    if !object_exists(&config, &secret, &key) {
+    if !object_exists(&config, &secret, &key).await {
         return Ok(());
     }
-    ObjectsManager::new(credential(&config, &secret))
-        .bucket(&config.bucket)
-        .delete_object(&key)
-        .call()
-        .map_err(|error| error.to_string())?;
+    delete_object(&config, &secret, &key).await?;
     Ok(())
 }
 
@@ -884,17 +972,17 @@ pub async fn qiniu_sync_library<R: Runtime>(app: AppHandle<R>) -> Result<SyncSum
     };
     // A fixed, identical protocol object makes concurrent first-device setup idempotent.
     let protocol_key = format!("{PREFIX}/protocol.json");
-    if !object_exists(&config, &secret, &protocol_key) {
+    if !object_exists(&config, &secret, &protocol_key).await {
         upload_bytes(&app, &config, &secret, &protocol_key, br#"{"protocolVersion":1}"#).await?;
     }
     let mut summary = SyncSummary::default();
     let _ = app.emit("qiniu-sync-stage", "Uploading local changes to Qiniu…");
     while let Some((seq, body, rows)) = seal_batch(&app, &device)? {
         let key = format!("{PREFIX}/changes/{device}/{seq:020}.json.gz");
-        if !object_exists(&config, &secret, &key) {
+        if !object_exists(&config, &secret, &key).await {
             upload_bytes(&app, &config, &secret, &key, &body).await?;
         }
-        let (put_time, _, _) = stat_object(&config, &secret, &key)?;
+        let (put_time, _, _) = stat_object(&config, &secret, &key).await?;
         upload_device_state(&app, &config, &secret, &device, seq).await?;
         confirm_local_batch(&app, &device, seq, put_time, &rows)?;
         summary.uploaded_changes += rows.len();

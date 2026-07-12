@@ -61,6 +61,7 @@ import {
   saveFileStorageSettings,
   type FileStorageSettings
 } from "./lib/fileStorage";
+import { cleanupDuplicateDownloads, scanDuplicateDownloads, type CleanupDuplicateSummary } from "./lib/cleanupDuplicates";
 import { FileStorageSettingsModal } from "./components/FileStorageSettingsModal";
 import { MendeleySyncModal } from "./components/MendeleySyncModal";
 import { ProxySettingsModal } from "./components/ProxySettingsModal";
@@ -1547,6 +1548,41 @@ export default function App() {
     }
   }
 
+  async function handleCleanupDuplicates(): Promise<CleanupDuplicateSummary | undefined> {
+    if (!fileStorageSettings.directory) {
+      setStatus("No file storage folder configured.");
+      return undefined;
+    }
+    setFileStorageBusy(true);
+    try {
+      const scan = await scanDuplicateDownloads(fileStorageSettings);
+      if (scan.errors.some((error) => error.includes("No file storage folder"))) {
+        setStatus("No file storage folder configured.");
+        return scan;
+      }
+      if (scan.duplicateGroups.length === 0) {
+        setStatus(`Scanned ${scan.totalFilesScanned} PDFs — no duplicate files found.`);
+        return scan;
+      }
+      const confirmed = window.confirm(
+        `Found ${scan.duplicateGroups.length} duplicate group(s) with ${scan.filesRemoved} excess file(s) (${formatFileSize(scan.bytesFreed)}).\n\nRemove the extra copies and update library records?`
+      );
+      if (!confirmed) {
+        return scan;
+      }
+      const result = await cleanupDuplicateDownloads(fileStorageSettings);
+      setStatus(
+        `Removed ${result.filesRemoved} duplicate file(s), freed ${formatFileSize(result.bytesFreed)}, updated ${result.libraryRecordsUpdated} library record(s).`
+      );
+      return result;
+    } catch (error) {
+      setStatus(`Duplicate cleanup failed: ${error}`);
+      return undefined;
+    } finally {
+      setFileStorageBusy(false);
+    }
+  }
+
   async function handleSaveSyncSettings(nextSettings: SyncSettings) {
     setSyncSettingsBusy(true);
     setStatus(undefined);
@@ -1840,6 +1876,7 @@ export default function App() {
               fileData={selectedFileData}
               hasLocalPdf={selectedHasLocalPdf}
               annotations={selectedAnnotations}
+              fileStorageSettings={fileStorageSettings}
               onUpdatePaper={handleUpdatePaper}
               arxivDownloadBusy={arxivDownloadBusy}
               onDownloadArxiv={(paperId, onProgress) => handleDownloadArxivFiles(paperId, onProgress)}
@@ -1909,6 +1946,7 @@ export default function App() {
         busy={fileStorageBusy}
         onClose={() => setFileStorageModalOpen(false)}
         onSave={(nextSettings) => void handleSaveFileStorageSettings(nextSettings)}
+        onCleanupDuplicates={() => handleCleanupDuplicates()}
       />
       <MendeleySyncModal
         open={mendeleySyncOpen}

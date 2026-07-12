@@ -1,9 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { ArxivMetadata, CloudSyncConfig, CloudSyncSummary, LibraryState } from "@lumora/shared";
 import { loadLibraryFromDb, persistEntities } from "./libraryDb";
-import { loadFileStorageSettings, readFileBytes, storePdfToDisk } from "./fileStorage";
+import { getStoredPdfMetadata, loadFileStorageSettings, readFileBytes, storePdfToDisk } from "./fileStorage";
 import { putFileBlob } from "./localStore";
-import { downloadMissingArxivFiles, normalizeArxivId } from "./arxivFiles";
+import { normalizeArxivId } from "./arxivFiles";
 
 export type SyncSettings = CloudSyncConfig & {
   /** Entered only while saving; Rust stores it in the system keychain. */
@@ -34,6 +34,44 @@ export const defaultAutoSyncSettings: AutoSyncSettings = {
   enabled: true,
   intervalMinutes: defaultAutoSyncIntervalMinutes
 };
+
+type QiniuObjectStat = { exists: boolean; size?: number };
+type VerifiedLocalFile = {
+  sha256: string;
+  storage: "disk" | "indexedDb";
+  path?: string;
+  size: number;
+  modifiedMs?: number;
+};
+
+const verifiedLocalFilesKey = "lumora:qiniu-verified-local-files-v1";
+const sha256Pattern = /^[a-f0-9]{64}$/i;
+
+function loadVerifiedLocalFiles(): Record<string, VerifiedLocalFile> {
+  try {
+    return JSON.parse(localStorage.getItem(verifiedLocalFilesKey) ?? "{}") as Record<string, VerifiedLocalFile>;
+  } catch {
+    return {};
+  }
+}
+
+function saveVerifiedLocalFiles(files: Record<string, VerifiedLocalFile>) {
+  try {
+    localStorage.setItem(verifiedLocalFilesKey, JSON.stringify(files));
+  } catch {
+    // Verification is only an optimization. A full read next time is safe.
+  }
+}
+
+async function mapWithConcurrency<T>(items: T[], concurrency: number, task: (item: T) => Promise<void>) {
+  let cursor = 0;
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (cursor < items.length) {
+      const item = items[cursor++];
+      await task(item);
+    }
+  }));
+}
 
 export function normalizeAutoSyncInterval(value: unknown): number {
   const minutes = Math.round(Number(value));
@@ -106,6 +144,53 @@ export async function syncLibrary(
     return !(arxivId && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName)));
   }).length;
   let uploadedBlobs = 0;
+  let uploadedFileOk = 0;
+  let consecutiveFailures = 0;
+  const uploadErrors: string[] = [];
+
+  // A successful content hash is cached against device-local file metadata.
+  // Only an unchanged local file may use its recorded SHA for the cheap cloud
+  // Stat path; otherwise the full file is read and hashed below.
+  const verifiedLocalFiles = loadVerifiedLocalFiles();
+  const preflight = new Map<string, QiniuObjectStat>();
+  const statPromises = new Map<string, Promise<QiniuObjectStat>>();
+  const ordinaryFiles = prepared.fileAssets.filter((file) => {
+    if (file.deletedAt) return false;
+    const paper = paperById.get(file.paperId);
+    const arxivId = paper?.arxiv ? normalizeArxivId(paper.arxiv) : undefined;
+    return !(arxivId && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName)));
+  });
+  await mapWithConcurrency(ordinaryFiles, 6, async (file) => {
+    const sha256 = file.sha256.trim().toLowerCase();
+    if (!sha256Pattern.test(sha256)
+      || file.contentRef?.kind !== "object"
+      || file.contentRef.sha256.toLowerCase() !== sha256) return;
+
+    const verified = verifiedLocalFiles[file.id];
+    if (!verified || verified.sha256 !== sha256 || verified.size !== file.size) return;
+    if (file.localPath && storage.directory) {
+      if (verified.storage !== "disk" || verified.path !== file.localPath) return;
+      try {
+        const metadata = await getStoredPdfMetadata(storage.directory, file.localPath);
+        if (metadata.size !== verified.size || metadata.modifiedMs !== verified.modifiedMs) return;
+      } catch {
+        return;
+      }
+    } else if (verified.storage !== "indexedDb") {
+      return;
+    }
+
+    let request = statPromises.get(sha256);
+    if (!request) {
+      request = invoke<QiniuObjectStat>("qiniu_object_exists", { sha256 });
+      statPromises.set(sha256, request);
+    }
+    const stat = await request;
+    if (stat.exists && stat.size !== file.size) {
+      throw new Error(`Cloud blob ${sha256} has size ${stat.size ?? "unknown"}, expected ${file.size}; refusing to trust it.`);
+    }
+    preflight.set(file.id, stat);
+  });
 
   for (const file of prepared.fileAssets) {
     if (file.deletedAt) {
@@ -116,40 +201,20 @@ export async function syncLibrary(
     const arxivId = paper?.arxiv ? normalizeArxivId(paper.arxiv) : undefined;
     if (arxivId && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName))) {
       if (file.contentRef?.kind === "object") promotedObjectHashes.add(file.contentRef.sha256);
-      let next = file;
-      if (file.contentRef?.kind !== "arxiv" || file.contentRef.arxivId !== arxivId) {
-        const arxivBuffer = await invoke<ArrayBuffer>("download_arxiv_pdf_silent", { arxivId });
-        const arxivBytes = new Uint8Array(arxivBuffer);
-        const arxivSha = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", arxivBytes)),
-          (byte) => byte.toString(16).padStart(2, "0")).join("");
-        if (arxivSha !== file.sha256) {
-          const confirmed = window.confirm(
-            `The local PDF for “${paper?.title ?? file.fileName}” differs from arXiv:${arxivId}. `
-            + "Switching can detach existing highlight coordinates. Replace the local PDF and use arXiv anyway?"
-          );
-          if (!confirmed) {
-            promotedObjectHashes.delete(file.contentRef?.kind === "object" ? file.contentRef.sha256 : "");
-            nextFiles.push(file);
-            continue;
-          }
-          let localPath: string | undefined;
-          if (storage.directory) {
-            localPath = await storePdfToDisk(storage.directory, file.fileName, arxivBytes);
-          } else {
-            await putFileBlob(file.id, new Blob([arxivBytes], { type: "application/pdf" }));
-          }
-          next = { ...file, sha256: arxivSha, size: arxivBytes.length, localPath, downloadState: "local" };
-        }
-        next = {
-          ...next,
-          contentRef: { kind: "arxiv" as const, arxivId },
-          updatedAt: new Date().toISOString()
-        };
-      }
-      nextFiles.push(next);
+      nextFiles.push(file.contentRef?.kind === "arxiv" && file.contentRef.arxivId === arxivId
+        ? file
+        : { ...file, contentRef: { kind: "arxiv" as const, arxivId }, updatedAt: new Date().toISOString() });
       continue;
     }
 
+    if (preflight.get(file.id)?.exists) {
+      nextFiles.push(file);
+      continue;
+    }
+
+    const diskMetadataBefore = file.localPath && storage.directory
+      ? await getStoredPdfMetadata(storage.directory, file.localPath).catch(() => undefined)
+      : undefined;
     const bytes = await readFileBytes(file, storage);
     if (bytes?.length) {
       uploadedBlobs += 1;
@@ -162,19 +227,48 @@ export async function syncLibrary(
       const buffer = new Uint8Array(bytes).buffer as ArrayBuffer;
       const sha256 = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", buffer)),
         (byte) => byte.toString(16).padStart(2, "0")).join("");
+      if (file.localPath && storage.directory && diskMetadataBefore) {
+        const metadataAfter = await getStoredPdfMetadata(storage.directory, file.localPath).catch(() => undefined);
+        if (metadataAfter
+          && metadataAfter.size === diskMetadataBefore.size
+          && metadataAfter.modifiedMs === diskMetadataBefore.modifiedMs) {
+          verifiedLocalFiles[file.id] = {
+            sha256, storage: "disk", path: file.localPath,
+            size: metadataAfter.size, modifiedMs: metadataAfter.modifiedMs
+          };
+          saveVerifiedLocalFiles(verifiedLocalFiles);
+        }
+      } else if (!file.localPath || !storage.directory) {
+        verifiedLocalFiles[file.id] = { sha256, storage: "indexedDb", size: bytes.length };
+        saveVerifiedLocalFiles(verifiedLocalFiles);
+      }
       try {
         await invoke<void>("qiniu_upload_blob", buffer, {
           headers: { "x-lumora-sha256": sha256 }
         });
       } catch (error) {
+        // One bad file must not abort the whole library sync. Record it, keep
+        // the file unchanged, and move on — but bail out fast if uploads fail
+        // systemically (e.g. a wrong region) instead of grinding through
+        // hundreds of doomed attempts.
         const detail = error instanceof Error ? error.message : String(error);
-        throw new Error(`Failed to upload “${file.fileName}”${file.localPath ? ` (${file.localPath})` : ""}: ${detail}`);
+        uploadErrors.push(`${file.fileName}: ${detail}`);
+        consecutiveFailures += 1;
+        if (consecutiveFailures >= 5) {
+          throw new Error(`Cloud sync aborted after ${consecutiveFailures} consecutive upload failures. Latest — ${file.fileName}: ${detail}`);
+        }
+        nextFiles.push(file);
+        continue;
       }
-      nextFiles.push(
-        file.sha256 === sha256 && file.contentRef?.kind === "object" && file.contentRef.sha256 === sha256
-          ? file
-          : { ...file, sha256, size: bytes.length, contentRef: { kind: "object" as const, sha256 }, updatedAt: new Date().toISOString() }
-      );
+      consecutiveFailures = 0;
+      uploadedFileOk += 1;
+      const healed = file.sha256 === sha256 && file.contentRef?.kind === "object" && file.contentRef.sha256 === sha256
+        ? file
+        : { ...file, sha256, size: bytes.length, contentRef: { kind: "object" as const, sha256 }, updatedAt: new Date().toISOString() };
+      // Persist each heal immediately so a crash or app close mid-sync keeps the
+      // progress instead of re-uploading everything on the next run.
+      if (healed !== file) await persistEntities([{ entityType: "fileAsset" as const, entity: healed }]);
+      nextFiles.push(healed);
       continue;
     }
     nextFiles.push(file.contentRef?.kind === "object"
@@ -191,6 +285,8 @@ export async function syncLibrary(
 
   onStage?.("Syncing changes with Qiniu…", 2, 5);
   const summary = await invoke<CloudSyncSummary>("qiniu_sync_library");
+  summary.uploadedFiles += uploadedFileOk;
+  summary.errors.push(...uploadErrors);
   let { state } = await loadLibraryFromDb();
 
   // macOS keeps a complete local mirror. Device-local path/status changes are
@@ -218,16 +314,9 @@ export async function syncLibrary(
     state = { ...state, fileAssets: downloadedFiles };
   }
 
-  onStage?.("Downloading arXiv PDFs…", 4, 5);
-  const arxiv = await downloadMissingArxivFiles(state, storage, { sleep: async (ms) => new Promise((resolve) => setTimeout(resolve, ms)) });
-  if (arxiv.downloaded > 0) {
-    await persistEntities(arxiv.state.fileAssets
-      .filter((file) => state.fileAssets.find((existing) => existing.id === file.id) !== file)
-      .map((entity) => ({ entityType: "fileAsset" as const, entity })), "remote");
-    state = arxiv.state;
-    summary.arxivDownloads += arxiv.downloaded;
-    summary.errors.push(...arxiv.failed.map((failure) => `arXiv:${failure.arxivId}: ${failure.error}`));
-  }
+  // Qiniu sync deliberately never contacts arXiv. Missing arXiv-backed PDFs
+  // remain metadata-only until the user invokes the separate download action.
+  onStage?.("Finalizing cloud references…", 4, 5);
 
   const referencedObjectHashes = new Set(state.fileAssets
     .filter((file) => !file.deletedAt && file.contentRef?.kind === "object")

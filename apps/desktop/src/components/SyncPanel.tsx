@@ -1,8 +1,10 @@
-import { DatabaseZap, Download, FileSearch, Search, Send, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { DatabaseZap, Download, ExternalLink, FileSearch, FolderOpen, Search, Send, Trash2 } from "lucide-react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Annotation, ArxivMetadata, FileAsset, Paper } from "@lumora/shared";
+import { invoke } from "@tauri-apps/api/core";
 import { searchArxivMetadata, type SyncSettings } from "../lib/syncClient";
 import { formatFileSize, type ArxivDownloadProgress } from "../lib/arxivFiles";
+import type { FileStorageSettings } from "../lib/fileStorage";
 
 type SyncPanelProps = {
   settings: SyncSettings;
@@ -11,6 +13,7 @@ type SyncPanelProps = {
   fileData?: Uint8Array;
   hasLocalPdf: boolean;
   annotations: Annotation[];
+  fileStorageSettings: FileStorageSettings;
   onUpdatePaper: (paper: Paper) => void;
   arxivDownloadBusy: boolean;
   onDownloadArxiv: (paperId: string, onProgress: (progress: ArxivDownloadProgress) => void) => Promise<string>;
@@ -24,6 +27,7 @@ export function SyncPanel({
   fileData,
   hasLocalPdf,
   annotations,
+  fileStorageSettings,
   onUpdatePaper,
   arxivDownloadBusy,
   onDownloadArxiv,
@@ -50,6 +54,7 @@ export function SyncPanel({
           fileAsset={fileAsset}
           fileData={fileData}
           hasLocalPdf={hasLocalPdf}
+          fileStorageSettings={fileStorageSettings}
           onUpdatePaper={onUpdatePaper}
           arxivDownloadBusy={arxivDownloadBusy}
           onDownloadArxiv={onDownloadArxiv}
@@ -76,6 +81,7 @@ function DetailsTab({
   fileAsset,
   fileData,
   hasLocalPdf,
+  fileStorageSettings,
   onUpdatePaper,
   arxivDownloadBusy,
   onDownloadArxiv
@@ -85,6 +91,7 @@ function DetailsTab({
   fileAsset?: FileAsset;
   fileData?: Uint8Array;
   hasLocalPdf: boolean;
+  fileStorageSettings: FileStorageSettings;
   onUpdatePaper: (paper: Paper) => void;
   arxivDownloadBusy: boolean;
   onDownloadArxiv: (paperId: string, onProgress: (progress: ArxivDownloadProgress) => void) => Promise<string>;
@@ -97,6 +104,69 @@ function DetailsTab({
   const [arxivDownloadProgress, setArxivDownloadProgress] = useState<ArxivDownloadProgress>();
   const [pdfMetadataStatus, setPdfMetadataStatus] = useState<string>();
   const [pdfMetadataBusy, setPdfMetadataBusy] = useState(false);
+  const [fileContextMenu, setFileContextMenu] = useState<{ x: number; y: number } | undefined>(undefined);
+  const [fileContextMenuStyle, setFileContextMenuStyle] = useState<{ left: number; top: number } | undefined>(undefined);
+  const fileContextMenuRef = useRef<HTMLDivElement>(null);
+
+  // Clamp context menu position so it never overflows the viewport
+  useLayoutEffect(() => {
+    const menu = fileContextMenuRef.current;
+    if (!menu || !fileContextMenu) {
+      setFileContextMenuStyle(undefined);
+      return;
+    }
+    const rect = menu.getBoundingClientRect();
+    const pad = 4;
+    const left = Math.min(fileContextMenu.x, window.innerWidth - rect.width - pad);
+    const top = Math.min(fileContextMenu.y, window.innerHeight - rect.height - pad);
+    setFileContextMenuStyle({ left: Math.max(pad, left), top: Math.max(pad, top) });
+  }, [fileContextMenu]);
+
+  // Close context menu on any click, keydown, or scroll
+  useEffect(() => {
+    if (!fileContextMenu) return;
+    const close = () => setFileContextMenu(undefined);
+    window.addEventListener("click", close);
+    window.addEventListener("keydown", close);
+    window.addEventListener("scroll", close, true);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("keydown", close);
+      window.removeEventListener("scroll", close, true);
+    };
+  }, [fileContextMenu]);
+
+  function handleFileContextMenu(event: React.MouseEvent) {
+    event.preventDefault();
+    setFileContextMenu({ x: event.clientX, y: event.clientY });
+  }
+
+  function getAbsolutePath(): string | undefined {
+    if (!fileAsset?.localPath || !fileStorageSettings.directory) return undefined;
+    return `${fileStorageSettings.directory}/${fileAsset.localPath}`;
+  }
+
+  async function handleOpenFileExternally() {
+    const absPath = getAbsolutePath();
+    if (!absPath) return;
+    try {
+      await invoke("open_file_with_system", { filePath: absPath });
+    } catch (error) {
+      console.error("Failed to open file:", error);
+    }
+    setFileContextMenu(undefined);
+  }
+
+  async function handleRevealFileInFolder() {
+    const absPath = getAbsolutePath();
+    if (!absPath) return;
+    try {
+      await invoke("reveal_file_in_folder", { filePath: absPath });
+    } catch (error) {
+      console.error("Failed to reveal file:", error);
+    }
+    setFileContextMenu(undefined);
+  }
 
   if (!paper) {
     return <p className="inspector-empty">No document selected.</p>;
@@ -337,7 +407,37 @@ function DetailsTab({
           Favorite
         </label>
       </div>
-      <p className="details-file">File: {fileAsset?.fileName ?? "No file attached"}</p>
+      <p
+        className={`details-file ${fileAsset?.localPath ? "has-local-file" : ""}`}
+        onContextMenu={fileAsset?.localPath ? handleFileContextMenu : undefined}
+        title={fileAsset?.localPath ? "Right-click for options" : undefined}
+      >
+        File: {fileAsset?.fileName ?? "No file attached"}
+      </p>
+
+      {fileContextMenu && (
+        <div
+          ref={fileContextMenuRef}
+          className="paper-context-menu"
+          style={{
+            left: fileContextMenuStyle?.left ?? fileContextMenu.x,
+            top: fileContextMenuStyle?.top ?? fileContextMenu.y,
+            visibility: fileContextMenuStyle ? "visible" : "hidden"
+          }}
+          role="menu"
+          onClick={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <button type="button" role="menuitem" onClick={() => void handleOpenFileExternally()}>
+            <ExternalLink size={15} />
+            <span>Open Externally</span>
+          </button>
+          <button type="button" role="menuitem" onClick={() => void handleRevealFileInFolder()}>
+            <FolderOpen size={15} />
+            <span>Show in Folder</span>
+          </button>
+        </div>
+      )}
     </div>
   );
 }

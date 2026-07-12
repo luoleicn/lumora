@@ -2,7 +2,7 @@
   "name": "lumora",
   "version": "0.1.0",
   "private": true,
-  "description": "lumora — light up your literature.",
+  "description": "lumora — light up your literature. Local-first desktop research literature manager.",
   "type": "module",
   "workspaces": [
     "apps/*",

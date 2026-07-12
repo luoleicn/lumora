@@ -2182,6 +2182,10 @@ body.paper-pointer-dragging * {
   line-height: 1.45;
 }
 
+.details-file.has-local-file {
+  cursor: context-menu;
+}
+
 .details-abstract,
 .inspector-empty {
   margin: 0;

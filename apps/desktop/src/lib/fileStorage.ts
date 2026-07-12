@@ -104,6 +104,12 @@ export async function readPdfFromDisk(directory: string, fileName: string): Prom
   return new Uint8Array(buffer);
 }
 
+export type StoredFileMetadata = { size: number; modifiedMs: number };
+
+export async function getStoredPdfMetadata(directory: string, fileName: string): Promise<StoredFileMetadata> {
+  return invoke<StoredFileMetadata>("stored_pdf_metadata", { dir: directory, fileName });
+}
+
 export async function listStoredPdfs(directory: string): Promise<string[]> {
   return invoke<string[]>("list_stored_pdfs", { dir: directory });
 }

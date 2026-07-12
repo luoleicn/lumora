@@ -34,14 +34,25 @@ always available. There is no edit-debounce sync.
 
 Device-local paths and availability never enter cloud batches. Ordinary files
 are addressed by SHA-256 and mirrored to macOS. A paper with an arXiv ID stores
-the pinned ID including `vN`; its PDF is not uploaded. Missing arXiv PDFs are
-downloaded during reconciliation and verified before being made visible.
+the pinned ID including `vN`; its PDF is not uploaded. Qiniu sync never contacts
+arXiv: missing arXiv PDFs remain metadata-only until the user explicitly runs
+the separate arXiv download action.
 
 Annotations carry the SHA-256 of the PDF they were created against. Coordinates
 are not drawn when the current file has another fingerprint, although the note
 and quote remain available for recovery. When a former object-backed PDF moves
 to arXiv, the old blob is deleted only if no other active FileAsset references
 the same hash.
+
+To avoid repeatedly reading the user's whole PDF library, the desktop keeps a
+device-local verification fingerprint (path, size, modification time, and the
+last computed SHA-256). An unchanged file is checked with a Qiniu Stat request;
+its bytes are read and hashed only when the object is missing or the local
+fingerprint changed. Stats are deduplicated by SHA-256 and run with bounded
+concurrency. A missing-object response is distinct from authentication,
+timeout, region, and other service errors, so an outage cannot trigger a full
+local-library scan. Uploads still verify SHA-256 before transfer and Stat the
+stored size afterwards.
 
 ## Security and operational limits
 

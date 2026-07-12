@@ -1,8 +1,9 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { FolderOpen, Save, X } from "lucide-react";
+import { FolderOpen, Save, Trash2, X } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { Paper } from "@lumora/shared";
 import { buildPdfFileName, defaultNameTemplate, type FileStorageSettings } from "../lib/fileStorage";
+import type { CleanupDuplicateSummary } from "../lib/cleanupDuplicates";
 
 type FileStorageSettingsModalProps = {
   open: boolean;
@@ -11,6 +12,7 @@ type FileStorageSettingsModalProps = {
   busy: boolean;
   onClose: () => void;
   onSave: (settings: FileStorageSettings) => void;
+  onCleanupDuplicates?: () => Promise<CleanupDuplicateSummary | undefined>;
 };
 
 export function FileStorageSettingsModal({
@@ -19,10 +21,13 @@ export function FileStorageSettingsModal({
   previewPaper,
   busy,
   onClose,
-  onSave
+  onSave,
+  onCleanupDuplicates
 }: FileStorageSettingsModalProps) {
   const [directory, setDirectory] = useState<string>();
   const [nameTemplate, setNameTemplate] = useState(defaultNameTemplate);
+  const [cleanupScanning, setCleanupScanning] = useState(false);
+  const [cleanupResult, setCleanupResult] = useState<CleanupDuplicateSummary>();
 
   useEffect(() => {
     if (isOpen) {
@@ -133,6 +138,52 @@ export function FileStorageSettingsModal({
               Saving moves every stored PDF into this folder with the template name. Metadata edits rename files automatically.
             </p>
           )}
+
+          {directory && onCleanupDuplicates && (
+            <div className="file-storage-cleanup-section">
+              <hr />
+              <label>Duplicate File Cleanup</label>
+              <p className="file-storage-hint">
+                Find PDF files in this folder that have identical content (same SHA&#8209;256)
+                and remove the extra copies, keeping one per group. Library records are
+                updated automatically.
+              </p>
+              {cleanupResult ? (
+                <div className="cleanup-result">
+                  <p>
+                    {cleanupResult.duplicateGroups.length === 0
+                      ? "No duplicate files found."
+                      : `Found ${cleanupResult.duplicateGroups.length} duplicate group${cleanupResult.duplicateGroups.length === 1 ? "" : "s"}
+                         (${cleanupResult.filesRemoved} excess file${cleanupResult.filesRemoved === 1 ? "" : "s"},
+                         ${formatCleanupBytes(cleanupResult.bytesFreed)}).`}
+                  </p>
+                  {cleanupResult.errors.length > 0 && (
+                    <p className="cleanup-errors">
+                      {cleanupResult.errors.map((e, i) => <span key={i}>{e}</span>)}
+                    </p>
+                  )}
+                </div>
+              ) : null}
+              <button
+                type="button"
+                className="cleanup-duplicates-button"
+                disabled={cleanupScanning}
+                onClick={async () => {
+                  setCleanupScanning(true);
+                  setCleanupResult(undefined);
+                  try {
+                    const summary = await onCleanupDuplicates();
+                    setCleanupResult(summary);
+                  } finally {
+                    setCleanupScanning(false);
+                  }
+                }}
+              >
+                <Trash2 size={15} />
+                {cleanupScanning ? "Scanning…" : cleanupResult ? "Re-scan" : "Find & Remove Duplicate Files"}
+              </button>
+            </div>
+          )}
         </div>
 
         <footer>
@@ -147,4 +198,11 @@ export function FileStorageSettingsModal({
       </form>
     </div>
   );
+}
+
+function formatCleanupBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }

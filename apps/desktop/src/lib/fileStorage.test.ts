@@ -15,7 +15,7 @@ vi.mock("./localStore", () => ({
 }));
 vi.mock("./libraryDb", () => ({ persistEntities: (...args: unknown[]) => persistEntitiesMock(...args) }));
 
-import { buildPdfFileName, defaultNameTemplate, fileNameMatchesTarget, reconcileFileStorage } from "./fileStorage";
+import { buildPdfFileName, defaultNameTemplate, fileNameMatchesTarget, getStoredPdfMetadata, reconcileFileStorage } from "./fileStorage";
 
 const now = "2026-07-10T00:00:00.000Z";
 
@@ -78,6 +78,19 @@ describe("fileNameMatchesTarget", () => {
   it("rejects different names", () => {
     expect(fileNameMatchesTarget("b-2017.pdf", "a-2017.pdf")).toBe(false);
     expect(fileNameMatchesTarget("a-2018.pdf", "a-2017.pdf")).toBe(false);
+  });
+});
+
+describe("getStoredPdfMetadata", () => {
+  it("stats a stored PDF without reading its bytes", async () => {
+    invokeMock.mockResolvedValue({ size: 42, modifiedMs: 1234 });
+
+    await expect(getStoredPdfMetadata("/library", "paper.pdf"))
+      .resolves.toEqual({ size: 42, modifiedMs: 1234 });
+    expect(invokeMock).toHaveBeenCalledWith("stored_pdf_metadata", {
+      dir: "/library",
+      fileName: "paper.pdf"
+    });
   });
 });
 
