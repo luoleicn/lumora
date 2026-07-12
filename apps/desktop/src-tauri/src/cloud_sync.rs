@@ -13,7 +13,7 @@ use std::{
     path::PathBuf,
     time::Duration,
 };
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use sha2::{Digest, Sha256};
 
 const CONFIG_META_KEY: &str = "qiniuSyncConfigV1";
@@ -224,29 +224,61 @@ async fn upload_bytes<R: Runtime>(
     bytes: &[u8],
 ) -> Result<(), String> {
     let path = upload_temp_path(app, &format!("{}.upload", uuid::Uuid::new_v4()), bytes)?;
-    let key = key.to_string();
+    let object_key = key.to_string();
     let upload_path = path.clone();
     let bucket = config.bucket.clone();
     let access_key = config.access_key.clone();
-    let secret = secret.to_string();
-    let upload_result = tauri::async_runtime::spawn_blocking(move || {
-        let manager = UploadManager::builder(UploadTokenSigner::new_credential_provider(
-            Credential::new(access_key, secret),
-            bucket,
-            Duration::from_secs(3600),
-        ))
-        .build();
-        let params = AutoUploaderObjectParams::builder()
-            .object_name(key.clone())
-            .file_name(key)
+    let secret_owned = secret.to_string();
+    let upload_handle = tauri::async_runtime::spawn_blocking({
+        let object_key = object_key.clone();
+        move || {
+            let manager = UploadManager::builder(UploadTokenSigner::new_credential_provider(
+                Credential::new(access_key, secret_owned),
+                bucket,
+                Duration::from_secs(3600),
+            ))
             .build();
-        let uploader: AutoUploader = manager.auto_uploader();
-        uploader.upload_path(&upload_path, params).map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())?;
+            let params = AutoUploaderObjectParams::builder()
+                .object_name(object_key.clone())
+                .file_name(object_key)
+                .build();
+            let uploader: AutoUploader = manager.auto_uploader();
+            uploader.upload_path(&upload_path, params).map_err(|error| error.to_string())
+        }
+    });
+    // The Qiniu SDK's blocking uploader has no timeout of its own; without this a
+    // stalled region query or upload connection hangs the whole sync forever.
+    let upload_result = match tokio::time::timeout(Duration::from_secs(120), upload_handle).await {
+        Err(_) => {
+            let _ = std::fs::remove_file(&path);
+            return Err(format!(
+                "Qiniu upload of {object_key} timed out after 120s — the upload host did not respond. \
+                 Check the bucket's region and any required network proxy."
+            ));
+        }
+        Ok(joined) => joined.map_err(|error| error.to_string())?,
+    };
     let _ = std::fs::remove_file(path);
-    upload_result.map(|_| ())
+    upload_result.map_err(|error| format!("Qiniu upload of {object_key} failed: {error}"))?;
+
+    // Qiniu Kodo is strongly consistent, so a freshly uploaded object must be
+    // immediately stat-able. When it is not, the PUT was accepted upstream but
+    // nothing actually landed in the bucket — surface that instead of reporting
+    // success, which would otherwise mark the file as synced while other devices
+    // can never download it.
+    let (_, _, stored_size) = stat_object(config, secret, &object_key).map_err(|error| {
+        format!(
+            "Qiniu accepted the upload of {object_key} but the object is missing afterwards ({error}). \
+             Verify the bucket name and that its region matches this account."
+        )
+    })?;
+    if stored_size != bytes.len() as u64 {
+        return Err(format!(
+            "Qiniu stored {stored_size} bytes for {object_key} but {} were uploaded.",
+            bytes.len()
+        ));
+    }
+    Ok(())
 }
 
 fn private_url(config: &QiniuSyncConfig, secret: &str, key: &str) -> Result<String, String> {
@@ -268,7 +300,16 @@ fn private_url(config: &QiniuSyncConfig, secret: &str, key: &str) -> Result<Stri
 }
 
 async fn download_bytes(config: &QiniuSyncConfig, secret: &str, key: &str) -> Result<Vec<u8>, String> {
-    let response = reqwest::get(private_url(config, secret, key)?)
+    // A stalled connection must fail fast rather than hang the whole sync
+    // forever, which would leave the UI stuck and block manual re-syncs.
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .get(private_url(config, secret, key)?)
+        .send()
         .await
         .map_err(|error| error.to_string())?;
     if !response.status().is_success() {
@@ -742,16 +783,21 @@ pub async fn qiniu_save_sync_config<R: Runtime>(
 
 #[tauri::command]
 pub async fn qiniu_test_sync_connection<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    let config = load_config(&app)?;
-    let secret = load_secret(&config)?;
+    let config = load_config(&app)
+        .map_err(|error| format!("Qiniu connection test failed while reading the saved configuration: {error}"))?;
+    let secret = load_secret(&config)
+        .map_err(|error| format!("Qiniu connection test failed while reading the Secret Key from Keychain: {error}"))?;
     let key = format!("{PREFIX}/connection-test-{}.json", uuid::Uuid::new_v4());
-    upload_bytes(&app, &config, &secret, &key, br#"{"ok":true}"#).await?;
-    stat_object(&config, &secret, &key)?;
+    upload_bytes(&app, &config, &secret, &key, br#"{"ok":true}"#)
+        .await
+        .map_err(|error| format!("Qiniu connection test failed during test-object upload: {error}"))?;
+    stat_object(&config, &secret, &key)
+        .map_err(|error| format!("Qiniu connection test uploaded the object, but Stat failed: {error}"))?;
     ObjectsManager::new(credential(&config, &secret))
         .bucket(&config.bucket)
         .delete_object(&key)
         .call()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("Qiniu connection test uploaded and verified the object, but cleanup deletion failed: {error}"))?;
     Ok(())
 }
 
@@ -842,6 +888,7 @@ pub async fn qiniu_sync_library<R: Runtime>(app: AppHandle<R>) -> Result<SyncSum
         upload_bytes(&app, &config, &secret, &protocol_key, br#"{"protocolVersion":1}"#).await?;
     }
     let mut summary = SyncSummary::default();
+    let _ = app.emit("qiniu-sync-stage", "Uploading local changes to Qiniu…");
     while let Some((seq, body, rows)) = seal_batch(&app, &device)? {
         let key = format!("{PREFIX}/changes/{device}/{seq:020}.json.gz");
         if !object_exists(&config, &secret, &key) {
@@ -856,6 +903,7 @@ pub async fn qiniu_sync_library<R: Runtime>(app: AppHandle<R>) -> Result<SyncSum
     // Ensure an empty/new device is discoverable too.
     let latest = next_batch_seq(&super::open_library_db(&app)?).saturating_sub(1);
     upload_device_state(&app, &config, &secret, &device, latest).await?;
+    let _ = app.emit("qiniu-sync-stage", "Fetching changes from other devices…");
     summary.downloaded_changes += pull_remote(&app, &config, &secret).await?;
     summary.downloaded_changes += apply_deferred_inbox(&app)?;
     let last_synced_at = now_iso();

@@ -25,6 +25,7 @@ import { NotebookPanel } from "./components/NotebookPanel";
 import { PaperList } from "./components/PaperList";
 import { PdfReader, type PdfReaderViewState } from "./components/PdfReader";
 import { SyncPanel } from "./components/SyncPanel";
+import { SyncSettingsModal } from "./components/SyncSettingsModal";
 import { createId } from "./lib/id";
 import {
   addPaperToCollection,
@@ -79,10 +80,13 @@ import { downloadMissingArxivFiles, formatFileSize, type ArxivDownloadProgress }
 import { defaultProxySettings, loadProxySettings, saveProxySettings, type ProxySettings } from "./lib/proxySettings";
 import {
   defaultSyncSettings,
+  loadAutoSyncSettings,
   loadSyncConfig,
+  saveAutoSyncSettings,
   saveSyncConfig,
   syncLibrary,
   testSyncConnection,
+  type AutoSyncSettings,
   type SyncSettings
 } from "./lib/syncClient";
 import {
@@ -205,6 +209,11 @@ export default function App() {
   const backfillRunningRef = useRef(false);
   const [fileDataById, setFileDataById] = useState<Record<string, Uint8Array>>({});
   const [settings, setSettings] = useState<SyncSettings>(defaultSyncSettings);
+  const [syncSettingsOpen, setSyncSettingsOpen] = useState(false);
+  // Kept separate from the global `busy` so the background periodic sync never
+  // leaves the Sync Settings modal stuck showing "Working…".
+  const [syncSettingsBusy, setSyncSettingsBusy] = useState(false);
+  const [autoSyncSettings, setAutoSyncSettings] = useState<AutoSyncSettings>(() => loadAutoSyncSettings());
   const [fileStorageSettings, setFileStorageSettings] = useState<FileStorageSettings>(() => loadFileStorageSettings());
   const [fileStorageModalOpen, setFileStorageModalOpen] = useState(false);
   const [mendeleySyncOpen, setMendeleySyncOpen] = useState(false);
@@ -218,6 +227,7 @@ export default function App() {
   const [mendeleySyncBusy, setMendeleySyncBusy] = useState(false);
   const [arxivDownloadBusy, setArxivDownloadBusy] = useState(false);
   const [mendeleySyncActivity, setMendeleySyncActivity] = useState<LibrarySyncActivity>();
+  const [cloudSyncActivity, setCloudSyncActivity] = useState<LibrarySyncActivity>();
   const [fileStorageBusy, setFileStorageBusy] = useState(false);
   const [workspaceLayout, setWorkspaceLayout] = useState<WorkspaceLayout>(() => loadWorkspaceLayout());
   const [resizeDrag, setResizeDrag] = useState<ResizeDrag>();
@@ -318,17 +328,44 @@ export default function App() {
     void loadSyncConfig().then(setSettings).catch((error) => setStatus(`Failed to load Qiniu settings: ${error}`));
   }, []);
 
-  // Object-storage sync is intentionally periodic rather than edit-debounced:
-  // one run after startup, then once per hour while the app remains open.
+  // Live progress emitted from the Rust cloud-sync command so the user can see
+  // which stage a long background sync is at instead of a single opaque spinner.
   useEffect(() => {
-    if (!settings.configured) return;
+    let unlisten: (() => void) | undefined;
+    void listen<string>("qiniu-sync-stage", (event) => {
+      if (cloudSyncInFlightRef.current) {
+        setCloudSyncActivity((current) => current ? { ...current, message: event.payload } : current);
+      }
+    }).then((next) => {
+      unlisten = next;
+    });
+    return () => unlisten?.();
+  }, []);
+
+  // Auto-dismiss the cloud-sync indicator a few seconds after it settles so a
+  // finished background sync does not linger in the sidebar.
+  useEffect(() => {
+    if (!cloudSyncActivity || cloudSyncActivity.state === "running") return;
+    const timer = window.setTimeout(() => setCloudSyncActivity(undefined), 6_000);
+    return () => window.clearTimeout(timer);
+  }, [cloudSyncActivity]);
+
+  useEffect(() => {
+    saveAutoSyncSettings(autoSyncSettings);
+  }, [autoSyncSettings]);
+
+  // Object-storage sync is intentionally periodic rather than edit-debounced:
+  // one run after startup, then once per configured interval while the app
+  // remains open. The user can disable it or change the interval in Sync Settings.
+  useEffect(() => {
+    if (!settings.configured || !autoSyncSettings.enabled) return;
     const initial = window.setTimeout(() => void handleSync(), 1_000);
-    const hourly = window.setInterval(() => void handleSync(), 60 * 60 * 1_000);
+    const timer = window.setInterval(() => void handleSync(), autoSyncSettings.intervalMinutes * 60 * 1_000);
     return () => {
       window.clearTimeout(initial);
-      window.clearInterval(hourly);
+      window.clearInterval(timer);
     };
-  }, [settings.configured, settings.bucket, settings.accessKey]);
+  }, [settings.configured, settings.bucket, settings.accessKey, autoSyncSettings.enabled, autoSyncSettings.intervalMinutes]);
 
   useEffect(() => {
     localStorage.setItem(workspaceLayoutKey, JSON.stringify(workspaceLayout));
@@ -443,6 +480,9 @@ export default function App() {
       } else if (event.payload === "show-proxy-settings") {
         setProxySettingsError(undefined);
         setProxySettingsOpen(true);
+      } else if (event.payload === "show-sync-settings") {
+        setStatus(undefined);
+        setSyncSettingsOpen(true);
       } else if (event.payload === "show-duplicate-documents") {
         setDuplicateDocumentsOpen(true);
       } else if (event.payload === "download-arxiv-files") {
@@ -1507,25 +1547,43 @@ export default function App() {
     }
   }
 
-  async function handleLogin() {
-    await runBusy("Qiniu private bucket configured.", async () => {
-      const saved = await saveSyncConfig(settings);
+  async function handleSaveSyncSettings(nextSettings: SyncSettings) {
+    setSyncSettingsBusy(true);
+    setStatus(undefined);
+    try {
+      const saved = await saveSyncConfig(nextSettings);
       setSettings({ ...saved, secretKey: undefined });
       await testSyncConnection();
-    });
+      setStatus("Qiniu private bucket configured.");
+    } catch (error) {
+      setStatus(formatActionError(error));
+    } finally {
+      setSyncSettingsBusy(false);
+    }
   }
 
+  // Cloud sync runs in the background: it never sets the global `busy`, so the
+  // user can keep working while a live progress indicator tracks each stage.
   async function handleSync() {
     if (cloudSyncInFlightRef.current || !settings.configured) return;
     cloudSyncInFlightRef.current = true;
+    setCloudSyncActivity({ state: "running", message: "Starting sync…", completed: 0, total: 5 });
     try {
-      await runBusy("Sync complete.", async () => {
-        const result = await syncLibrary(settings, libraryRef.current ?? library);
-        setLibrary(result.state);
-        setStatus(
-          `Sync complete: ${result.summary.uploadedChanges} uploaded, ${result.summary.downloadedChanges} downloaded.`
-        );
+      const result = await syncLibrary(
+        settings,
+        libraryRef.current ?? library,
+        (message, completed = 0, total = 5) =>
+          setCloudSyncActivity({ state: "running", message, completed, total })
+      );
+      setLibrary(result.state);
+      setCloudSyncActivity({
+        state: "success",
+        message: `${result.summary.uploadedChanges} uploaded, ${result.summary.downloadedChanges} downloaded`,
+        completed: 5,
+        total: 5
       });
+    } catch (error) {
+      setCloudSyncActivity({ state: "error", message: formatActionError(error), completed: 0, total: 5 });
     } finally {
       cloudSyncInFlightRef.current = false;
     }
@@ -1636,7 +1694,7 @@ export default function App() {
       await task();
       setStatus(successMessage);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Action failed.");
+      setStatus(formatActionError(error));
     } finally {
       setBusy(false);
     }
@@ -1721,7 +1779,8 @@ export default function App() {
               onAddPdfToCollection={handleAddPdfToCollection}
               onEmptyTrash={() => void handleEmptyTrash()}
               onSync={handleSync}
-              syncBusy={busy}
+              syncBusy={cloudSyncActivity?.state === "running"}
+              cloudSyncActivity={cloudSyncActivity}
               mendeleySyncActivity={mendeleySyncActivity}
               onCancelMendeleySync={handleCancelMendeleySync}
             />
@@ -1776,16 +1835,11 @@ export default function App() {
           {panel === "sync" && (
             <SyncPanel
               settings={settings}
-              busy={busy}
-              status={status}
               paper={selectedPaper}
               fileAsset={selectedFile}
               fileData={selectedFileData}
               hasLocalPdf={selectedHasLocalPdf}
               annotations={selectedAnnotations}
-              onSettingsChange={setSettings}
-              onLogin={handleLogin}
-              onSync={handleSync}
               onUpdatePaper={handleUpdatePaper}
               arxivDownloadBusy={arxivDownloadBusy}
               onDownloadArxiv={(paperId, onProgress) => handleDownloadArxivFiles(paperId, onProgress)}
@@ -1836,6 +1890,18 @@ export default function App() {
       />
       <ShortcutsHelpModal open={shortcutsHelpOpen} onClose={() => setShortcutsHelpOpen(false)} />
       <AboutModal open={aboutOpen} onClose={() => setAboutOpen(false)} />
+      <SyncSettingsModal
+        open={syncSettingsOpen}
+        settings={settings}
+        autoSync={autoSyncSettings}
+        busy={syncSettingsBusy}
+        syncing={cloudSyncActivity?.state === "running"}
+        status={cloudSyncActivity?.state === "running" ? cloudSyncActivity.message : status}
+        onClose={() => setSyncSettingsOpen(false)}
+        onSave={(nextSettings) => void handleSaveSyncSettings(nextSettings)}
+        onSync={() => void handleSync()}
+        onAutoSyncChange={setAutoSyncSettings}
+      />
       <FileStorageSettingsModal
         open={fileStorageModalOpen}
         settings={fileStorageSettings}
@@ -1901,6 +1967,19 @@ export default function App() {
       />
     </main>
   );
+}
+
+function formatActionError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  if (error && typeof error === "object") {
+    try {
+      return JSON.stringify(error);
+    } catch {
+      // Fall through to the generic string conversion.
+    }
+  }
+  return String(error || "Action failed.");
 }
 
 function PanelFragment({

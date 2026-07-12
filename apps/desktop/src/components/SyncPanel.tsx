@@ -1,4 +1,4 @@
-import { Cloud, DatabaseZap, Download, FileSearch, KeyRound, RefreshCw, Search, Send, Trash2 } from "lucide-react";
+import { DatabaseZap, Download, FileSearch, Search, Send, Trash2 } from "lucide-react";
 import { useState } from "react";
 import type { Annotation, ArxivMetadata, FileAsset, Paper } from "@lumora/shared";
 import { searchArxivMetadata, type SyncSettings } from "../lib/syncClient";
@@ -6,16 +6,11 @@ import { formatFileSize, type ArxivDownloadProgress } from "../lib/arxivFiles";
 
 type SyncPanelProps = {
   settings: SyncSettings;
-  busy: boolean;
-  status?: string;
   paper?: Paper;
   fileAsset?: FileAsset;
   fileData?: Uint8Array;
   hasLocalPdf: boolean;
   annotations: Annotation[];
-  onSettingsChange: (settings: SyncSettings) => void;
-  onLogin: () => void;
-  onSync: () => void;
   onUpdatePaper: (paper: Paper) => void;
   arxivDownloadBusy: boolean;
   onDownloadArxiv: (paperId: string, onProgress: (progress: ArxivDownloadProgress) => void) => Promise<string>;
@@ -24,22 +19,17 @@ type SyncPanelProps = {
 
 export function SyncPanel({
   settings,
-  busy,
-  status,
   paper,
   fileAsset,
   fileData,
   hasLocalPdf,
   annotations,
-  onSettingsChange,
-  onLogin,
-  onSync,
   onUpdatePaper,
   arxivDownloadBusy,
   onDownloadArxiv,
   onDeleteAnnotation
 }: SyncPanelProps) {
-  const [activeTab, setActiveTab] = useState<"details" | "notes" | "sync">("details");
+  const [activeTab, setActiveTab] = useState<"details" | "notes">("details");
   const visibleAnnotations = annotations.filter((annotation) => !annotation.deletedAt);
 
   return (
@@ -50,9 +40,6 @@ export function SyncPanel({
         </button>
         <button type="button" className={activeTab === "notes" ? "active" : ""} onClick={() => setActiveTab("notes")}>
           Notes
-        </button>
-        <button type="button" className={activeTab === "sync" ? "active" : ""} onClick={() => setActiveTab("sync")}>
-          Sync
         </button>
       </div>
 
@@ -69,62 +56,6 @@ export function SyncPanel({
         />
       )}
       {activeTab === "notes" && <NotesTab annotations={visibleAnnotations} onDeleteAnnotation={onDeleteAnnotation} />}
-      {activeTab === "sync" && (
-        <>
-          <div className="panel-heading">
-            <Cloud size={18} />
-            <h3>Sync</h3>
-          </div>
-          <label>
-            Qiniu Access Key
-            <input
-              value={settings.accessKey}
-              onChange={(event) => onSettingsChange({ ...settings, accessKey: event.target.value })}
-            />
-          </label>
-          <label>
-            Qiniu Secret Key
-            <input
-              type="password"
-              value={settings.secretKey ?? ""}
-              placeholder={settings.configured ? "Stored in macOS Keychain" : "Required"}
-              onChange={(event) => onSettingsChange({ ...settings, secretKey: event.target.value })}
-            />
-          </label>
-          <label>
-            Bucket
-            <input
-              value={settings.bucket}
-              onChange={(event) => onSettingsChange({ ...settings, bucket: event.target.value })}
-            />
-          </label>
-          <label>
-            Region (optional)
-            <input
-              value={settings.region ?? ""}
-              onChange={(event) => onSettingsChange({ ...settings, region: event.target.value })}
-            />
-          </label>
-          <label>
-            Private download domain
-            <input
-              value={settings.privateDomain}
-              onChange={(event) => onSettingsChange({ ...settings, privateDomain: event.target.value })}
-            />
-          </label>
-          <div className="sync-actions">
-            <button type="button" onClick={onLogin} disabled={busy}>
-              <KeyRound size={16} />
-              Save &amp; Test
-            </button>
-            <button type="button" onClick={onSync} disabled={busy || !settings.configured}>
-              <RefreshCw size={16} />
-              Sync
-            </button>
-          </div>
-          {status && <p className="sync-status">{status}</p>}
-        </>
-      )}
     </aside>
   );
 }

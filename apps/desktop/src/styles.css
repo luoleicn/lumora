@@ -2708,6 +2708,38 @@ button:disabled {
   font-weight: 400;
 }
 
+.auto-sync-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #e2e8ef;
+  border-radius: 8px;
+  background: #f7f9fb;
+}
+
+.file-storage-modal-body label.auto-sync-toggle,
+.file-storage-modal-body label.auto-sync-interval {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.file-storage-modal-body label.auto-sync-toggle input,
+.file-storage-modal-body label.auto-sync-interval input[type="checkbox"] {
+  width: auto;
+  height: auto;
+}
+
+.file-storage-modal-body label.auto-sync-interval input {
+  width: 72px;
+  text-align: center;
+}
+
+.file-storage-modal-body label.auto-sync-interval input:disabled {
+  opacity: 0.5;
+}
+
 .file-storage-directory-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

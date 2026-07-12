@@ -19,6 +19,49 @@ export const defaultSyncSettings: SyncSettings = {
   configured: false
 };
 
+/** Device-local scheduling preference for the background periodic sync. */
+export type AutoSyncSettings = {
+  enabled: boolean;
+  intervalMinutes: number;
+};
+
+const autoSyncSettingsKey = "lumora:auto-sync-settings";
+export const defaultAutoSyncIntervalMinutes = 60;
+const minAutoSyncIntervalMinutes = 1;
+const maxAutoSyncIntervalMinutes = 24 * 60;
+
+export const defaultAutoSyncSettings: AutoSyncSettings = {
+  enabled: true,
+  intervalMinutes: defaultAutoSyncIntervalMinutes
+};
+
+export function normalizeAutoSyncInterval(value: unknown): number {
+  const minutes = Math.round(Number(value));
+  if (!Number.isFinite(minutes)) return defaultAutoSyncIntervalMinutes;
+  return Math.min(Math.max(minutes, minAutoSyncIntervalMinutes), maxAutoSyncIntervalMinutes);
+}
+
+export function loadAutoSyncSettings(): AutoSyncSettings {
+  const raw = localStorage.getItem(autoSyncSettingsKey);
+  if (!raw) return defaultAutoSyncSettings;
+  try {
+    const parsed = JSON.parse(raw) as Partial<AutoSyncSettings>;
+    return {
+      enabled: parsed.enabled ?? defaultAutoSyncSettings.enabled,
+      intervalMinutes: normalizeAutoSyncInterval(parsed.intervalMinutes)
+    };
+  } catch {
+    return defaultAutoSyncSettings;
+  }
+}
+
+export function saveAutoSyncSettings(settings: AutoSyncSettings) {
+  localStorage.setItem(autoSyncSettingsKey, JSON.stringify({
+    enabled: settings.enabled,
+    intervalMinutes: normalizeAutoSyncInterval(settings.intervalMinutes)
+  }));
+}
+
 export async function loadSyncConfig(): Promise<SyncSettings> {
   return (await invoke<CloudSyncConfig | null>("qiniu_sync_config")) ?? defaultSyncSettings;
 }
@@ -44,12 +87,25 @@ export async function disconnectSync(): Promise<void> {
   await invoke("qiniu_disconnect_sync");
 }
 
-export async function syncLibrary(_settings: SyncSettings, _state: LibraryState): Promise<{ state: LibraryState; summary: CloudSyncSummary }> {
+export async function syncLibrary(
+  _settings: SyncSettings,
+  _state: LibraryState,
+  onStage?: (message: string, completed?: number, total?: number) => void
+): Promise<{ state: LibraryState; summary: CloudSyncSummary }> {
   let prepared = _state;
   const storage = loadFileStorageSettings();
   const paperById = new Map(prepared.papers.map((paper) => [paper.id, paper]));
   const promotedObjectHashes = new Set<string>();
   const nextFiles = [] as typeof prepared.fileAssets;
+
+  onStage?.("Preparing library…", 0, 5);
+  const uploadableTotal = prepared.fileAssets.filter((file) => {
+    if (file.deletedAt) return false;
+    const paper = paperById.get(file.paperId);
+    const arxivId = paper?.arxiv ? normalizeArxivId(paper.arxiv) : undefined;
+    return !(arxivId && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName)));
+  }).length;
+  let uploadedBlobs = 0;
 
   for (const file of prepared.fileAssets) {
     if (file.deletedAt) {
@@ -62,7 +118,7 @@ export async function syncLibrary(_settings: SyncSettings, _state: LibraryState)
       if (file.contentRef?.kind === "object") promotedObjectHashes.add(file.contentRef.sha256);
       let next = file;
       if (file.contentRef?.kind !== "arxiv" || file.contentRef.arxivId !== arxivId) {
-        const arxivBuffer = await invoke<ArrayBuffer>("download_arxiv_pdf", { arxivId });
+        const arxivBuffer = await invoke<ArrayBuffer>("download_arxiv_pdf_silent", { arxivId });
         const arxivBytes = new Uint8Array(arxivBuffer);
         const arxivSha = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", arxivBytes)),
           (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -96,9 +152,30 @@ export async function syncLibrary(_settings: SyncSettings, _state: LibraryState)
 
     const bytes = await readFileBytes(file, storage);
     if (bytes?.length) {
-      await invoke<void>("qiniu_upload_blob", new Uint8Array(bytes).buffer as ArrayBuffer, {
-        headers: { "x-lumora-sha256": file.sha256 }
-      });
+      uploadedBlobs += 1;
+      onStage?.(`Uploading files ${uploadedBlobs}/${uploadableTotal}: ${file.fileName}`, 1, 5);
+      // Content-address the blob by the real hash of the actual bytes. Mendeley
+      // imports carry a synthetic `sha256` ("mendeley-sha1:…"/"mendeley-note:…")
+      // that never matches the content, so trusting file.sha256 here both keys
+      // the blob wrong and trips the Rust integrity check. Heal the metadata to
+      // the real hash so the upload succeeds and other devices can find it.
+      const buffer = new Uint8Array(bytes).buffer as ArrayBuffer;
+      const sha256 = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", buffer)),
+        (byte) => byte.toString(16).padStart(2, "0")).join("");
+      try {
+        await invoke<void>("qiniu_upload_blob", buffer, {
+          headers: { "x-lumora-sha256": sha256 }
+        });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`Failed to upload “${file.fileName}”${file.localPath ? ` (${file.localPath})` : ""}: ${detail}`);
+      }
+      nextFiles.push(
+        file.sha256 === sha256 && file.contentRef?.kind === "object" && file.contentRef.sha256 === sha256
+          ? file
+          : { ...file, sha256, size: bytes.length, contentRef: { kind: "object" as const, sha256 }, updatedAt: new Date().toISOString() }
+      );
+      continue;
     }
     nextFiles.push(file.contentRef?.kind === "object"
       ? file
@@ -112,6 +189,7 @@ export async function syncLibrary(_settings: SyncSettings, _state: LibraryState)
       .map((entity) => ({ entityType: "fileAsset" as const, entity })));
   }
 
+  onStage?.("Syncing changes with Qiniu…", 2, 5);
   const summary = await invoke<CloudSyncSummary>("qiniu_sync_library");
   let { state } = await loadLibraryFromDb();
 
@@ -121,6 +199,7 @@ export async function syncLibrary(_settings: SyncSettings, _state: LibraryState)
   for (const [index, file] of downloadedFiles.entries()) {
     if (file.deletedAt || file.contentRef?.kind !== "object") continue;
     if ((await readFileBytes(file, storage))?.length) continue;
+    onStage?.(`Downloading file from cloud: ${file.fileName}`, 3, 5);
     const buffer = await invoke<ArrayBuffer>("qiniu_download_blob", { sha256: file.contentRef.sha256 });
     const bytes = new Uint8Array(buffer);
     let localPath: string | undefined;
@@ -139,6 +218,7 @@ export async function syncLibrary(_settings: SyncSettings, _state: LibraryState)
     state = { ...state, fileAssets: downloadedFiles };
   }
 
+  onStage?.("Downloading arXiv PDFs…", 4, 5);
   const arxiv = await downloadMissingArxivFiles(state, storage, { sleep: async (ms) => new Promise((resolve) => setTimeout(resolve, ms)) });
   if (arxiv.downloaded > 0) {
     await persistEntities(arxiv.state.fileAssets

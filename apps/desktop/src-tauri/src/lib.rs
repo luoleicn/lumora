@@ -21,6 +21,7 @@ const APP_ABOUT: &str = "app-about";
 const APP_FILE_STORAGE_SETTINGS: &str = "app-file-storage-settings";
 const APP_MENDELEY_SYNC: &str = "app-mendeley-sync";
 const APP_PROXY_SETTINGS: &str = "app-proxy-settings";
+const APP_SYNC_SETTINGS: &str = "app-sync-settings";
 const APP_DUPLICATE_DOCUMENTS: &str = "app-duplicate-documents";
 const FILES_REFRESH_LIBRARY: &str = "files-refresh-library";
 const FILES_DOWNLOAD_ARXIV_FILES: &str = "files-download-arxiv-files";
@@ -1397,6 +1398,22 @@ async fn download_arxiv_pdf(
     arxiv_id: String,
     on_progress: tauri::ipc::Channel<ArxivDownloadEvent>,
 ) -> Result<tauri::ipc::Response, String> {
+    download_arxiv_pdf_impl(app, arxiv_id, Some(&on_progress)).await
+}
+
+#[tauri::command]
+async fn download_arxiv_pdf_silent(
+    app: AppHandle,
+    arxiv_id: String,
+) -> Result<tauri::ipc::Response, String> {
+    download_arxiv_pdf_impl(app, arxiv_id, None).await
+}
+
+async fn download_arxiv_pdf_impl(
+    app: AppHandle,
+    arxiv_id: String,
+    on_progress: Option<&tauri::ipc::Channel<ArxivDownloadEvent>>,
+) -> Result<tauri::ipc::Response, String> {
     let arxiv_id = arxiv_id.trim();
     let modern = regex::Regex::new(r"^\d{4}\.\d{4,5}(v\d+)?$").map_err(|error| error.to_string())?;
     let legacy = regex::Regex::new(r"^[A-Za-z-]+(?:\.[A-Za-z-]+)?/\d{7}(v\d+)?$")
@@ -1417,15 +1434,19 @@ async fn download_arxiv_pdf(
         return Err(format!("arXiv PDF download failed for {arxiv_id} ({})", response.status()));
     }
     let total_bytes = response.content_length();
-    let _ = on_progress.send(ArxivDownloadEvent::Started { total_bytes });
+    if let Some(channel) = on_progress {
+        let _ = channel.send(ArxivDownloadEvent::Started { total_bytes });
+    }
     let mut bytes = Vec::with_capacity(total_bytes.unwrap_or(0).min(usize::MAX as u64) as usize);
     while let Some(chunk) = response.chunk().await
         .map_err(|error| format!("Failed to read arXiv PDF {arxiv_id}: {error}"))? {
         bytes.extend_from_slice(&chunk);
-        let _ = on_progress.send(ArxivDownloadEvent::Progress {
-            downloaded_bytes: bytes.len() as u64,
-            total_bytes,
-        });
+        if let Some(channel) = on_progress {
+            let _ = channel.send(ArxivDownloadEvent::Progress {
+                downloaded_bytes: bytes.len() as u64,
+                total_bytes,
+            });
+        }
     }
     if !bytes.starts_with(b"%PDF-") {
         return Err(format!("arXiv returned non-PDF content for {arxiv_id}"));
@@ -1620,6 +1641,8 @@ pub fn run() {
                 let _ = app.emit(WORKSPACE_EVENT, "show-mendeley-sync");
             } else if id == APP_PROXY_SETTINGS {
                 let _ = app.emit(WORKSPACE_EVENT, "show-proxy-settings");
+            } else if id == APP_SYNC_SETTINGS {
+                let _ = app.emit(WORKSPACE_EVENT, "show-sync-settings");
             } else if id == APP_DUPLICATE_DOCUMENTS {
                 let _ = app.emit(WORKSPACE_EVENT, "show-duplicate-documents");
             } else if id == FILES_DOWNLOAD_ARXIV_FILES {
@@ -1655,6 +1678,7 @@ pub fn run() {
             mendeley_request,
             mendeley_download_file,
             download_arxiv_pdf,
+            download_arxiv_pdf_silent,
             cloud_sync::qiniu_sync_config,
             cloud_sync::qiniu_save_sync_config,
             cloud_sync::qiniu_test_sync_connection,
@@ -1785,6 +1809,7 @@ fn build_menu<R: Runtime>(app_handle: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             &MenuItem::with_id(app_handle, APP_ABOUT, format!("About {}", pkg_info.name), true, None::<&str>)?,
             &PredefinedMenuItem::separator(app_handle)?,
             &MenuItem::with_id(app_handle, APP_MENDELEY_SYNC, "Mendeley Sync...", true, None::<&str>)?,
+            &MenuItem::with_id(app_handle, APP_SYNC_SETTINGS, "Sync Settings...", true, None::<&str>)?,
             &MenuItem::with_id(app_handle, APP_PROXY_SETTINGS, "Proxy...", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app_handle)?,
             &PredefinedMenuItem::services(app_handle, None)?,

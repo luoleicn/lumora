@@ -45,6 +45,7 @@ type LibrarySidebarProps = {
   onEmptyTrash: () => void;
   onSync: () => void;
   syncBusy: boolean;
+  cloudSyncActivity?: LibrarySyncActivity;
   mendeleySyncActivity?: LibrarySyncActivity;
   onCancelMendeleySync: () => void;
 };
@@ -82,6 +83,7 @@ export function LibrarySidebar({
   onEmptyTrash,
   onSync,
   syncBusy,
+  cloudSyncActivity,
   mendeleySyncActivity,
   onCancelMendeleySync
 }: LibrarySidebarProps) {
@@ -311,6 +313,26 @@ export function LibrarySidebar({
       </section>
 
       <div className="library-sync-footer">
+        {cloudSyncActivity && (
+          <div
+            className={`library-sync-activity ${cloudSyncActivity.state}`}
+            role="status"
+            aria-live="polite"
+          >
+            <div className="library-sync-activity-heading">
+              {cloudSyncActivity.state === "running" && <RefreshCw className="spinning" size={14} />}
+              {cloudSyncActivity.state === "success" && <CircleCheck size={14} />}
+              {cloudSyncActivity.state === "error" && <AlertCircle size={14} />}
+              {cloudSyncActivity.state === "cancelled" && <CircleX size={14} />}
+              <span>{cloudSyncActivity.state === "running" ? "Cloud syncing" : cloudSyncActivity.state === "success" ? "Cloud synced" : cloudSyncActivity.state === "cancelled" ? "Cloud sync cancelled" : "Cloud sync failed"}</span>
+              <small>{Math.round((cloudSyncActivity.completed / Math.max(1, cloudSyncActivity.total)) * 100)}%</small>
+            </div>
+            <div className="library-sync-progress" aria-hidden>
+              <span style={{ width: `${Math.min(100, (cloudSyncActivity.completed / Math.max(1, cloudSyncActivity.total)) * 100)}%` }} />
+            </div>
+            <p title={cloudSyncActivity.message}>{cloudSyncActivity.message}</p>
+          </div>
+        )}
         {mendeleySyncActivity && (
           <div
             className={`library-sync-activity ${mendeleySyncActivity.state}`}
