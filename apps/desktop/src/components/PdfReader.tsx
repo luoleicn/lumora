@@ -927,8 +927,22 @@ function AnnotationOverlay({
     dragging: boolean;
   } | undefined>(undefined);
   const suppressClickRef = useRef<string | undefined>(undefined);
+  const notePopoverRef = useRef<HTMLElement>(null);
   const openNote = annotations.find((annotation) => annotation.id === openNoteId && annotation.kind === "note");
   const openNotePosition = openNote ? getNoteMarkerPosition(openNote) : undefined;
+
+  useEffect(() => {
+    if (!openNote) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!(event.target instanceof Element)) return;
+      // Keep open when clicking inside the popover or on a note marker.
+      if (notePopoverRef.current?.contains(event.target)) return;
+      if (event.target.closest(".note-marker")) return;
+      setOpenNoteId(undefined);
+    };
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, [openNote]);
 
   function handleMarkerPointerDown(annotation: Annotation, event: React.PointerEvent<HTMLButtonElement>) {
     if (event.button !== 0) {
@@ -1050,6 +1064,7 @@ function AnnotationOverlay({
       })}
       {openNote && openNotePosition && (
         <aside
+          ref={notePopoverRef}
           className="note-popover"
           style={{
             left: `${Math.min(0.84, openNotePosition.x) * 100}%`,

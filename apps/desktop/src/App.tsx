@@ -585,8 +585,10 @@ export default function App() {
         switch (selectedCollectionId) {
           case "all":
             return true;
-          case "recently_added":
-            return true;
+          case "recently_added": {
+            const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+            return paper.createdAt >= weekAgo;
+          }
           case "no_arxiv":
             return !paper.arxiv;
           case "no_pdf":
@@ -1313,6 +1315,24 @@ export default function App() {
     });
   }
 
+  function handleSelectCollection(collectionId: string) {
+    setSelectedCollectionId(collectionId);
+    if (!selectedPaperId) return;
+    const current = libraryRef.current ?? library;
+    const paper = current.papers.find((item) => item.id === selectedPaperId);
+    if (!paper) return;
+    // Virtual collections: paper visibility is determined by filter logic in filteredPapers.
+    // "all", "recently_added", "favorites", "unsorted", "trash" — let the filter decide.
+    if (!collectionId || ["all", "recently_added", "favorites", "unsorted", "trash"].includes(collectionId)) return;
+    // Real collection: deselect if the paper isn't a member.
+    const isMember = current.paperCollections.some(
+      (item) => item.paperId === selectedPaperId && item.collectionId === collectionId && !item.deletedAt
+    );
+    if (!isMember) {
+      setSelectedPaperId(undefined);
+    }
+  }
+
   function handleOpenPaperTab(paperId: string) {
     const paper = library.papers.find((item) => item.id === paperId && !item.deletedAt);
     if (!paper) {
@@ -1598,7 +1618,11 @@ export default function App() {
   // Cloud sync runs in the background: it never sets the global `busy`, so the
   // user can keep working while a live progress indicator tracks each stage.
   async function handleSync() {
-    if (cloudSyncInFlightRef.current || !settings.configured) return;
+    if (cloudSyncInFlightRef.current) return;
+    if (!settings.configured) {
+      setSyncSettingsOpen(true);
+      return;
+    }
     cloudSyncInFlightRef.current = true;
     cloudSyncCancelRequestedRef.current = false;
     setCloudSyncActivity({ state: "running", message: "Starting sync…", completed: 0, total: 5 });
@@ -1833,7 +1857,7 @@ export default function App() {
               selectedPaperId={selectedPaperId}
               selectedAuthor={selectedAuthor}
               selectedTag={selectedTag}
-              onSelectCollection={setSelectedCollectionId}
+              onSelectCollection={handleSelectCollection}
               onSelectAuthor={setSelectedAuthor}
               onSelectTag={setSelectedTag}
               onCreateCollection={handleCreateCollection}

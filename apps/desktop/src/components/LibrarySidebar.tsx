@@ -124,6 +124,8 @@ export function LibrarySidebar({
   const selectedPaperCollectionIds = getActivePaperCollectionIds(state, selectedPaperId);
   const activePapers = state.papers.filter((paper) => !paper.deletedAt);
   const deletedPapers = state.papers.filter((paper) => paper.deletedAt);
+  const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const recentlyAddedCount = activePapers.filter((paper) => paper.createdAt >= weekAgo).length;
   const unfiledPaperCount = activePapers.filter(
     (paper) => !state.paperCollections.some((item) => item.paperId === paper.id && !item.deletedAt)
   ).length;
@@ -165,7 +167,7 @@ export function LibrarySidebar({
             icon={Clock}
             label="Recently Added"
             active={selectedCollectionId === "recently_added"}
-            count={activePapers.length}
+            count={recentlyAddedCount}
             onClick={() => onSelectCollection("recently_added")}
           />
           <NavButton
