@@ -35,7 +35,8 @@ import {
   removePaperFromCollectionTree,
   renameCollection,
   restorePaperFromTrash,
-  permanentlyDeletePaperFromTrash
+  permanentlyDeletePaperFromTrash,
+  permanentlyDeleteAllFromTrash
 } from "./lib/libraryActions";
 import {
   loadLibraryState,
@@ -55,6 +56,7 @@ import {
   migrateStoredPdfs,
   movePdfOnDisk,
   readFileBytes,
+  reconcileFileStorage,
   saveFileStorageSettings,
   type FileStorageSettings
 } from "./lib/fileStorage";
@@ -148,6 +150,32 @@ function isPdfFile(fileAsset: FileAsset) {
   return fileAsset.mime === "application/pdf" || /\.pdf$/i.test(fileAsset.fileName);
 }
 
+// Single resolver for "focus the toolbar search box" so every entry point — the
+// DOM keydown handler and the native Cmd+F event forwarded from Rust — agrees on
+// the target. The input is located by the semantic `data-search-input` marker
+// rather than a tag/type/class, which are presentational and can silently drift
+// (a missing `type="text"` once made this a no-op on the Documents tab). The
+// marker sits on whichever field the toolbar currently shows: the library search
+// on Documents, the find-in-document input on a paper tab.
+function focusToolbarSearch() {
+  const input = document.querySelector<HTMLInputElement>(".app-toolbar input[data-search-input]");
+  input?.focus();
+  input?.select();
+}
+
+// A PDF is locally available when it lives on disk. `localPath` is authoritative
+// — it is only ever set to a `.pdf` file we stored, so it stands on its own even
+// when a record's mime/fileName came from a source (e.g. Mendeley) that doesn't
+// look PDF-ish. The startup reconcile keeps localPath in sync with the folder,
+// clearing it when the file is gone. `downloadState === "local"` is the legacy
+// fallback for records that predate localPath.
+function isLocalPdfFile(fileAsset: FileAsset): boolean {
+  if (fileAsset.localPath) {
+    return true;
+  }
+  return isPdfFile(fileAsset) && fileAsset.downloadState === "local";
+}
+
 export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const referenceInputRef = useRef<HTMLInputElement>(null);
@@ -233,6 +261,16 @@ export default function App() {
           lastPersistedLibraryRef.current = dbState;
           libraryLoadedRef.current = true;
           setLibrary(dbState);
+          // Reconcile records against the storage folder: drain any leftover
+          // IndexedDB blobs to disk, re-link PDFs that lost their localPath, and
+          // clear stale local flags. reconcileFileStorage persists its own
+          // changes, so advance the baseline to avoid a redundant full re-diff.
+          const reconciled = await reconcileFileStorage(dbState, fileStorageSettings);
+          if (cancelled || reconciled === dbState) {
+            return;
+          }
+          lastPersistedLibraryRef.current = reconciled;
+          setLibrary(reconciled);
           return;
         }
 
@@ -345,18 +383,17 @@ export default function App() {
       }
 
       // Cmd+F / Ctrl+F: focus the toolbar search bar (library search on
-      // Documents, find-in-document on a paper tab). WKWebView may intercept
-      // Cmd+F on macOS before the DOM sees it; when it does reach us, make
-      // sure both tab types are covered.
+      // Documents, find-in-document on a paper tab). On macOS WKWebView claims
+      // Cmd+F before the DOM sees it, so this branch is the Windows/Linux path;
+      // macOS arrives via the native monitor's `focus-toolbar-search` event.
+      // Both share focusToolbarSearch so they can never disagree on the target.
       const isFindShortcut = event.key.toLowerCase() === "f"
         && usesPrimaryModifier
         && !event.altKey
         && !event.shiftKey;
       if (isFindShortcut) {
         event.preventDefault();
-        const toolbarInput = document.querySelector<HTMLInputElement>(".app-toolbar input[type='text']");
-        toolbarInput?.focus();
-        toolbarInput?.select();
+        focusToolbarSearch();
         return;
       }
 
@@ -410,10 +447,10 @@ export default function App() {
         setDuplicateDocumentsOpen(true);
       } else if (event.payload === "download-arxiv-files") {
         void handleDownloadArxivFiles();
+      } else if (event.payload === "refresh-library") {
+        void handleRefreshLibrary();
       } else if (event.payload === "focus-toolbar-search") {
-        const toolbarInput = document.querySelector<HTMLInputElement>(".app-toolbar input[type='text']");
-        toolbarInput?.focus();
-        toolbarInput?.select();
+        focusToolbarSearch();
       }
     }).then((nextUnlisten) => {
       if (disposed) {
@@ -516,7 +553,7 @@ export default function App() {
             return !paper.arxiv;
           case "no_pdf":
             return !library.fileAssets.some(
-              (fileAsset) => fileAsset.paperId === paper.id && !fileAsset.deletedAt && isPdfFile(fileAsset) && fileAsset.downloadState === "local"
+              (fileAsset) => fileAsset.paperId === paper.id && !fileAsset.deletedAt && isLocalPdfFile(fileAsset)
             );
           case "favorites":
             return Boolean(paper.favorite);
@@ -675,7 +712,8 @@ export default function App() {
 
   const selectedPaper = library.papers.find((paper) => paper.id === selectedPaperId && !paper.deletedAt);
   const selectedFile = selectedPaper
-    ? library.fileAssets.find((fileAsset) => fileAsset.paperId === selectedPaper.id && !fileAsset.deletedAt)
+    ? (library.fileAssets.find((fileAsset) => fileAsset.paperId === selectedPaper.id && !fileAsset.deletedAt && isLocalPdfFile(fileAsset))
+      ?? library.fileAssets.find((fileAsset) => fileAsset.paperId === selectedPaper.id && !fileAsset.deletedAt))
     : undefined;
   const selectedAnnotations = selectedPaper
     ? library.annotations.filter((annotation) => annotation.paperId === selectedPaper.id)
@@ -685,7 +723,7 @@ export default function App() {
     ? library.fileAssets.some((fileAsset) =>
       fileAsset.paperId === selectedPaper.id
       && !fileAsset.deletedAt
-      && isPdfFile(fileAsset)
+      && isLocalPdfFile(fileAsset)
       && Boolean(fileDataById[fileAsset.id]?.length)
     )
     : false;
@@ -710,9 +748,13 @@ export default function App() {
       }
 
       const paper = library.papers.find((item) => item.id === tab.paperId && !item.deletedAt);
-      const fileAsset = paper
-        ? library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt)
-        : undefined;
+      if (!paper) return [];
+      // Prefer a fileAsset that is actually on disk or marked local, then fall
+      // back to any non-deleted file for the paper. Without this a Mendeley
+      // "remote" entry would shadow a local PDF that lives in the storage folder.
+      const fileAsset =
+        library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt && isLocalPdfFile(item))
+        ?? library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt && isPdfFile(item));
       return fileAsset ? [fileAsset.id] : [];
     });
 
@@ -1143,6 +1185,66 @@ export default function App() {
       ...memberships.map((membership) => ({ entityType: "paperCollection" as const, id: membership.id }))
     ]);
     setStatus(`Permanently deleted ${paper.title}.`);
+  }
+
+  async function handleRefreshLibrary() {
+    try {
+      const { state: dbState, empty } = await loadLibraryFromDb();
+      if (empty) {
+        setStatus("Library is empty — nothing to refresh.");
+        return;
+      }
+      setLibrary(dbState);
+      lastPersistedLibraryRef.current = dbState;
+      // Force re-reading file bytes for currently open papers so icons and
+      // download states reflect the actual files on disk.
+      setFileDataById({});
+      setStatus("Library refreshed from disk.");
+    } catch (error) {
+      setStatus(`Refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async function handleEmptyTrash() {
+    const trashedPapers = library.papers.filter((paper) => paper.deletedAt);
+    if (trashedPapers.length === 0) {
+      setStatus("Trash is already empty.");
+      return;
+    }
+    if (!window.confirm(`Permanently delete all ${trashedPapers.length} document${trashedPapers.length === 1 ? "" : "s"} in Trash? This cannot be undone.`)) {
+      return;
+    }
+
+    const files = library.fileAssets.filter((item) => trashedPapers.some((paper) => paper.id === item.paperId));
+    const annotations = library.annotations.filter((item) => trashedPapers.some((paper) => paper.id === item.paperId));
+    const memberships = library.paperCollections.filter((item) => trashedPapers.some((paper) => paper.id === item.paperId));
+    const trashedPaperIds = new Set(trashedPapers.map((paper) => paper.id));
+
+    const { state: nextState } = permanentlyDeleteAllFromTrash(library);
+    setLibrary(nextState);
+    if (selectedPaperId && trashedPaperIds.has(selectedPaperId)) setSelectedPaperId(undefined);
+    setFileDataById((current) => Object.fromEntries(
+      Object.entries(current).filter(([fileId]) => !files.some((file) => file.id === fileId))
+    ));
+    setWorkspaceTabs((current) => current.filter((tab) => !(tab.kind === "paper" && trashedPaperIds.has(tab.paperId))));
+    if (activeWorkspaceTabId.startsWith("paper:")) {
+      const tabPaperId = activeWorkspaceTabId.slice("paper:".length);
+      if (trashedPaperIds.has(tabPaperId)) setActiveWorkspaceTabId(documentsTab.id);
+    }
+
+    const diskDeletes = files.flatMap((file) =>
+      file.localPath && fileStorageSettings.directory
+        ? [deleteStoredPdf(fileStorageSettings.directory, file.localPath)]
+        : []
+    );
+    await Promise.allSettled([...files.map((file) => deleteFileBlob(file.id)), ...diskDeletes]);
+    await deletePersistedEntities([
+      ...trashedPapers.map((paper) => ({ entityType: "paper" as const, id: paper.id })),
+      ...files.map((file) => ({ entityType: "fileAsset" as const, id: file.id })),
+      ...annotations.map((annotation) => ({ entityType: "annotation" as const, id: annotation.id })),
+      ...memberships.map((membership) => ({ entityType: "paperCollection" as const, id: membership.id }))
+    ]);
+    setStatus(`Emptied Trash: permanently deleted ${trashedPapers.length} document${trashedPapers.length === 1 ? "" : "s"}.`);
   }
 
   function handleCreateAnnotation(annotation: Annotation) {
@@ -1617,6 +1719,7 @@ export default function App() {
               onDeleteCollection={handleRequestDeleteCollection}
               onAddPaperToCollection={handleAddPaperToCollection}
               onAddPdfToCollection={handleAddPdfToCollection}
+              onEmptyTrash={() => void handleEmptyTrash()}
               onSync={handleSync}
               syncBusy={busy}
               mendeleySyncActivity={mendeleySyncActivity}

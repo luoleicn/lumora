@@ -22,6 +22,7 @@ const APP_FILE_STORAGE_SETTINGS: &str = "app-file-storage-settings";
 const APP_MENDELEY_SYNC: &str = "app-mendeley-sync";
 const APP_PROXY_SETTINGS: &str = "app-proxy-settings";
 const APP_DUPLICATE_DOCUMENTS: &str = "app-duplicate-documents";
+const FILES_REFRESH_LIBRARY: &str = "files-refresh-library";
 const FILES_DOWNLOAD_ARXIV_FILES: &str = "files-download-arxiv-files";
 const PROXY_SETTINGS_META_KEY: &str = "networkProxySettings";
 
@@ -1516,6 +1517,31 @@ fn store_pdf(request: tauri::ipc::Request<'_>) -> Result<String, String> {
     Ok(target.file_name().and_then(|name| name.to_str()).unwrap_or(&file_name).to_string())
 }
 
+// Lists the PDF file names currently in the storage folder so the front end can
+// reconcile library records against what actually lives on disk (the folder is
+// the source of truth for whether a paper has a local PDF). A missing folder is
+// not an error: it just means nothing is stored yet.
+#[tauri::command]
+async fn list_stored_pdfs(dir: String) -> Result<Vec<String>, String> {
+    let path = std::path::Path::new(&dir);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let entries = std::fs::read_dir(path).map_err(|error| format!("Failed to read storage folder: {error}"))?;
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|file_type| file_type.is_file()).unwrap_or(false) {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            if name.to_ascii_lowercase().ends_with(".pdf") {
+                names.push(name.to_string());
+            }
+        }
+    }
+    Ok(names)
+}
+
 #[tauri::command]
 async fn read_stored_pdf(dir: String, file_name: String) -> Result<tauri::ipc::Response, String> {
     validate_stored_file_name(&file_name)?;
@@ -1574,7 +1600,9 @@ pub fn run() {
         .menu(build_menu)
         .on_menu_event(|app, event| {
             let id = event.id().as_ref();
-            if id == PDF_VIEW_FIT_WIDTH {
+            if id == FILES_REFRESH_LIBRARY {
+                let _ = app.emit(WORKSPACE_EVENT, "refresh-library");
+            } else if id == PDF_VIEW_FIT_WIDTH {
                 #[cfg(target_os = "macos")]
                 reset_native_magnification(app);
                 let _ = app.emit(PDF_VIEW_EVENT, "fit-width");
@@ -1607,6 +1635,7 @@ pub fn run() {
             translate_with_youdao,
             search_arxiv_by_title,
             store_pdf,
+            list_stored_pdfs,
             read_stored_pdf,
             delete_stored_pdf,
             move_stored_pdf,
@@ -1699,13 +1728,16 @@ fn install_key_shortcut_monitor(app_handle: AppHandle) {
                 // keyCode and character detection for robustness, then
                 // evaluate JS directly in the webview — this avoids the
                 // Tauri event round-trip and works even when the event
-                // listener hasn't been set up yet.
+                // listener hasn't been set up yet. The search input is located
+                // by its semantic `data-search-input` marker (kept in sync with
+                // focusToolbarSearch on the JS side), not a presentational
+                // tag/type that can silently drift.
                 let is_f_key = key_event.keyCode() == F_KEY_CODE
                     || key_event
                         .charactersIgnoringModifiers()
                         .is_some_and(|c| matches!(c.to_string().to_lowercase().as_str(), "f"));
                 if is_f_key {
-                    let js = "const el=document.querySelector('.app-toolbar input[type=text]');if(el){el.focus();el.select();}";
+                    let js = "const el=document.querySelector('.app-toolbar input[data-search-input]');if(el){el.focus();el.select();}";
                     if let Some(window) = app_handle.get_webview_window("main") {
                         let _ = window.eval(js);
                     }
@@ -1769,6 +1801,8 @@ fn build_menu<R: Runtime>(app_handle: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         "Files",
         true,
         &[
+            &MenuItem::with_id(app_handle, FILES_REFRESH_LIBRARY, "Refresh Library", true, Some("CmdOrCtrl+R"))?,
+            &PredefinedMenuItem::separator(app_handle)?,
             &MenuItem::with_id(app_handle, APP_FILE_STORAGE_SETTINGS, "File Storage Settings...", true, None::<&str>)?,
             &MenuItem::with_id(app_handle, FILES_DOWNLOAD_ARXIV_FILES, "Download arXiv Files", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app_handle)?,

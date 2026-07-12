@@ -58,6 +58,7 @@ export function PdfFindBar({
       <input
         ref={inputRef}
         type="text"
+        data-search-input=""
         value={query}
         onChange={(event) => onQueryChange(event.target.value)}
         onKeyDown={handleKeyDown}

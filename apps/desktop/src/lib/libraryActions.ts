@@ -157,6 +157,30 @@ export function permanentlyDeletePaperFromTrash(state: LibraryState, paperId: En
   };
 }
 
+// Permanently removes every trashed paper and all of their associated entities.
+// Returns the set of removed paper IDs so callers can clean up blobs and disk
+// files that aren't represented in the library state.
+export function permanentlyDeleteAllFromTrash(state: LibraryState): { state: LibraryState; removedPaperIds: EntityId[] } {
+  const trashedPaperIds = new Set(
+    state.papers.filter((paper) => paper.deletedAt).map((paper) => paper.id)
+  );
+
+  if (trashedPaperIds.size === 0) {
+    return { state, removedPaperIds: [] };
+  }
+
+  return {
+    state: {
+      ...state,
+      papers: state.papers.filter((item) => !trashedPaperIds.has(item.id)),
+      fileAssets: state.fileAssets.filter((item) => !trashedPaperIds.has(item.paperId)),
+      paperCollections: state.paperCollections.filter((item) => !trashedPaperIds.has(item.paperId)),
+      annotations: state.annotations.filter((item) => !trashedPaperIds.has(item.paperId))
+    },
+    removedPaperIds: [...trashedPaperIds]
+  };
+}
+
 export function removePaperFromCollectionTree(
   state: LibraryState,
   paperId: EntityId,

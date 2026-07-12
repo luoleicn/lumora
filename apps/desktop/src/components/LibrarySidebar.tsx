@@ -42,6 +42,7 @@ type LibrarySidebarProps = {
   onDeleteCollection: (collectionId: string) => void;
   onAddPaperToCollection: (paperId: string, collectionId: string) => void;
   onAddPdfToCollection: (collectionId: string) => void;
+  onEmptyTrash: () => void;
   onSync: () => void;
   syncBusy: boolean;
   mendeleySyncActivity?: LibrarySyncActivity;
@@ -78,6 +79,7 @@ export function LibrarySidebar({
   onDeleteCollection,
   onAddPaperToCollection,
   onAddPdfToCollection,
+  onEmptyTrash,
   onSync,
   syncBusy,
   mendeleySyncActivity,
@@ -88,22 +90,26 @@ export function LibrarySidebar({
   const [collapsedCollections, setCollapsedCollections] = useState<Record<string, boolean>>({});
   const [nativeDragOverCollectionId, setNativeDragOverCollectionId] = useState<string>();
   const [contextMenu, setContextMenu] = useState<CollectionContextMenu>();
+  const [trashContextMenu, setTrashContextMenu] = useState<{ x: number; y: number }>();
 
   useEffect(() => {
-    if (!contextMenu) {
+    if (!contextMenu && !trashContextMenu) {
       return;
     }
 
-    const closeMenu = () => setContextMenu(undefined);
-    window.addEventListener("click", closeMenu);
-    window.addEventListener("keydown", closeMenu);
-    window.addEventListener("scroll", closeMenu, true);
-    return () => {
-      window.removeEventListener("click", closeMenu);
-      window.removeEventListener("keydown", closeMenu);
-      window.removeEventListener("scroll", closeMenu, true);
+    const closeMenus = () => {
+      setContextMenu(undefined);
+      setTrashContextMenu(undefined);
     };
-  }, [contextMenu]);
+    window.addEventListener("click", closeMenus);
+    window.addEventListener("keydown", closeMenus);
+    window.addEventListener("scroll", closeMenus, true);
+    return () => {
+      window.removeEventListener("click", closeMenus);
+      window.removeEventListener("keydown", closeMenus);
+      window.removeEventListener("scroll", closeMenus, true);
+    };
+  }, [contextMenu, trashContextMenu]);
   const visibleDragOverCollectionId = dragOverCollectionId ?? nativeDragOverCollectionId;
   const collections = sortCollectionsAlphabetically(
     state.collections.filter((collection) => !collection.deletedAt)
@@ -223,6 +229,11 @@ export function LibrarySidebar({
             active={selectedCollectionId === "trash"}
             count={deletedPapers.length}
             onClick={() => onSelectCollection("trash")}
+            onContextMenu={(event) => {
+              if (deletedPapers.length === 0) return;
+              event.preventDefault();
+              setTrashContextMenu({ x: event.clientX, y: event.clientY });
+            }}
           />
         </div>
       </nav>
@@ -392,6 +403,29 @@ export function LibrarySidebar({
               <span>Delete Folder</span>
             </button>
           )}
+        </div>
+      )}
+
+      {trashContextMenu && (
+        <div
+          className="paper-context-menu"
+          style={{ left: trashContextMenu.x, top: trashContextMenu.y }}
+          role="menu"
+          onClick={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <button
+            type="button"
+            className="danger"
+            role="menuitem"
+            onClick={() => {
+              setTrashContextMenu(undefined);
+              onEmptyTrash();
+            }}
+          >
+            <Trash2 size={15} />
+            <span>Empty Trash...</span>
+          </button>
         </div>
       )}
     </aside>
@@ -580,16 +614,18 @@ function NavButton({
   label,
   active,
   count,
-  onClick
+  onClick,
+  onContextMenu
 }: {
   icon: LucideIcon;
   label: string;
   active: boolean;
   count: number;
   onClick: () => void;
+  onContextMenu?: (event: React.MouseEvent) => void;
 }) {
   return (
-    <button className={active ? "collection-button active" : "collection-button"} type="button" onClick={onClick}>
+    <button className={active ? "collection-button active" : "collection-button"} type="button" onClick={onClick} onContextMenu={onContextMenu}>
       <Icon size={16} />
       <span>{label}</span>
       <strong>{count}</strong>

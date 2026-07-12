@@ -336,12 +336,19 @@ export function PaperList({
                   key={paper.id}
                   paper={paper}
                   searchMeta={searchMeta?.get(paper.id)}
-                  fileAsset={state.fileAssets.find((file) =>
-                    file.paperId === paper.id
-                    && !file.deletedAt
-                    && file.downloadState === "local"
-                    && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName))
-                  )}
+                  fileAsset={
+                    state.fileAssets.find((file) =>
+                      file.paperId === paper.id
+                      && !file.deletedAt
+                      && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName))
+                      && (Boolean(file.localPath) || file.downloadState === "local")
+                    ) ??
+                    state.fileAssets.find((file) =>
+                      file.paperId === paper.id
+                      && !file.deletedAt
+                      && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName))
+                    )
+                  }
                   active={paper.id === selectedPaperId}
                   onClick={() => onSelectPaper(paper.id)}
                   onDoubleClick={() => onOpenPaper(paper.id)}
@@ -360,7 +367,7 @@ export function PaperList({
           y={contextMenu.y}
           isTrash={isTrash}
           canRemoveFromCollection={isRealCollectionId(selectedCollectionId)}
-          hasLocalPdf={state.fileAssets.some((file) => file.paperId === contextMenu.paperId && !file.deletedAt && file.downloadState === "local" && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName)))}
+          hasLocalPdf={state.fileAssets.some((file) => file.paperId === contextMenu.paperId && !file.deletedAt && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName)) && (Boolean(file.localPath) || file.downloadState === "local"))}
           onBindLocalPdf={() => { onBindLocalPdf(contextMenu.paperId); setContextMenu(undefined); }}
           onRemoveFromCollection={() => {
             onRemovePaperFromCollection(contextMenu.paperId);

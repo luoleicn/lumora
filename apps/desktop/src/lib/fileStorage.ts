@@ -104,6 +104,10 @@ export async function readPdfFromDisk(directory: string, fileName: string): Prom
   return new Uint8Array(buffer);
 }
 
+export async function listStoredPdfs(directory: string): Promise<string[]> {
+  return invoke<string[]>("list_stored_pdfs", { dir: directory });
+}
+
 export async function deleteStoredPdf(directory: string, fileName: string): Promise<void> {
   await invoke("delete_stored_pdf", { dir: directory, fileName });
 }
@@ -289,4 +293,133 @@ export async function migrateStoredPdfs(
   }
 
   return state;
+}
+
+// Picks the on-disk file that belongs to `fileAsset` out of the still-available
+// names. A record's own localPath/fileName wins outright; otherwise the template
+// name (and its `-N` collision variants) is matched so a record that only
+// carries metadata — e.g. synced from another device — still binds to the PDF a
+// prior device wrote. The chosen name is consumed by the caller so two records
+// can never claim the same file.
+function resolveDiskName(
+  fileAsset: FileAsset,
+  paper: Paper,
+  template: string,
+  available: Set<string>
+): string | undefined {
+  for (const candidate of [fileAsset.localPath, fileAsset.fileName]) {
+    if (candidate && /\.pdf$/i.test(candidate) && available.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  const targetName = buildPdfFileName(paper, template);
+  if (available.has(targetName)) {
+    return targetName;
+  }
+  for (const name of available) {
+    if (fileNameMatchesTarget(name, targetName)) {
+      return name;
+    }
+  }
+
+  return undefined;
+}
+
+// Reconciles library file records against the actual storage directory, making
+// the folder the single source of truth for "does this paper have a local PDF".
+// Idempotent; safe to run on every startup. Three jobs:
+//   1. Drains leftover IndexedDB blobs to disk (post-migration cleanup) so the
+//      browser store never retains PDFs once a folder is configured.
+//   2. Re-links records whose PDF sits in the folder but lost its `localPath`
+//      (cross-device cloud/Mendeley sync, interrupted migrations) — this is what
+//      pulls a paper out of "No PDF" and lets it open again.
+//   3. Clears stale `localPath`/local flags whose file is genuinely gone, so the
+//      paper correctly falls into "No PDF" instead of failing to open.
+export async function reconcileFileStorage(
+  current: LibraryState,
+  settings: FileStorageSettings
+): Promise<LibraryState> {
+  const directory = settings.directory;
+  if (!directory) {
+    return current;
+  }
+
+  let available: Set<string>;
+  try {
+    available = new Set(await listStoredPdfs(directory));
+  } catch {
+    return current; // folder unreadable this run; retried on the next startup
+  }
+
+  const paperById = new Map(current.papers.map((paper) => [paper.id, paper]));
+  const changed = new Map<string, FileAsset>();
+  const now = () => new Date().toISOString();
+
+  // Pass 1: drain any bytes still living in IndexedDB onto disk. Crash-safe
+  // ordering — write to disk, then delete the blob only after.
+  for (const fileAsset of current.fileAssets) {
+    if (fileAsset.deletedAt) continue;
+    const paper = paperById.get(fileAsset.paperId);
+    if (!paper || paper.deletedAt) continue;
+
+    const blob = await getFileBytes(fileAsset.id);
+    if (!blob) continue;
+
+    const storedName = await storePdfToDisk(directory, buildPdfFileName(paper, settings.nameTemplate), blob);
+    await deleteFileBlob(fileAsset.id);
+    available.add(storedName);
+    changed.set(fileAsset.id, {
+      ...fileAsset,
+      fileName: storedName,
+      localPath: storedName,
+      downloadState: "local",
+      updatedAt: now()
+    });
+  }
+
+  // Pass 2: bind each remaining record to its file on disk, consuming the name
+  // so no two records claim the same file.
+  for (const fileAsset of current.fileAssets) {
+    if (fileAsset.deletedAt || changed.has(fileAsset.id)) continue;
+    const paper = paperById.get(fileAsset.paperId);
+    if (!paper || paper.deletedAt) continue;
+
+    const onDisk = resolveDiskName(fileAsset, paper, settings.nameTemplate, available);
+    if (onDisk) {
+      available.delete(onDisk);
+      if (fileAsset.localPath !== onDisk || fileAsset.fileName !== onDisk || fileAsset.downloadState !== "local") {
+        changed.set(fileAsset.id, {
+          ...fileAsset,
+          fileName: onDisk,
+          localPath: onDisk,
+          downloadState: "local",
+          updatedAt: now()
+        });
+      }
+      continue;
+    }
+
+    // No file on disk and no blob: a record still claiming to be local is stale.
+    // Demote it to "remote" and drop the dangling localPath so it reads as
+    // "No PDF" rather than trying to open a file that isn't there.
+    if (fileAsset.localPath || fileAsset.downloadState === "local") {
+      changed.set(fileAsset.id, {
+        ...fileAsset,
+        localPath: undefined,
+        downloadState: "remote",
+        updatedAt: now()
+      });
+    }
+  }
+
+  if (changed.size === 0) {
+    return current;
+  }
+
+  await persistEntities([...changed.values()].map((entity) => ({ entityType: "fileAsset" as const, entity })));
+  return {
+    ...current,
+    fileAssets: current.fileAssets.map((item) => changed.get(item.id) ?? item)
+  };
 }

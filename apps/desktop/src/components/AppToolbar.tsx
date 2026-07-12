@@ -29,7 +29,13 @@ export function AppToolbar({
       {searchMode === "library" ? (
         <label className="global-search">
           <Search size={16} />
-          <input value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder="Search library" />
+          <input
+            type="text"
+            data-search-input=""
+            value={search}
+            onChange={(event) => onSearchChange(event.target.value)}
+            placeholder="Search library"
+          />
         </label>
       ) : (
         <PdfFindBar
