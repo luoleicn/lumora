@@ -106,14 +106,19 @@ export function SyncSettingsModal({
           </label>
           <label>
             Region (optional)
-            <input value={draft.region ?? ""} onChange={(event) => setDraft({ ...draft, region: event.target.value })} disabled={busy} />
+            <input
+              value={draft.region ?? ""}
+              onChange={(event) => setDraft({ ...draft, region: event.target.value })}
+              placeholder="Auto-detected from the endpoint, e.g. cn-east-1"
+              disabled={busy}
+            />
           </label>
           <label>
-            Private download domain
+            S3 endpoint
             <input
               value={draft.privateDomain}
               onChange={(event) => setDraft({ ...draft, privateDomain: event.target.value })}
-              placeholder="https://papers.example.com"
+              placeholder="s3.cn-east-1.qiniucs.com"
               disabled={busy}
               required
             />

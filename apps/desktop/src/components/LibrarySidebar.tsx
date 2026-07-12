@@ -48,6 +48,8 @@ type LibrarySidebarProps = {
   cloudSyncActivity?: LibrarySyncActivity;
   mendeleySyncActivity?: LibrarySyncActivity;
   onCancelMendeleySync: () => void;
+  onCancelCloudSync: () => void;
+  onDismissCloudSync: () => void;
 };
 
 export type LibrarySyncActivity = {
@@ -85,7 +87,9 @@ export function LibrarySidebar({
   syncBusy,
   cloudSyncActivity,
   mendeleySyncActivity,
-  onCancelMendeleySync
+  onCancelMendeleySync,
+  onCancelCloudSync,
+  onDismissCloudSync
 }: LibrarySidebarProps) {
   const [authorsExpanded, setAuthorsExpanded] = useState(false);
   const [tagsExpanded, setTagsExpanded] = useState(false);
@@ -326,6 +330,15 @@ export function LibrarySidebar({
               {cloudSyncActivity.state === "cancelled" && <CircleX size={14} />}
               <span>{cloudSyncActivity.state === "running" ? "Cloud syncing" : cloudSyncActivity.state === "success" ? "Cloud synced" : cloudSyncActivity.state === "cancelled" ? "Cloud sync cancelled" : "Cloud sync failed"}</span>
               <small>{Math.round((cloudSyncActivity.completed / Math.max(1, cloudSyncActivity.total)) * 100)}%</small>
+              <button
+                type="button"
+                className="library-sync-cancel"
+                onClick={cloudSyncActivity.state === "running" ? onCancelCloudSync : onDismissCloudSync}
+                aria-label={cloudSyncActivity.state === "running" ? "Cancel cloud sync" : "Dismiss"}
+                title={cloudSyncActivity.state === "running" ? "Cancel sync" : "Dismiss"}
+              >
+                <X size={13} />
+              </button>
             </div>
             <div className="library-sync-progress" aria-hidden>
               <span style={{ width: `${Math.min(100, (cloudSyncActivity.completed / Math.max(1, cloudSyncActivity.total)) * 100)}%` }} />

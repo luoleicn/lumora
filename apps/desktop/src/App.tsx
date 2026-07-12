@@ -189,6 +189,7 @@ export default function App() {
   const importTargetCollectionIdRef = useRef<string | undefined>(undefined);
   const pdfRenameInFlightRef = useRef(false);
   const mendeleyCancelRequestedRef = useRef(false);
+  const cloudSyncCancelRequestedRef = useRef(false);
   const arxivDownloadInFlightRef = useRef(false);
   const cloudSyncInFlightRef = useRef(false);
   const libraryRef = useRef<LibraryState | undefined>(undefined);
@@ -343,13 +344,9 @@ export default function App() {
     return () => unlisten?.();
   }, []);
 
-  // Auto-dismiss the cloud-sync indicator a few seconds after it settles so a
-  // finished background sync does not linger in the sidebar.
-  useEffect(() => {
-    if (!cloudSyncActivity || cloudSyncActivity.state === "running") return;
-    const timer = window.setTimeout(() => setCloudSyncActivity(undefined), 6_000);
-    return () => window.clearTimeout(timer);
-  }, [cloudSyncActivity]);
+  // Cloud-sync activity card in the sidebar persists until the user explicitly
+  // dismisses it: clicking X while the sync is running cancels and dismisses;
+  // clicking X after completion simply closes the card.
 
   useEffect(() => {
     saveAutoSyncSettings(autoSyncSettings);
@@ -1603,6 +1600,7 @@ export default function App() {
   async function handleSync() {
     if (cloudSyncInFlightRef.current || !settings.configured) return;
     cloudSyncInFlightRef.current = true;
+    cloudSyncCancelRequestedRef.current = false;
     setCloudSyncActivity({ state: "running", message: "Starting sync…", completed: 0, total: 5 });
     try {
       const result = await syncLibrary(
@@ -1611,6 +1609,7 @@ export default function App() {
         (message, completed = 0, total = 5) =>
           setCloudSyncActivity({ state: "running", message, completed, total })
       );
+      if (cloudSyncCancelRequestedRef.current) return;
       setLibrary(result.state);
       setCloudSyncActivity({
         state: "success",
@@ -1619,6 +1618,7 @@ export default function App() {
         total: 5
       });
     } catch (error) {
+      if (cloudSyncCancelRequestedRef.current) return;
       setCloudSyncActivity({ state: "error", message: formatActionError(error), completed: 0, total: 5 });
     } finally {
       cloudSyncInFlightRef.current = false;
@@ -1723,6 +1723,20 @@ export default function App() {
     } : current);
   }
 
+  // When the cloud sync is still running, clicking X requests cancellation and
+  // dismisses the card immediately — the backend finishes in the background but
+  // the result is silently discarded.
+  function handleCancelCloudSync() {
+    cloudSyncCancelRequestedRef.current = true;
+    setCloudSyncActivity(undefined);
+  }
+
+  // When the cloud sync has already settled (success / error), clicking X
+  // simply removes the card.
+  function handleDismissCloudSync() {
+    setCloudSyncActivity(undefined);
+  }
+
   async function runBusy(successMessage: string, task: () => Promise<void>) {
     setBusy(true);
     setStatus(undefined);
@@ -1819,6 +1833,8 @@ export default function App() {
               cloudSyncActivity={cloudSyncActivity}
               mendeleySyncActivity={mendeleySyncActivity}
               onCancelMendeleySync={handleCancelMendeleySync}
+              onCancelCloudSync={handleCancelCloudSync}
+              onDismissCloudSync={handleDismissCloudSync}
             />
           )}
 

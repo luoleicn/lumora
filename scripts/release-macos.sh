@@ -211,6 +211,24 @@ make_dmg() {
   cp -R "$app_bundle" "$staging/"
   ln -s /Applications "$staging/Applications"
 
+  # Apply pre-generated .DS_Store for Finder window layout (icon positions,
+  # window size, background image, etc.). This avoids mounting the DMG and
+  # running AppleScript during every release build.
+  # Generate (or regenerate) the template with: ./scripts/generate-dmg-dsstore.sh
+  local dsstore_template="$TAURI_DIR/dmg-dsstore"
+  if [[ -f "$dsstore_template" ]]; then
+    cp "$dsstore_template" "$staging/.DS_Store"
+  else
+    warn "No dmg-dsstore template found at $dsstore_template"
+    warn "DMG will have default Finder layout. Run scripts/generate-dmg-dsstore.sh to fix."
+  fi
+
+  # Copy background image if present (referenced by the .DS_Store template)
+  local bg_src="$TAURI_DIR/dmg-background.png"
+  if [[ -f "$bg_src" ]]; then
+    cp "$bg_src" "$staging/.background.png"
+  fi
+
   hdiutil create -srcfolder "$staging" \
     -volname "$APP_NAME" \
     -format UDZO \
@@ -316,15 +334,19 @@ fi
 
 log "Release created — id: $RELEASE_ID"
 
+UPLOAD_BASE="https://uploads.github.com/repos/$REPO_SLUG/releases/$RELEASE_ID/assets"
+
 for ASSET in "${ASSETS[@]}"; do
   ASSET_NAME=$(basename "$ASSET")
   log "Uploading $ASSET_NAME ..."
-  curl -s --fail -X POST \
+  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
     -H "$AUTH_HEADER" \
     -H "Content-Type: application/octet-stream" \
     --data-binary "@$ASSET" \
-    "$API_BASE/releases/$RELEASE_ID/assets?name=$ASSET_NAME" >/dev/null \
-    || err "Failed to upload $ASSET_NAME"
+    "$UPLOAD_BASE?name=$ASSET_NAME")
+  if [[ "$HTTP_CODE" != "201" ]]; then
+    err "Failed to upload $ASSET_NAME (HTTP $HTTP_CODE)"
+  fi
 done
 
 # --------------- done ---------------

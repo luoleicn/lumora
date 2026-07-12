@@ -292,12 +292,36 @@ export async function syncLibrary(
   // macOS keeps a complete local mirror. Device-local path/status changes are
   // persisted as remote-source writes so they never enter the cloud outbox.
   const downloadedFiles = [...state.fileAssets];
+  const downloadErrors: string[] = [];
+  let consecutiveDownloadFailures = 0;
   for (const [index, file] of downloadedFiles.entries()) {
     if (file.deletedAt || file.contentRef?.kind !== "object") continue;
+    // A synthetic Mendeley hash ("mendeley-sha1:…"/"mendeley-note:…") is a
+    // placeholder for a file whose real bytes were never available to upload, so
+    // no cloud blob exists under that key. Leave it metadata-only rather than
+    // hard-failing the whole sync on a guaranteed 404.
+    if (file.contentRef.sha256.startsWith("mendeley-")) continue;
     if ((await readFileBytes(file, storage))?.length) continue;
     onStage?.(`Downloading file from cloud: ${file.fileName}`, 3, 5);
-    const buffer = await invoke<ArrayBuffer>("qiniu_download_blob", { sha256: file.contentRef.sha256 });
-    const bytes = new Uint8Array(buffer);
+    let bytes: Uint8Array<ArrayBuffer>;
+    try {
+      const buffer = await invoke<ArrayBuffer>("qiniu_download_blob", { sha256: file.contentRef.sha256 });
+      bytes = new Uint8Array(buffer);
+    } catch (error) {
+      // One missing or un-fetchable blob must not abort the whole library sync:
+      // record it and move on, leaving the file as a metadata-only placeholder to
+      // retry next time. Bail out fast if downloads fail systemically (e.g. a
+      // wrong region) instead of grinding through hundreds of doomed attempts.
+      const detail = error instanceof Error ? error.message : String(error);
+      downloadErrors.push(`${file.fileName}: ${detail}`);
+      consecutiveDownloadFailures += 1;
+      if (consecutiveDownloadFailures >= 5) {
+        summary.errors.push(...downloadErrors);
+        throw new Error(`Cloud sync aborted after ${consecutiveDownloadFailures} consecutive download failures. Latest — ${file.fileName}: ${detail}`);
+      }
+      continue;
+    }
+    consecutiveDownloadFailures = 0;
     let localPath: string | undefined;
     if (storage.directory) {
       localPath = await storePdfToDisk(storage.directory, file.fileName, bytes);
@@ -307,6 +331,7 @@ export async function syncLibrary(
     downloadedFiles[index] = { ...file, localPath, downloadState: "local" };
     summary.downloadedFiles += 1;
   }
+  summary.errors.push(...downloadErrors);
   if (downloadedFiles.some((file, index) => file !== state.fileAssets[index])) {
     await persistEntities(downloadedFiles
       .filter((file, index) => file !== state.fileAssets[index])

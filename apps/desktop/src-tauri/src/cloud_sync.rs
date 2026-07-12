@@ -1,19 +1,15 @@
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
-use qiniu_sdk::{
-    credential::Credential,
-    objects::{apis::http_client::ResponseErrorKind, ObjectsManager},
-    upload::{AutoUploader, AutoUploaderObjectParams, UploadManager, UploadTokenSigner},
-};
+use hmac::{Hmac, Mac};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
     io::{Read, Write},
-    path::PathBuf,
-    time::Duration,
+    sync::OnceLock,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Runtime};
 use sha2::{Digest, Sha256};
 
 const CONFIG_META_KEY: &str = "qiniuSyncConfigV1";
@@ -25,6 +21,249 @@ const KEYRING_SERVICE: &str = "com.lumora.desktop.qiniu";
 const PREFIX: &str = "lumora/v1";
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_CHANGES_PER_BATCH: usize = 500;
+
+// A single shared reqwest client. A server that accepts a connection and never
+// responds must fail fast rather than hang the whole sync forever, which would
+// leave the UI stuck and block manual re-syncs.
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn http_client() -> reqwest::Client {
+    HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(120))
+                .build()
+                .expect("failed to build reqwest client")
+        })
+        .clone()
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    hex::encode(Sha256::digest(data))
+}
+
+/// Percent-encodes per RFC 3986 the way AWS SigV4 canonicalisation requires:
+/// everything except the unreserved set is escaped, and `/` is kept only inside
+/// object-key paths (`encode_slash = false`).
+fn uri_encode(input: &str, encode_slash: bool) -> String {
+    let mut out = String::with_capacity(input.len());
+    for &byte in input.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(byte as char),
+            b'/' if !encode_slash => out.push('/'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// Breaks a Unix timestamp into the two forms SigV4 needs: the full
+/// `YYYYMMDDTHHMMSSZ` amz-date and the `YYYYMMDD` datestamp, in UTC.
+/// Uses Howard Hinnant's civil-from-days algorithm so we avoid a date crate.
+fn amz_timestamps(secs: u64) -> (String, String) {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (hour, minute, second) = (rem / 3_600, (rem % 3_600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    (
+        format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z"),
+        format!("{year:04}{month:02}{day:02}"),
+    )
+}
+
+/// How the bucket is addressed. Path-style keeps the bucket in the request path
+/// (`s3.<region>.qiniucs.com/<bucket>/<key>`); virtual-hosted bakes it into the
+/// host (`<bucket>.s3.<region>.qiniucs.com/<key>`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AddressingStyle {
+    Path,
+    VirtualHosted,
+}
+
+/// A resolved Qiniu S3-compatible endpoint. `base` is `scheme://host[:port]`,
+/// `host_header` is exactly what goes into the (signed) `Host` header, `region`
+/// scopes the SigV4 credential, and `style` decides where the bucket goes.
+struct S3Target {
+    base: String,
+    host_header: String,
+    region: String,
+    style: AddressingStyle,
+}
+
+/// Extracts `(region, addressing_style)` from a Qiniu S3 host. Handles path-style
+/// `s3.<region>.qiniucs.com`, virtual-hosted `<bucket>.s3.<region>.qiniucs.com`,
+/// and the older dash form `s3-<region>.qiniucs.com`. Returns None for custom
+/// domains, where the region must be set explicitly in Settings → Cloud Sync.
+fn parse_host(host: &str) -> Option<(String, AddressingStyle)> {
+    let lower = host.to_ascii_lowercase();
+    let core = lower.strip_suffix(".qiniucs.com")?;
+    // Path-style: the whole host is the S3 endpoint.
+    if let Some(region) = core.strip_prefix("s3.").or_else(|| core.strip_prefix("s3-")) {
+        return (!region.is_empty()).then(|| (region.to_string(), AddressingStyle::Path));
+    }
+    // Virtual-hosted: the bucket is the label(s) before `.s3.`/`.s3-`.
+    let region = core
+        .find(".s3.")
+        .or_else(|| core.find(".s3-"))
+        .map(|index| &core[index + 4..])?;
+    (!region.is_empty()).then(|| (region.to_string(), AddressingStyle::VirtualHosted))
+}
+
+fn resolve_target(config: &QiniuSyncConfig) -> Result<S3Target, String> {
+    let raw = config.private_domain.trim().trim_end_matches('/');
+    if raw.is_empty() {
+        return Err("The S3 endpoint (private domain) is not configured.".to_string());
+    }
+    let with_scheme = if raw.starts_with("http://") || raw.starts_with("https://") {
+        raw.to_string()
+    } else {
+        format!("https://{raw}")
+    };
+    let uri: http::Uri = with_scheme.parse().map_err(|error| format!("Invalid S3 endpoint '{raw}': {error}"))?;
+    let scheme = uri.scheme_str().unwrap_or("https").to_string();
+    let host = uri
+        .host()
+        .ok_or_else(|| format!("S3 endpoint '{raw}' has no host."))?
+        .to_string();
+    let default_port = if scheme == "http" { 80 } else { 443 };
+    let (base, host_header) = match uri.port_u16() {
+        Some(port) if port != default_port => (format!("{scheme}://{host}:{port}"), format!("{host}:{port}")),
+        _ => (format!("{scheme}://{host}"), host.clone()),
+    };
+    // Custom domains that don't match a Qiniu host default to path-style, and
+    // require the region to be supplied explicitly.
+    let parsed = parse_host(&host);
+    let style = parsed.as_ref().map_or(AddressingStyle::Path, |(_, style)| *style);
+    let region = config
+        .region
+        .as_deref()
+        .map(str::trim)
+        .filter(|region| !region.is_empty())
+        .map(String::from)
+        .or_else(|| parsed.map(|(region, _)| region))
+        .ok_or_else(|| {
+            format!(
+                "Cannot determine the S3 region from the endpoint '{host}'. \
+                 Expected a host like 's3.<region>.qiniucs.com' or '<bucket>.s3.<region>.qiniucs.com', \
+                 or set the Region field in Settings → Cloud Sync."
+            )
+        })?;
+    Ok(S3Target { base, host_header, region, style })
+}
+
+/// Canonical request URI for an object under this target's addressing style.
+/// Path-style prepends the bucket; virtual-hosted keys off the root.
+fn object_uri(target: &S3Target, config: &QiniuSyncConfig, key: &str) -> String {
+    match target.style {
+        AddressingStyle::Path => format!("/{}/{}", uri_encode(&config.bucket, true), uri_encode(key, false)),
+        AddressingStyle::VirtualHosted => format!("/{}", uri_encode(key, false)),
+    }
+}
+
+/// Canonical request URI for a bucket-level operation (e.g. ListObjectsV2).
+fn bucket_uri(target: &S3Target, config: &QiniuSyncConfig) -> String {
+    match target.style {
+        AddressingStyle::Path => format!("/{}", uri_encode(&config.bucket, true)),
+        AddressingStyle::VirtualHosted => "/".to_string(),
+    }
+}
+
+/// The resource a request targets: a single object by key, or the bucket itself
+/// (for listing). The canonical URI is derived from this plus the addressing style.
+enum S3Resource<'a> {
+    Object(&'a str),
+    Bucket,
+}
+
+/// Signs and sends one S3 request with SigV4 header authentication. `query` holds
+/// raw (unencoded) key/value pairs.
+async fn s3_send(
+    config: &QiniuSyncConfig,
+    secret: &str,
+    method: reqwest::Method,
+    resource: S3Resource<'_>,
+    query: &[(&str, &str)],
+    body: Option<Vec<u8>>,
+) -> Result<reqwest::Response, String> {
+    let target = resolve_target(config)?;
+    let canonical_uri = match resource {
+        S3Resource::Object(key) => object_uri(&target, config, key),
+        S3Resource::Bucket => bucket_uri(&target, config),
+    };
+    let payload = body.as_deref().unwrap_or(&[]);
+    let payload_hash = sha256_hex(payload);
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| error.to_string())?.as_secs();
+    let (amz_date, datestamp) = amz_timestamps(now);
+
+    // Canonical query string: sorted by encoded key, both key and value encoded.
+    let mut encoded: Vec<(String, String)> = query
+        .iter()
+        .map(|(key, value)| (uri_encode(key, true), uri_encode(value, true)))
+        .collect();
+    encoded.sort();
+    let canonical_query = encoded
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&");
+
+    let canonical_headers =
+        format!("host:{}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n", target.host_header);
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let canonical_request = format!(
+        "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    );
+
+    let scope = format!("{datestamp}/{}/s3/aws4_request", target.region);
+    let string_to_sign =
+        format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(canonical_request.as_bytes()));
+
+    let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), datestamp.as_bytes());
+    let k_region = hmac_sha256(&k_date, target.region.as_bytes());
+    let k_service = hmac_sha256(&k_region, b"s3");
+    let k_signing = hmac_sha256(&k_service, b"aws4_request");
+    let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
+
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
+        config.access_key
+    );
+
+    let url = if canonical_query.is_empty() {
+        format!("{}{canonical_uri}", target.base)
+    } else {
+        format!("{}{canonical_uri}?{canonical_query}", target.base)
+    };
+
+    let mut builder = http_client()
+        .request(method, &url)
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", &payload_hash)
+        .header("Authorization", &authorization);
+    if let Some(body) = body {
+        builder = builder.body(body);
+    }
+    builder.send().await.map_err(|error| error.to_string())
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -197,10 +436,6 @@ fn load_secret(config: &QiniuSyncConfig) -> Result<String, String> {
         .map_err(|error| format!("Failed to read Qiniu Secret Key from the system keychain: {error}"))
 }
 
-fn credential(config: &QiniuSyncConfig, secret: &str) -> Credential {
-    Credential::new(config.access_key.clone(), secret.to_string())
-}
-
 fn gzip_json<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
     let json = serde_json::to_vec(value).map_err(|error| error.to_string())?;
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -215,147 +450,89 @@ fn ungzip_json<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, String> 
     serde_json::from_slice(&json).map_err(|error| error.to_string())
 }
 
-fn upload_temp_path<R: Runtime>(app: &AppHandle<R>, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
-    let dir = app.path().app_cache_dir().map_err(|error| error.to_string())?.join("qiniu-sync");
-    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-    let path = dir.join(name);
-    std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
-    Ok(path)
-}
-
-async fn upload_bytes<R: Runtime>(
-    app: &AppHandle<R>,
-    config: &QiniuSyncConfig,
-    secret: &str,
-    key: &str,
-    bytes: &[u8],
-) -> Result<(), String> {
-    let path = upload_temp_path(app, &format!("{}.upload", uuid::Uuid::new_v4()), bytes)?;
-    let object_key = key.to_string();
-    let upload_path = path.clone();
-    let bucket = config.bucket.clone();
-    let access_key = config.access_key.clone();
-    let secret_owned = secret.to_string();
-    let upload_handle = tauri::async_runtime::spawn_blocking({
-        let object_key = object_key.clone();
-        move || {
-            let manager = UploadManager::builder(UploadTokenSigner::new_credential_provider(
-                Credential::new(access_key, secret_owned),
-                bucket,
-                Duration::from_secs(3600),
-            ))
-            .build();
-            let params = AutoUploaderObjectParams::builder()
-                .object_name(object_key.clone())
-                .file_name(object_key)
-                .build();
-            let uploader: AutoUploader = manager.auto_uploader();
-            uploader.upload_path(&upload_path, params).map_err(|error| error.to_string())
-        }
-    });
-    // The Qiniu SDK's blocking uploader has no timeout of its own; without this a
-    // stalled region query or upload connection hangs the whole sync forever.
-    let upload_result = match tokio::time::timeout(Duration::from_secs(120), upload_handle).await {
-        Err(_) => {
-            let _ = std::fs::remove_file(&path);
-            return Err(format!(
-                "Qiniu upload of {object_key} timed out after 120s — the upload host did not respond. \
-                 Check the bucket's region and any required network proxy."
-            ));
-        }
-        Ok(joined) => joined.map_err(|error| error.to_string())?,
-    };
-    let _ = std::fs::remove_file(path);
-    upload_result.map_err(|error| format!("Qiniu upload of {object_key} failed: {error}"))?;
+async fn upload_bytes(config: &QiniuSyncConfig, secret: &str, key: &str, bytes: &[u8]) -> Result<(), String> {
+    let response = s3_send(config, secret, reqwest::Method::PUT, S3Resource::Object(key), &[], Some(bytes.to_vec()))
+        .await
+        .map_err(|error| format!("Qiniu upload of {key} failed: {error}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Qiniu upload of {key} failed: {status}. Body: {body}"));
+    }
 
     // Qiniu Kodo is strongly consistent, so a freshly uploaded object must be
     // immediately stat-able. When it is not, the PUT was accepted upstream but
     // nothing actually landed in the bucket — surface that instead of reporting
     // success, which would otherwise mark the file as synced while other devices
     // can never download it.
-    let (_, _, stored_size) = stat_object(config, secret, &object_key).await.map_err(|error| {
+    let (_, _, stored_size) = stat_object(config, secret, key).await.map_err(|error| {
         format!(
-            "Qiniu accepted the upload of {object_key} but the object is missing afterwards ({error}). \
+            "Qiniu accepted the upload of {key} but the object is missing afterwards ({error}). \
              Verify the bucket name and that its region matches this account."
         )
     })?;
     if stored_size != bytes.len() as u64 {
-        return Err(format!(
-            "Qiniu stored {stored_size} bytes for {object_key} but {} were uploaded.",
-            bytes.len()
-        ));
+        return Err(format!("Qiniu stored {stored_size} bytes for {key} but {} were uploaded.", bytes.len()));
     }
     Ok(())
 }
 
-fn private_url(config: &QiniuSyncConfig, secret: &str, key: &str) -> Result<String, String> {
-    let domain = config.private_domain.trim().trim_end_matches('/');
-    let domain = if domain.starts_with("http://") || domain.starts_with("https://") {
-        domain.to_string()
-    } else {
-        format!("https://{domain}")
-    };
-    let encoded = key
-        .split('/')
-        .map(|part| percent_encoding::utf8_percent_encode(part, percent_encoding::NON_ALPHANUMERIC).to_string())
-        .collect::<Vec<_>>()
-        .join("/");
-    let uri: http::Uri = format!("{domain}/{encoded}").parse::<http::Uri>().map_err(|error| error.to_string())?;
-    Ok(credential(config, secret)
-        .sign_download_url(uri, Duration::from_secs(900))
-        .to_string())
-}
-
 async fn download_bytes(config: &QiniuSyncConfig, secret: &str, key: &str) -> Result<Vec<u8>, String> {
-    // A stalled connection must fail fast rather than hang the whole sync
-    // forever, which would leave the UI stuck and block manual re-syncs.
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|error| error.to_string())?;
-    let response = client
-        .get(private_url(config, secret, key)?)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
+    let response = s3_send(config, secret, reqwest::Method::GET, S3Resource::Object(key), &[], None).await?;
     if !response.status().is_success() {
-        return Err(format!("Qiniu download failed for {key}: {}", response.status()));
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Qiniu download failed for {key}: {status}. Body: {body}. \
+             Verify that the S3 endpoint, bucket, region, Access Key and Secret Key in \
+             Settings → Cloud Sync are correct for this bucket."
+        ));
     }
     response.bytes().await.map(|bytes| bytes.to_vec()).map_err(|error| error.to_string())
 }
 
-/// Runs a blocking Qiniu SDK call on a worker thread with a hard timeout, so a
-/// stalled region query or connection can never hang the whole sync forever.
-async fn run_blocking_timeout<T, F>(label: &str, secs: u64, task: F) -> Result<T, String>
-where
-    F: FnOnce() -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    let handle = tauri::async_runtime::spawn_blocking(task);
-    match tokio::time::timeout(Duration::from_secs(secs), handle).await {
-        Err(_) => Err(format!(
-            "{label} timed out after {secs}s — Qiniu did not respond. Check the bucket's region and any required network proxy."
-        )),
-        Ok(joined) => joined.map_err(|error| error.to_string())?,
-    }
+/// Reads the object size from the `Content-Length` header. reqwest's
+/// `Response::content_length()` reports the *body* size hint, which is always 0
+/// for a HEAD response, so it must not be used for stat calls.
+fn content_length_header(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
+/// Qiniu's native putTime is measured in 100-nanosecond units since the Unix
+/// epoch. S3 only exposes second-granularity `Last-Modified`, so we scale it to
+/// the same units — this keeps the last-write-wins ordering key comparable with
+/// version rows written by the previous Qiniu-native implementation.
+fn put_time_from_response(response: &reqwest::Response) -> u64 {
+    let system_time = response
+        .headers()
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| httpdate::parse_http_date(value).ok())
+        .unwrap_or_else(SystemTime::now);
+    system_time.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) * 10_000_000
+}
+
+/// Returns `(put_time, etag, size)`. The etag is unused by callers but kept for
+/// signature parity with the previous implementation.
 async fn stat_object(config: &QiniuSyncConfig, secret: &str, key: &str) -> Result<(u64, String, u64), String> {
-    let config = config.clone();
-    let secret = secret.to_string();
-    let key_owned = key.to_string();
-    run_blocking_timeout(&format!("Qiniu stat of {key}"), 60, move || {
-        let manager = ObjectsManager::new(credential(&config, &secret));
-        let response = manager
-            .bucket(&config.bucket)
-            .stat_object(&key_owned)
-            .call()
-            .map_err(|error| error.to_string())?;
-        let object = response.into_body();
-        Ok((object.get_put_time_as_u64(), object.get_hash_as_str().to_string(), object.get_size_as_u64()))
-    })
-    .await
+    let response = s3_send(config, secret, reqwest::Method::HEAD, S3Resource::Object(key), &[], None).await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        return Err(format!("Qiniu stat of {key} failed: {status}."));
+    }
+    let put_time = put_time_from_response(&response);
+    let etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim_matches('"').to_string())
+        .unwrap_or_default();
+    let size = content_length_header(&response).unwrap_or(0);
+    Ok((put_time, etag, size))
 }
 
 async fn object_exists(config: &QiniuSyncConfig, secret: &str, key: &str) -> bool {
@@ -367,21 +544,14 @@ async fn stat_object_if_exists(
     secret: &str,
     key: &str,
 ) -> Result<Option<u64>, String> {
-    let config = config.clone();
-    let secret = secret.to_string();
-    let key_owned = key.to_string();
-    run_blocking_timeout(&format!("Qiniu stat of {key}"), 60, move || {
-        let manager = ObjectsManager::new(credential(&config, &secret));
-        match manager.bucket(&config.bucket).stat_object(&key_owned).call() {
-            Ok(response) => Ok(Some(response.into_body().get_size_as_u64())),
-            Err(error) if matches!(
-                error.kind(),
-                ResponseErrorKind::StatusCodeError(status) if status.as_u16() == 612 || status.as_u16() == 404
-            ) => Ok(None),
-            Err(error) => Err(error.to_string()),
-        }
-    })
-    .await
+    let response = s3_send(config, secret, reqwest::Method::HEAD, S3Resource::Object(key), &[], None).await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(format!("Qiniu stat of {key} failed: {}.", response.status()));
+    }
+    Ok(Some(content_length_header(&response).unwrap_or(0)))
 }
 
 fn device_id(connection: &rusqlite::Connection) -> Result<String, String> {
@@ -719,41 +889,65 @@ async fn upload_device_state<R: Runtime>(
         updated_at: now_iso(),
         seen,
     };
-    upload_bytes(app, config, secret, &format!("{PREFIX}/devices/{device}.json"), &serde_json::to_vec(&state).unwrap()).await
+    upload_bytes(config, secret, &format!("{PREFIX}/devices/{device}.json"), &serde_json::to_vec(&state).unwrap()).await
 }
 
 async fn delete_object(config: &QiniuSyncConfig, secret: &str, key: &str) -> Result<(), String> {
-    let config = config.clone();
-    let secret = secret.to_string();
-    let key_owned = key.to_string();
-    run_blocking_timeout(&format!("Qiniu delete of {key}"), 60, move || {
-        ObjectsManager::new(credential(&config, &secret))
-            .bucket(&config.bucket)
-            .delete_object(&key_owned)
-            .call()
-            .map_err(|error| error.to_string())?;
-        Ok(())
-    })
-    .await
+    let response = s3_send(config, secret, reqwest::Method::DELETE, S3Resource::Object(key), &[], None).await?;
+    // S3 DELETE is idempotent: a 204 (deleted) and a 404 (already gone) are both
+    // success from our perspective.
+    if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(format!("Qiniu delete of {key} failed: {status}. Body: {body}"))
+}
+
+/// Extracts the text of every `<tag>…</tag>` occurrence in an XML document.
+/// The keys and continuation tokens we read are plain ASCII with no XML
+/// entities, so this deliberately avoids pulling in a full XML parser.
+fn extract_xml_values(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut values = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        let after = &rest[start + open.len()..];
+        let Some(end) = after.find(&close) else { break };
+        values.push(after[..end].to_string());
+        rest = &after[end + close.len()..];
+    }
+    values
 }
 
 async fn list_device_keys(config: &QiniuSyncConfig, secret: &str) -> Result<Vec<String>, String> {
-    let config = config.clone();
-    let secret = secret.to_string();
-    run_blocking_timeout("Qiniu device list", 60, move || {
-        let manager = ObjectsManager::new(credential(&config, &secret));
-        let bucket = manager.bucket(&config.bucket);
-        let mut keys = Vec::new();
-        for entry in bucket.list().iter() {
-            let entry = entry.map_err(|error| error.to_string())?;
-            let key = entry.get_key_as_str();
-            if key.starts_with(&format!("{PREFIX}/devices/")) && key.ends_with(".json") {
-                keys.push(key.to_string());
+    let prefix = format!("{PREFIX}/devices/");
+    let mut keys = Vec::new();
+    let mut continuation: Option<String> = None;
+    loop {
+        let mut query: Vec<(&str, &str)> = vec![("list-type", "2"), ("prefix", prefix.as_str())];
+        if let Some(token) = continuation.as_deref() {
+            query.push(("continuation-token", token));
+        }
+        let response = s3_send(config, secret, reqwest::Method::GET, S3Resource::Bucket, &query, None).await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("Qiniu device list failed: {status}. Body: {body}"));
+        }
+        let xml = response.text().await.map_err(|error| error.to_string())?;
+        for key in extract_xml_values(&xml, "Key") {
+            if key.starts_with(&prefix) && key.ends_with(".json") {
+                keys.push(key);
             }
         }
-        Ok(keys)
-    })
-    .await
+        match extract_xml_values(&xml, "NextContinuationToken").into_iter().next() {
+            Some(token) if !token.is_empty() => continuation = Some(token),
+            _ => break,
+        }
+    }
+    Ok(keys)
 }
 
 async fn pull_remote<R: Runtime>(
@@ -823,11 +1017,8 @@ pub async fn qiniu_save_sync_config<R: Runtime>(
         || request.bucket.trim().is_empty()
         || request.private_domain.trim().is_empty()
     {
-        return Err("Access Key, Secret Key, Bucket, and private domain are required.".to_string());
+        return Err("Access Key, Secret Key, Bucket, and S3 endpoint are required.".to_string());
     }
-    keyring_entry(request.access_key.trim())?
-        .set_password(&request.secret_key)
-        .map_err(|error| format!("Failed to store Qiniu Secret Key in the system keychain: {error}"))?;
     let config = QiniuSyncConfig {
         access_key: request.access_key.trim().to_string(),
         bucket: request.bucket.trim().to_string(),
@@ -836,6 +1027,11 @@ pub async fn qiniu_save_sync_config<R: Runtime>(
         prefix: PREFIX.to_string(),
         configured: true,
     };
+    // Fail fast on an unusable endpoint/region before persisting anything.
+    resolve_target(&config)?;
+    keyring_entry(request.access_key.trim())?
+        .set_password(&request.secret_key)
+        .map_err(|error| format!("Failed to store Qiniu Secret Key in the system keychain: {error}"))?;
     let mut connection = super::open_library_db(&app)?;
     init_sync_schema(&connection)?;
     let target = format!("{}:{}", config.access_key, config.bucket);
@@ -859,12 +1055,17 @@ pub async fn qiniu_test_sync_connection<R: Runtime>(app: AppHandle<R>) -> Result
     let secret = load_secret(&config)
         .map_err(|error| format!("Qiniu connection test failed while reading the Secret Key from Keychain: {error}"))?;
     let key = format!("{PREFIX}/connection-test-{}.json", uuid::Uuid::new_v4());
-    upload_bytes(&app, &config, &secret, &key, br#"{"ok":true}"#)
+    upload_bytes(&config, &secret, &key, br#"{"ok":true}"#)
         .await
         .map_err(|error| format!("Qiniu connection test failed during test-object upload: {error}"))?;
     stat_object(&config, &secret, &key)
         .await
         .map_err(|error| format!("Qiniu connection test uploaded the object, but Stat failed: {error}"))?;
+    // Round-trip a download too, so a signing/endpoint/region mismatch that only
+    // affects reads is caught here rather than during a real sync.
+    download_bytes(&config, &secret, &key)
+        .await
+        .map_err(|error| format!("Qiniu connection test: upload succeeded but downloading through the S3 endpoint ({}) failed: {error}", config.private_domain))?;
     delete_object(&config, &secret, &key)
         .await
         .map_err(|error| format!("Qiniu connection test uploaded and verified the object, but cleanup deletion failed: {error}"))?;
@@ -906,7 +1107,7 @@ pub async fn qiniu_upload_blob<R: Runtime>(
     let secret = load_secret(&config)?;
     let key = format!("{PREFIX}/blobs/sha256/{expected}");
     if !object_exists(&config, &secret, &key).await {
-        upload_bytes(&app, &config, &secret, &key, &bytes).await?;
+        upload_bytes(&config, &secret, &key, &bytes).await?;
     }
     Ok(())
 }
@@ -973,14 +1174,14 @@ pub async fn qiniu_sync_library<R: Runtime>(app: AppHandle<R>) -> Result<SyncSum
     // A fixed, identical protocol object makes concurrent first-device setup idempotent.
     let protocol_key = format!("{PREFIX}/protocol.json");
     if !object_exists(&config, &secret, &protocol_key).await {
-        upload_bytes(&app, &config, &secret, &protocol_key, br#"{"protocolVersion":1}"#).await?;
+        upload_bytes(&config, &secret, &protocol_key, br#"{"protocolVersion":1}"#).await?;
     }
     let mut summary = SyncSummary::default();
     let _ = app.emit("qiniu-sync-stage", "Uploading local changes to Qiniu…");
     while let Some((seq, body, rows)) = seal_batch(&app, &device)? {
         let key = format!("{PREFIX}/changes/{device}/{seq:020}.json.gz");
         if !object_exists(&config, &secret, &key).await {
-            upload_bytes(&app, &config, &secret, &key, &body).await?;
+            upload_bytes(&config, &secret, &key, &body).await?;
         }
         let (put_time, _, _) = stat_object(&config, &secret, &key).await?;
         upload_device_state(&app, &config, &secret, &device, seq).await?;
@@ -1012,6 +1213,92 @@ mod tests {
     fn cloud_version_has_deterministic_tie_breakers() {
         assert!(version_is_newer((10, "b", 1, 0), Some((10, "a".into(), 9, 9))));
         assert!(!version_is_newer((9, "z", 99, 99), Some((10, "a".into(), 1, 0))));
+    }
+
+    #[test]
+    fn amz_timestamps_break_down_utc_correctly() {
+        assert_eq!(amz_timestamps(0), ("19700101T000000Z".into(), "19700101".into()));
+        assert_eq!(amz_timestamps(1_000_000_000), ("20010909T014640Z".into(), "20010909".into()));
+        assert_eq!(amz_timestamps(1_700_000_000), ("20231114T221320Z".into(), "20231114".into()));
+    }
+
+    #[test]
+    fn uri_encode_matches_sigv4_rules() {
+        // Unreserved characters pass through; '/' is kept only when encode_slash is false.
+        assert_eq!(uri_encode("lumora/v1/a-b_c.json", false), "lumora/v1/a-b_c.json");
+        assert_eq!(uri_encode("lumora/v1", true), "lumora%2Fv1");
+        assert_eq!(uri_encode("a b+c", true), "a%20b%2Bc");
+    }
+
+    #[test]
+    fn host_is_parsed_for_both_addressing_styles() {
+        assert_eq!(parse_host("s3.cn-east-1.qiniucs.com"), Some(("cn-east-1".into(), AddressingStyle::Path)));
+        assert_eq!(parse_host("s3-cn-north-1.qiniucs.com"), Some(("cn-north-1".into(), AddressingStyle::Path)));
+        assert_eq!(
+            parse_host("lumora-luolei.s3.cn-east-1.qiniucs.com"),
+            Some(("cn-east-1".into(), AddressingStyle::VirtualHosted))
+        );
+        assert_eq!(parse_host("cdn.example.com"), None);
+    }
+
+    fn target_for(domain: &str) -> S3Target {
+        resolve_target(&QiniuSyncConfig {
+            access_key: "ak".into(),
+            bucket: "my-bucket".into(),
+            region: None,
+            private_domain: domain.into(),
+            prefix: PREFIX.into(),
+            configured: true,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn object_uri_places_bucket_by_addressing_style() {
+        let cfg = QiniuSyncConfig {
+            access_key: "ak".into(),
+            bucket: "my-bucket".into(),
+            region: None,
+            private_domain: String::new(),
+            prefix: PREFIX.into(),
+            configured: true,
+        };
+        // Path-style prepends the bucket; virtual-hosted keys off the root.
+        let path = target_for("s3.cn-east-1.qiniucs.com");
+        assert_eq!(object_uri(&path, &cfg, "lumora/v1/x.json"), "/my-bucket/lumora/v1/x.json");
+        assert_eq!(bucket_uri(&path, &cfg), "/my-bucket");
+        let virt = target_for("my-bucket.s3.cn-east-1.qiniucs.com");
+        assert_eq!(object_uri(&virt, &cfg, "lumora/v1/x.json"), "/lumora/v1/x.json");
+        assert_eq!(bucket_uri(&virt, &cfg), "/");
+    }
+
+    #[test]
+    fn sigv4_matches_aws_published_test_vector() {
+        // AWS "get-vanilla" case from the official Signature Version 4 test suite.
+        // Validates the HMAC signing-key chain, sha256_hex, and the exact
+        // string-to-sign layout that s3_send relies on.
+        let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+        let empty_hash = sha256_hex(&[]);
+        let canonical_request = format!(
+            "GET\n/\n\nhost:example.amazonaws.com\nx-amz-date:20150830T123600Z\n\nhost;x-amz-date\n{empty_hash}"
+        );
+        let scope = "20150830/us-east-1/service/aws4_request";
+        let string_to_sign =
+            format!("AWS4-HMAC-SHA256\n20150830T123600Z\n{scope}\n{}", sha256_hex(canonical_request.as_bytes()));
+        let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), b"20150830");
+        let k_region = hmac_sha256(&k_date, b"us-east-1");
+        let k_service = hmac_sha256(&k_region, b"service");
+        let k_signing = hmac_sha256(&k_service, b"aws4_request");
+        let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
+        assert_eq!(signature, "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31");
+    }
+
+    #[test]
+    fn xml_values_are_extracted() {
+        let xml = "<A><Key>k1</Key></A><A><Key>k2</Key></A><NextContinuationToken>tok</NextContinuationToken>";
+        assert_eq!(extract_xml_values(xml, "Key"), vec!["k1".to_string(), "k2".to_string()]);
+        assert_eq!(extract_xml_values(xml, "NextContinuationToken"), vec!["tok".to_string()]);
+        assert!(extract_xml_values(xml, "Missing").is_empty());
     }
 
     #[test]
