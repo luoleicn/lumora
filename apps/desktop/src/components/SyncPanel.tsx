@@ -33,7 +33,7 @@ export function SyncPanel({
   onDownloadArxiv,
   onDeleteAnnotation
 }: SyncPanelProps) {
-  const [activeTab, setActiveTab] = useState<"details" | "notes">("details");
+  const [activeTab, setActiveTab] = useState<"details" | "notes" | "deepseek">("details");
   const visibleAnnotations = annotations.filter((annotation) => !annotation.deletedAt);
 
   return (
@@ -44,6 +44,9 @@ export function SyncPanel({
         </button>
         <button type="button" className={activeTab === "notes" ? "active" : ""} onClick={() => setActiveTab("notes")}>
           Notes
+        </button>
+        <button type="button" className={activeTab === "deepseek" ? "active" : ""} onClick={() => setActiveTab("deepseek")}>
+          Ask DeepSeek
         </button>
       </div>
 
@@ -61,6 +64,7 @@ export function SyncPanel({
         />
       )}
       {activeTab === "notes" && <NotesTab annotations={visibleAnnotations} onDeleteAnnotation={onDeleteAnnotation} />}
+      {activeTab === "deepseek" && <DeepSeekTab paper={paper} />}
     </aside>
   );
 }
@@ -520,6 +524,26 @@ function NotesTab({
           {annotation.comment && <blockquote>{annotation.comment}</blockquote>}
         </article>
       ))}
+    </div>
+  );
+}
+
+function DeepSeekTab({ paper }: { paper?: Paper }) {
+  if (!paper) {
+    return <p className="inspector-empty">No document selected.</p>;
+  }
+
+  return (
+    <div className="inspector-deepseek">
+      <div className="deepseek-placeholder">
+        <Send size={32} />
+        <h3>Ask DeepSeek</h3>
+        <p>
+          Ask AI about this paper — summarize, explain concepts, find key insights,
+          and more.
+        </p>
+        <p className="deepseek-coming-soon">Coming soon</p>
+      </div>
     </div>
   );
 }
