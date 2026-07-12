@@ -10,8 +10,7 @@
 # Prerequisites:
 #   - Rust stable toolchain
 #   - Node.js 22+, npm 11+
-#   - GitHub CLI (`brew install gh`) and logged in (`gh auth login`)
-#     OR set GITHUB_TOKEN env var for API fallback.
+#   - GITHUB_TOKEN env var (GitHub personal access token with repo scope)
 #
 # What it does:
 #   1. Validates that --tag was given and that it doesn't already exist
@@ -83,27 +82,42 @@ log "Project: $PROJECT_DIR"
 
 # --------------- check prerequisites ---------------
 
+command -v python3 >/dev/null 2>&1 || err "python3 is required"
 command -v npm   >/dev/null 2>&1 || err "npm is required (Node.js 22+)"
 command -v cargo >/dev/null 2>&1 || err "cargo is required (Rust stable toolchain)"
 
-if command -v gh >/dev/null 2>&1; then
-  USE_GH_CLI=true
-  log "Using GitHub CLI for release management."
-  if ! gh auth status >/dev/null 2>&1; then
-    err "gh is not authenticated. Run: gh auth login"
-  fi
-elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
-  USE_GH_CLI=false
-  log "Using GITHUB_TOKEN for API fallback."
-else
-  err "Neither 'gh' CLI nor GITHUB_TOKEN env var found.\n  Install gh: brew install gh && gh auth login\n  Or: export GITHUB_TOKEN=<your-token>"
+if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+  err "GITHUB_TOKEN env var is required.\n  Create a token at https://github.com/settings/tokens (repo scope)\n  Then: export GITHUB_TOKEN=<your-token>"
 fi
+log "Using GITHUB_TOKEN for GitHub API."
 
 # Extract GitHub owner/repo from git remote
 REPO_URL=$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null) \
   || err "No 'origin' remote found. Run this from within the lumora repo."
-REPO_SLUG=$(echo "$REPO_URL" | sed -E 's|.*[:/]([^/]+/[^/]+)(\.git)?$|\1|')
+REPO_SLUG=$(printf '%s\n' "$REPO_URL" | sed -E \
+  -e 's|^[^@]+@github\.com:||' \
+  -e 's|^https?://github\.com/||' \
+  -e 's|/$||' \
+  -e 's|\.git$||')
+if ! echo "$REPO_SLUG" | grep -qE '^[^/]+/[^/]+$'; then
+  err "Could not parse a GitHub owner/repository from origin: $REPO_URL"
+fi
 log "Target repo: $REPO_SLUG"
+
+# Validate both the token and its repository selection before doing expensive
+# cross-architecture builds. GitHub intentionally returns 404 when a valid
+# fine-grained token is not authorized for a private repository.
+REPO_HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+  -H "Authorization: Bearer $GITHUB_TOKEN" \
+  -H "Accept: application/vnd.github+json" \
+  "https://api.github.com/repos/$REPO_SLUG")
+case "$REPO_HTTP_CODE" in
+  200) ;;
+  401) err "GitHub rejected GITHUB_TOKEN (HTTP 401). The token may be invalid or expired." ;;
+  404) err "GitHub repository '$REPO_SLUG' is not visible to this token (HTTP 404). Check the token's resource owner and repository access." ;;
+  *) err "GitHub repository access check failed (HTTP $REPO_HTTP_CODE)." ;;
+esac
+log "GitHub token can access $REPO_SLUG."
 
 # --------------- ensure tag is new ---------------
 
@@ -120,17 +134,14 @@ if git -C "$PROJECT_DIR" ls-remote --tags origin "$TAG" 2>/dev/null | grep -q "$
 fi
 
 # Check that a GitHub Release for this tag doesn't already exist
-if [[ "$USE_GH_CLI" == "true" ]]; then
-  if gh release view "$TAG" --repo "$REPO_SLUG" >/dev/null 2>&1; then
-    err "GitHub Release for '$TAG' already exists. Use a new tag."
-  fi
-else
-  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-    -H "Authorization: Bearer $GITHUB_TOKEN" \
-    "https://api.github.com/repos/$REPO_SLUG/releases/tags/$TAG")
-  if [[ "$HTTP_CODE" == "200" ]]; then
-    err "GitHub Release for '$TAG' already exists. Use a new tag."
-  fi
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+  -H "Authorization: Bearer $GITHUB_TOKEN" \
+  -H "Accept: application/vnd.github+json" \
+  "https://api.github.com/repos/$REPO_SLUG/releases/tags/$TAG")
+if [[ "$HTTP_CODE" == "200" ]]; then
+  err "GitHub Release for '$TAG' already exists. Use a new tag."
+elif [[ "$HTTP_CODE" != "404" ]]; then
+  err "Could not check whether release '$TAG' exists (HTTP $HTTP_CODE)."
 fi
 
 log "Tag '$TAG' is available -- proceeding."
@@ -173,6 +184,10 @@ log "Intel build: $(file -b "$INTEL_APP/Contents/MacOS/$APP_NAME")"
 # --------------- package DMGs ---------------
 
 ARTIFACTS_DIR="$PROJECT_DIR/.release-artifacts"
+# Detach any leftover mounts from a previous interrupted run
+if [[ -d "$ARTIFACTS_DIR/.mnt" ]]; then
+  hdiutil detach "$ARTIFACTS_DIR/.mnt" -force >/dev/null 2>&1 || true
+fi
 rm -rf "$ARTIFACTS_DIR"
 mkdir -p "$ARTIFACTS_DIR"
 
@@ -189,26 +204,21 @@ make_dmg() {
 
   log "Creating DMG: $dmg_name ..."
 
-  local tmp_dmg="${ARTIFACTS_DIR}/.tmp_$(basename "$dmg_path" .dmg).dmg"
-  rm -f "$tmp_dmg"
+  local staging="${ARTIFACTS_DIR}/.staging_${APP_NAME}"
+  rm -rf "$staging"
+  mkdir -p "$staging"
 
-  local app_size_kb
-  app_size_kb=$(du -sk "$app_bundle" | awk '{print $1}')
-  local dmg_size_mb=$(( (app_size_kb / 1024) + 30 ))
+  cp -R "$app_bundle" "$staging/"
+  ln -s /Applications "$staging/Applications"
 
-  hdiutil create -size ${dmg_size_mb}m -fs HFS+ -volname "$APP_NAME" -layout NONE "$tmp_dmg" >/dev/null
-  hdiutil attach "$tmp_dmg" -noautoopen -nobrowse -mountpoint "$ARTIFACTS_DIR/.mnt" >/dev/null
+  hdiutil create -srcfolder "$staging" \
+    -volname "$APP_NAME" \
+    -format UDZO \
+    -imagekey zlib-level=9 \
+    -ov \
+    "$dmg_path" >/dev/null
 
-  cp -R "$app_bundle" "$ARTIFACTS_DIR/.mnt/"
-  ln -s /Applications "$ARTIFACTS_DIR/.mnt/Applications"
-
-  sleep 2
-  local dev
-  dev=$(hdiutil info | awk -v mp="$ARTIFACTS_DIR/.mnt" '$0 ~ mp {for(i=1;i<=NF;i++) if($i ~ /^\/dev\//) {print $i; exit}}')
-  hdiutil detach "$dev" -force >/dev/null 2>&1 || true
-
-  hdiutil convert "$tmp_dmg" -format UDZO -imagekey zlib-level=9 -o "$dmg_path" >/dev/null
-  rm -f "$tmp_dmg"
+  rm -rf "$staging"
 
   log "  DMG: $dmg_path ($(du -sh "$dmg_path" | awk '{print $1}'))"
 }
@@ -240,61 +250,82 @@ macOS desktop build — separate DMGs for Apple Silicon and Intel Macs.
 
 ASSETS=("$ARM_DMG_PATH" "$INTEL_DMG_PATH")
 
-if [[ "$USE_GH_CLI" == "true" ]]; then
-  DRAFT_FLAG=""
-  if [[ "$DRAFT" == "true" ]]; then
-    DRAFT_FLAG="--draft"
-  fi
+API_BASE="https://api.github.com/repos/$REPO_SLUG"
+AUTH_HEADER="Authorization: Bearer $GITHUB_TOKEN"
 
-  log "Creating GitHub Release: $TAG ..."
-  gh release create "$TAG" "${ASSETS[@]}" \
-    --repo "$REPO_SLUG" \
-    --title "$APP_NAME $TAG" \
-    --notes "$RELEASE_NOTES" \
-    $DRAFT_FLAG
-else
-  API_BASE="https://api.github.com/repos/$REPO_SLUG"
-  AUTH_HEADER="Authorization: Bearer $GITHUB_TOKEN"
-
-  DRAFT_BOOL="false"
-  if [[ "$DRAFT" == "true" ]]; then
-    DRAFT_BOOL="true"
-  fi
-
-  log "Creating GitHub Release via API: $TAG ..."
-  RELEASE_BODY=$(python3 -c "
-import json
-print(json.dumps({
-  'tag_name': '$TAG',
-  'name': '$APP_NAME $TAG',
-  'body': '''$RELEASE_NOTES''',
-  'draft': $DRAFT_BOOL,
-  'prerelease': False
-}))
-")
-  CREATE_RESP=$(curl -s -X POST \
-    -H "$AUTH_HEADER" \
-    -H "Content-Type: application/json" \
-    -d "$RELEASE_BODY" \
-    "$API_BASE/releases")
-  RELEASE_ID=$(echo "$CREATE_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-
-  if [[ -z "$RELEASE_ID" ]] || [[ "$RELEASE_ID" == "null" ]]; then
-    echo "$CREATE_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['message'])" 2>/dev/null || echo "$CREATE_RESP"
-    err "Failed to create GitHub Release."
-  fi
-
-  for ASSET in "${ASSETS[@]}"; do
-    ASSET_NAME=$(basename "$ASSET")
-    log "Uploading $ASSET_NAME ..."
-    curl -s --fail -X POST \
-      -H "$AUTH_HEADER" \
-      -H "Content-Type: application/octet-stream" \
-      --data-binary "@$ASSET" \
-      "$API_BASE/releases/$RELEASE_ID/assets?name=$ASSET_NAME" >/dev/null \
-      || err "Failed to upload $ASSET_NAME"
-  done
+DRAFT_BOOL="False"
+if [[ "$DRAFT" == "true" ]]; then
+  DRAFT_BOOL="True"
 fi
+
+log "Creating GitHub Release via API: $TAG ..."
+
+# Build the release JSON via Python. Release notes may contain special
+# characters (backticks, single quotes, etc.) so we pass them through the
+# environment rather than interpolating into inline Python string literals.
+RELEASE_NOTES_JSON="$RELEASE_NOTES"
+export RELEASE_NOTES_JSON
+
+RELEASE_BODY=$(python3 -c '
+import os, json, sys
+body = os.environ.get("RELEASE_NOTES_JSON", "")
+print(json.dumps({
+    "tag_name": sys.argv[2],
+    "name":    sys.argv[1] + " " + sys.argv[2],
+    "body":    body,
+    "draft":   sys.argv[3] == "True",
+    "prerelease": False
+}))
+' "$APP_NAME" "$TAG" "$DRAFT_BOOL")
+
+CREATE_RESP=$(curl -s -w "\n%{http_code}" -X POST \
+  -H "$AUTH_HEADER" \
+  -H "Accept: application/vnd.github+json" \
+  -H "Content-Type: application/json" \
+  -d "$RELEASE_BODY" \
+  "$API_BASE/releases")
+
+# Split response body and HTTP status code (last line)
+HTTP_CODE=$(echo "$CREATE_RESP" | tail -1)
+RESP_BODY=$(echo "$CREATE_RESP" | sed '$d')
+
+if [[ "$HTTP_CODE" != "201" ]]; then
+  echo "$RESP_BODY" | python3 -c "
+import sys,json
+try:
+    data = json.load(sys.stdin)
+    for err in data.get('errors', []):
+        print(f\"  GitHub: {err.get('field','?')}: {err.get('message','')}\")
+    msg = data.get('message','')
+    if msg:
+        print(f'  GitHub: {msg}')
+except: pass
+" 2>/dev/null
+  echo ""
+  echo "Raw response:"
+  echo "$RESP_BODY"
+  err "Failed to create GitHub Release (HTTP $HTTP_CODE)."
+fi
+
+RELEASE_ID=$(echo "$RESP_BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+if [[ -z "$RELEASE_ID" ]] || [[ "$RELEASE_ID" == "null" ]]; then
+  echo "$RESP_BODY"
+  err "Release created (HTTP 201) but response had no id."
+fi
+
+log "Release created — id: $RELEASE_ID"
+
+for ASSET in "${ASSETS[@]}"; do
+  ASSET_NAME=$(basename "$ASSET")
+  log "Uploading $ASSET_NAME ..."
+  curl -s --fail -X POST \
+    -H "$AUTH_HEADER" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary "@$ASSET" \
+    "$API_BASE/releases/$RELEASE_ID/assets?name=$ASSET_NAME" >/dev/null \
+    || err "Failed to upload $ASSET_NAME"
+done
 
 # --------------- done ---------------
 
