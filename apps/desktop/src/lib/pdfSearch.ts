@@ -18,9 +18,12 @@ export type PdfSearchMatch = {
 /**
  * Searches the rendered text layer of a single PDF page for a query string.
  *
- * Iterates over every `<span>` inside `.react-pdf__Page__textContent`, checks
- * whether its text content includes the (lowercased) query, and converts the
- * span's bounding rect to normalized coordinates relative to the page shell.
+ * Each `<span>` inside `.react-pdf__Page__textContent` is matched case-
+ * insensitively.  When the span contains a single text node the DOM Range API
+ * measures only the matched substring so that the highlight overlay is as
+ * narrow as possible; multi-rect ranges (word wrapped across visual lines) are
+ * split into one highlight per rect.  Spans with a more complex child layout
+ * fall back to highlighting the whole span.
  *
  * @param pageElement - The `.page-shell` DOM element (has `data-page-index`)
  * @param pageIndex  - Zero-based page index for the returned matches
@@ -42,19 +45,46 @@ export function findInPageTextLayer(
 
   for (const span of textSpans) {
     const text = span.textContent ?? "";
-    if (!text.toLowerCase().includes(query)) continue;
+    const lowerText = text.toLowerCase();
+    let searchFrom = 0;
 
-    const spanRect = span.getBoundingClientRect();
-    const normalized = normalizeRect(spanRect, pageRect);
+    while (searchFrom < text.length) {
+      const pos = lowerText.indexOf(query, searchFrom);
+      if (pos === -1) break;
 
-    // We highlight the entire matched span. A multi-word span that only
-    // partially matches the query is fully highlighted — this is the same
-    // approximation most PDF readers make without per-character measurement.
-    matches.push({
-      pageIndex,
-      rect: normalized,
-      key: `pdf-search-${pageIndex}-${matchIndex++}`
-    });
+      const textNode = span.firstChild;
+      if (textNode && textNode.nodeType === Node.TEXT_NODE && textNode.textContent) {
+        const nodeLen = textNode.textContent.length;
+        const start = Math.min(pos, nodeLen);
+        const end = Math.min(pos + query.length, nodeLen);
+        if (start < end) {
+          const range = document.createRange();
+          range.setStart(textNode, start);
+          range.setEnd(textNode, end);
+          const rects = range.getClientRects();
+          for (let r = 0; r < rects.length; r++) {
+            const rect = rects[r];
+            if (rect.width > 0 && rect.height > 0) {
+              matches.push({
+                pageIndex,
+                rect: normalizeRect(rect, pageRect),
+                key: `pdf-search-${pageIndex}-${matchIndex++}`
+              });
+            }
+          }
+        }
+      } else {
+        // Fallback: highlight the whole span when the DOM isn't a simple text node.
+        const spanRect = span.getBoundingClientRect();
+        matches.push({
+          pageIndex,
+          rect: normalizeRect(spanRect, pageRect),
+          key: `pdf-search-${pageIndex}-${matchIndex++}`
+        });
+      }
+
+      searchFrom = pos + query.length;
+    }
   }
 
   return matches;

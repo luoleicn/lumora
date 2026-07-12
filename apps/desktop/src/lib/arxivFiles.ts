@@ -145,6 +145,7 @@ export async function downloadMissingArxivFiles(
         size: bytes.length,
         mime: "application/pdf",
         fileName: storedName,
+        contentRef: { kind: "arxiv", arxivId: entry.arxivId },
         localPath: settings.directory ? storedName : undefined,
         downloadState: "local",
         updatedAt: now,

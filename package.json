@@ -11,13 +11,10 @@
   "scripts": {
     "dev": "npm run dev --workspace @lumora/desktop",
     "dev:desktop": "npm run dev --workspace @lumora/desktop",
-    "dev:server": "npm run dev --workspace @lumora/server",
-    "build": "npm run build --workspace @lumora/shared && npm run build --workspace @lumora/server && npm run build --workspace @lumora/desktop",
-    "typecheck": "npm run build --workspace @lumora/shared && npm run typecheck --workspace @lumora/server && npm run typecheck --workspace @lumora/desktop",
-    "test": "npm run test --workspace @lumora/shared && npm run test --workspace @lumora/server --if-present && npm run test --workspace @lumora/desktop --if-present",
-    "test:coverage": "npm run test:coverage --workspace @lumora/desktop",
-    "prisma:generate": "npm run prisma:generate --workspace @lumora/server",
-    "prisma:migrate": "npm run prisma:migrate --workspace @lumora/server"
+    "build": "npm run build --workspace @lumora/shared && npm run build --workspace @lumora/desktop",
+    "typecheck": "npm run build --workspace @lumora/shared && npm run typecheck --workspace @lumora/desktop",
+    "test": "npm run test --workspace @lumora/shared && npm run test --workspace @lumora/desktop --if-present",
+    "test:coverage": "npm run test:coverage --workspace @lumora/desktop"
   },
   "engines": {
     "node": ">=22"

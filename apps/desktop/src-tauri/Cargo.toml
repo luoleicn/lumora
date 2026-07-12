@@ -14,13 +14,20 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 percent-encoding = "2"
+flate2 = "1"
+hex = "0.4"
+http = "0.2"
+keyring = { version = "3", features = ["apple-native", "sync-secret-service"] }
+qiniu-sdk = { version = "0.2.4", features = ["credential", "objects", "upload", "reqwest", "async"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "form", "json", "socks"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-web-kit = { version = "0.3", default-features = false, features = ["WKWebView", "objc2-core-foundation"] }

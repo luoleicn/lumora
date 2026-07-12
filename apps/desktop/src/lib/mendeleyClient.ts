@@ -929,18 +929,43 @@ export async function syncWithMendeley(
   }
 
   report("files", "Downloading PDF files…", 7);
-  for (const [fileIndex, remoteFile] of remoteFiles.entries()) {
+  // Download every attachment still pending locally, not just the ones listed
+  // by this pull: files that failed on a previous run would otherwise never be
+  // retried once the cursor advances past their added_since window. A single
+  // failed download is recorded and skipped so it cannot abort the whole sync.
+  const pendingDownloads = fileAssets.filter((item) => item.mendeleyId && !item.deletedAt && item.downloadState === "remote");
+  for (const [fileIndex, file] of pendingDownloads.entries()) {
     ensureActive();
-    const file = fileAssets.find((item) => item.mendeleyId === remoteFile.id);
-    if (!file || file.downloadState === "local" || file.deletedAt) continue;
-    report("files", `Downloading PDF files ${fileIndex + 1}/${remoteFiles.length}…`, 7 + (remoteFiles.length ? (fileIndex + 1) / remoteFiles.length : 1));
-    const buffer = await invoke<ArrayBuffer>("mendeley_download_file", {
-      clientId: settings.clientId,
-      clientSecret: settings.clientSecret,
-      fileId: remoteFile.id
-    });
+
+    // When the paper already has a locally available PDF from another source
+    // (e.g. manually bound or downloaded from arXiv), mirror the existing
+    // local file so the Mendeley download is skipped and never re-queued.
+    const alreadyLocal = fileAssets.find(
+      (f) => f.paperId === file.paperId && !f.deletedAt && f.downloadState === "local"
+        && (f.mime === "application/pdf" || /\.pdf$/i.test(f.fileName))
+    );
+    if (alreadyLocal) {
+      fileAssets = fileAssets.map((item) => item.id === file.id
+        ? { ...item, sha256: alreadyLocal.sha256, downloadState: "local", localPath: alreadyLocal.localPath, fileName: alreadyLocal.fileName }
+        : item);
+      publishState();
+      continue;
+    }
+
+    report("files", `Downloading PDF files ${fileIndex + 1}/${pendingDownloads.length}…`, 7 + (pendingDownloads.length ? (fileIndex + 1) / pendingDownloads.length : 1));
+    let bytes: Uint8Array<ArrayBuffer>;
+    try {
+      const buffer = await invoke<ArrayBuffer>("mendeley_download_file", {
+        clientId: settings.clientId,
+        clientSecret: settings.clientSecret,
+        fileId: file.mendeleyId
+      });
+      bytes = new Uint8Array(buffer);
+    } catch (error) {
+      summary.unavailableResources.push(`file ${file.fileName}: ${String(error)}`);
+      continue;
+    }
     ensureActive();
-    const bytes = new Uint8Array(buffer);
     const digest = await crypto.subtle.digest("SHA-256", bytes);
     const sha256 = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, "0")).join("");
     let localPath: string | undefined;
@@ -955,6 +980,7 @@ export async function syncWithMendeley(
     fileAssets = fileAssets.map((item) => item.id === file.id
       ? { ...item, sha256, downloadState: "local", localPath, fileName: localPath || item.fileName }
       : item);
+    publishState();
   }
 
   // Migrate existing IndexedDB-only files to disk when a storage directory is configured.

@@ -1,4 +1,4 @@
-import { Cloud, DatabaseZap, Download, FileSearch, LogIn, RefreshCw, Search, Send, Trash2 } from "lucide-react";
+import { Cloud, DatabaseZap, Download, FileSearch, KeyRound, RefreshCw, Search, Send, Trash2 } from "lucide-react";
 import { useState } from "react";
 import type { Annotation, ArxivMetadata, FileAsset, Paper } from "@lumora/shared";
 import { searchArxivMetadata, type SyncSettings } from "../lib/syncClient";
@@ -76,33 +76,48 @@ export function SyncPanel({
             <h3>Sync</h3>
           </div>
           <label>
-            Server
+            Qiniu Access Key
             <input
-              value={settings.serverUrl}
-              onChange={(event) => onSettingsChange({ ...settings, serverUrl: event.target.value })}
+              value={settings.accessKey}
+              onChange={(event) => onSettingsChange({ ...settings, accessKey: event.target.value })}
             />
           </label>
           <label>
-            Email
-            <input
-              value={settings.email}
-              onChange={(event) => onSettingsChange({ ...settings, email: event.target.value })}
-            />
-          </label>
-          <label>
-            Password
+            Qiniu Secret Key
             <input
               type="password"
-              value={settings.password}
-              onChange={(event) => onSettingsChange({ ...settings, password: event.target.value })}
+              value={settings.secretKey ?? ""}
+              placeholder={settings.configured ? "Stored in macOS Keychain" : "Required"}
+              onChange={(event) => onSettingsChange({ ...settings, secretKey: event.target.value })}
+            />
+          </label>
+          <label>
+            Bucket
+            <input
+              value={settings.bucket}
+              onChange={(event) => onSettingsChange({ ...settings, bucket: event.target.value })}
+            />
+          </label>
+          <label>
+            Region (optional)
+            <input
+              value={settings.region ?? ""}
+              onChange={(event) => onSettingsChange({ ...settings, region: event.target.value })}
+            />
+          </label>
+          <label>
+            Private download domain
+            <input
+              value={settings.privateDomain}
+              onChange={(event) => onSettingsChange({ ...settings, privateDomain: event.target.value })}
             />
           </label>
           <div className="sync-actions">
             <button type="button" onClick={onLogin} disabled={busy}>
-              <LogIn size={16} />
-              Login
+              <KeyRound size={16} />
+              Save &amp; Test
             </button>
-            <button type="button" onClick={onSync} disabled={busy || !settings.token}>
+            <button type="button" onClick={onSync} disabled={busy || !settings.configured}>
               <RefreshCw size={16} />
               Sync
             </button>

@@ -1,6 +1,8 @@
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID, WINDOW_SUBMENU_ID};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
+mod cloud_sync;
+
 #[derive(Clone, serde::Serialize)]
 #[serde(tag = "event", rename_all = "camelCase", rename_all_fields = "camelCase")]
 enum ArxivDownloadEvent {
@@ -935,6 +937,8 @@ const MENDELEY_META_ACCESS_TOKEN: &str = "mendeleyAccessToken";
 const MENDELEY_META_REFRESH_TOKEN: &str = "mendeleyRefreshToken";
 const MENDELEY_META_EXPIRES_AT: &str = "mendeleyTokenExpiresAt";
 const MENDELEY_META_DISPLAY_NAME: &str = "mendeleyDisplayName";
+const MENDELEY_META_CLIENT_ID: &str = "mendeleyClientId";
+const MENDELEY_META_CLIENT_SECRET: &str = "mendeleyClientSecret";
 
 #[derive(serde::Deserialize)]
 struct MendeleyTokenResponse {
@@ -976,6 +980,19 @@ fn set_meta_value(connection: &rusqlite::Connection, key: &str, value: &str) -> 
         )
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn clear_mendeley_tokens(connection: &rusqlite::Connection) {
+    for key in [
+        MENDELEY_META_ACCESS_TOKEN,
+        MENDELEY_META_REFRESH_TOKEN,
+        MENDELEY_META_EXPIRES_AT,
+        MENDELEY_META_DISPLAY_NAME,
+        MENDELEY_META_CLIENT_ID,
+        MENDELEY_META_CLIENT_SECRET,
+    ] {
+        let _ = connection.execute("DELETE FROM meta WHERE key = ?1", [key]);
+    }
 }
 
 fn store_mendeley_tokens<R: Runtime>(app: &AppHandle<R>, tokens: &MendeleyTokenResponse) -> Result<(), String> {
@@ -1136,30 +1153,72 @@ async fn mendeley_connect(app: AppHandle, client_id: String, client_secret: Stri
 
     let connection = open_library_db(&app)?;
     set_meta_value(&connection, MENDELEY_META_DISPLAY_NAME, display_name.as_deref().unwrap_or(""))?;
+    set_meta_value(&connection, MENDELEY_META_CLIENT_ID, &client_id)?;
+    set_meta_value(&connection, MENDELEY_META_CLIENT_SECRET, &client_secret)?;
 
     Ok(MendeleyStatus { connected: true, display_name })
 }
 
 #[tauri::command]
 async fn mendeley_status(app: AppHandle) -> Result<MendeleyStatus, String> {
-    let connection = open_library_db(&app)?;
-    let connected = get_meta_value(&connection, MENDELEY_META_REFRESH_TOKEN).is_some()
-        || get_meta_value(&connection, MENDELEY_META_ACCESS_TOKEN).is_some();
-    let display_name = get_meta_value(&connection, MENDELEY_META_DISPLAY_NAME).filter(|name| !name.is_empty());
-    Ok(MendeleyStatus { connected, display_name })
+    let (has_refresh_token, display_name, token_fresh, client_id, client_secret) = {
+        let connection = open_library_db(&app)?;
+        let has_refresh_token = get_meta_value(&connection, MENDELEY_META_REFRESH_TOKEN).is_some();
+        let display_name = get_meta_value(&connection, MENDELEY_META_DISPLAY_NAME)
+            .filter(|name| !name.is_empty());
+        let expires_at = get_meta_value(&connection, MENDELEY_META_EXPIRES_AT)
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let token_fresh = expires_at - now > 60;
+        let client_id = get_meta_value(&connection, MENDELEY_META_CLIENT_ID).unwrap_or_default();
+        let client_secret = get_meta_value(&connection, MENDELEY_META_CLIENT_SECRET).unwrap_or_default();
+        (has_refresh_token, display_name, token_fresh, client_id, client_secret)
+    };
+
+    if !has_refresh_token {
+        return Ok(MendeleyStatus { connected: false, display_name: None });
+    }
+
+    // Fast path: access token is still valid — no network call needed.
+    if token_fresh {
+        return Ok(MendeleyStatus { connected: true, display_name });
+    }
+
+    // Token is near or past expiry. Try refreshing to verify the refresh token
+    // is still good. If client credentials were never stored (pre-migration DB),
+    // err on the side of showing "connected" rather than forcing re-auth.
+    if client_id.is_empty() {
+        return Ok(MendeleyStatus { connected: true, display_name });
+    }
+
+    match refresh_mendeley_token(&app, &client_id, &client_secret).await {
+        Ok(_) => {
+            let connection = open_library_db(&app)?;
+            let display_name = get_meta_value(&connection, MENDELEY_META_DISPLAY_NAME)
+                .filter(|name| !name.is_empty());
+            Ok(MendeleyStatus { connected: true, display_name })
+        }
+        Err(_) => {
+            // refresh_mendeley_token clears tokens on authentication failures
+            // (4xx), so re-reading the DB gives the correct post-clear state.
+            // Network errors leave tokens intact — connected stays true.
+            let connection = open_library_db(&app)?;
+            let still_connected = get_meta_value(&connection, MENDELEY_META_REFRESH_TOKEN).is_some();
+            let display_name = get_meta_value(&connection, MENDELEY_META_DISPLAY_NAME)
+                .filter(|name| !name.is_empty());
+            Ok(MendeleyStatus { connected: still_connected, display_name })
+        }
+    }
 }
 
 #[tauri::command]
 async fn mendeley_disconnect(app: AppHandle) -> Result<(), String> {
     let connection = open_library_db(&app)?;
-    for key in [
-        MENDELEY_META_ACCESS_TOKEN,
-        MENDELEY_META_REFRESH_TOKEN,
-        MENDELEY_META_EXPIRES_AT,
-        MENDELEY_META_DISPLAY_NAME,
-    ] {
-        let _ = connection.execute("DELETE FROM meta WHERE key = ?1", [key]);
-    }
+    clear_mendeley_tokens(&connection);
     Ok(())
 }
 
@@ -1187,7 +1246,15 @@ async fn refresh_mendeley_token<R: Runtime>(
         .map_err(|error| format!("Token refresh failed: {error}"))?;
 
     if !response.status().is_success() {
-        return Err(format!("Token refresh failed ({}). Reconnect Mendeley.", response.status()));
+        let status = response.status();
+        // When the refresh token itself is invalid or expired, clear all stored
+        // tokens so the app reports "disconnected" without manual intervention.
+        if status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::UNAUTHORIZED {
+            if let Ok(connection) = open_library_db(app) {
+                clear_mendeley_tokens(&connection);
+            }
+        }
+        return Err(format!("Token refresh failed ({}). Reconnect Mendeley.", status));
     }
 
     let tokens: MendeleyTokenResponse = response
@@ -1298,22 +1365,29 @@ async fn mendeley_download_file(
             None
         }
     };
-    let access_token = match token {
+    let mut access_token = match token {
         Some(token) => token,
         None => refresh_mendeley_token(&app, &client_id, &client_secret).await?,
     };
-    let response = network_client(&app)?
-        .get(format!("https://api.mendeley.com/files/{file_id}"))
-        .bearer_auth(access_token)
-        .send()
-        .await
-        .map_err(|error| format!("Mendeley file download failed: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!("Mendeley file download failed ({})", response.status()));
+    for attempt in 0..2 {
+        let response = network_client(&app)?
+            .get(format!("https://api.mendeley.com/files/{file_id}"))
+            .bearer_auth(&access_token)
+            .send()
+            .await
+            .map_err(|error| format!("Mendeley file download failed: {error}"))?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+            access_token = refresh_mendeley_token(&app, &client_id, &client_secret).await?;
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err(format!("Mendeley file download failed ({})", response.status()));
+        }
+        let bytes = response.bytes().await
+            .map_err(|error| format!("Failed to read Mendeley file: {error}"))?;
+        return Ok(tauri::ipc::Response::new(bytes.to_vec()));
     }
-    let bytes = response.bytes().await
-        .map_err(|error| format!("Failed to read Mendeley file: {error}"))?;
-    Ok(tauri::ipc::Response::new(bytes.to_vec()))
+    Err("Mendeley file download failed after token refresh.".to_string())
 }
 
 #[tauri::command]
@@ -1493,7 +1567,7 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             {
                 enable_trackpad_pinch_zoom(app);
-                install_fit_width_shortcut_monitor(app.handle().clone());
+                install_key_shortcut_monitor(app.handle().clone());
             }
             Ok(())
         })
@@ -1551,7 +1625,15 @@ pub fn run() {
             mendeley_disconnect,
             mendeley_request,
             mendeley_download_file,
-            download_arxiv_pdf
+            download_arxiv_pdf,
+            cloud_sync::qiniu_sync_config,
+            cloud_sync::qiniu_save_sync_config,
+            cloud_sync::qiniu_test_sync_connection,
+            cloud_sync::qiniu_disconnect_sync,
+            cloud_sync::qiniu_upload_blob,
+            cloud_sync::qiniu_download_blob,
+            cloud_sync::qiniu_delete_blob,
+            cloud_sync::qiniu_sync_library
         ])
         .run(tauri::generate_context!())
         .expect("error while running lumora");
@@ -1574,15 +1656,15 @@ fn enable_trackpad_pinch_zoom<R: Runtime>(app: &tauri::App<R>) {
 }
 
 // WKWebView claims macOS text-editing key equivalents (Cmd+Z is Undo, Cmd+; is
-// spell-check's "Check Document Now") inside its own performKeyEquivalent: pass,
-// which macOS runs before both the menu-bar accelerators and DOM keydown
-// listeners — so neither layer ever sees those chords. An NSApplication-level
-// local event monitor is the one hook that runs ahead of the responder chain,
-// so the Fit Width shortcut is intercepted here and forwarded as the same event
-// the View menu item emits. Returning null consumes the NSEvent, which also
-// keeps WebKit's built-in spell-check action from firing.
+// spell-check's "Check Document Now", Cmd+F is Find) inside its own
+// performKeyEquivalent: pass, which macOS runs before both the menu-bar
+// accelerators and DOM keydown listeners — so neither layer ever sees those
+// chords. An NSApplication-level local event monitor is the one hook that runs
+// ahead of the responder chain, so shortcuts are intercepted here and forwarded
+// as Tauri events. Returning null consumes the NSEvent, preventing WebKit's
+// built-in actions from firing.
 #[cfg(target_os = "macos")]
-fn install_fit_width_shortcut_monitor(app_handle: AppHandle) {
+fn install_key_shortcut_monitor(app_handle: AppHandle) {
     use core::ptr::NonNull;
     use objc2_app_kit::{NSEvent, NSEventMask, NSEventModifierFlags};
 
@@ -1590,25 +1672,46 @@ fn install_fit_width_shortcut_monitor(app_handle: AppHandle) {
     // under a CJK input source charactersIgnoringModifiers can yield the
     // full-width "；", which would break a string comparison against ";".
     const SEMICOLON_KEY_CODE: u16 = 41;
+    const F_KEY_CODE: u16 = 3;
 
     let handler: block2::RcBlock<dyn Fn(NonNull<NSEvent>) -> *mut NSEvent> =
         block2::RcBlock::new(move |event: NonNull<NSEvent>| {
             let key_event = unsafe { event.as_ref() };
             let flags = key_event.modifierFlags();
-            let is_semicolon_key = key_event.keyCode() == SEMICOLON_KEY_CODE
-                || key_event
-                    .charactersIgnoringModifiers()
-                    .is_some_and(|characters| matches!(characters.to_string().as_str(), ";" | "；"));
-            let is_fit_width_chord = flags.contains(NSEventModifierFlags::Command)
+            let is_cmd_only = flags.contains(NSEventModifierFlags::Command)
                 && !flags.intersects(
                     NSEventModifierFlags::Shift | NSEventModifierFlags::Control | NSEventModifierFlags::Option,
-                )
-                && is_semicolon_key;
+                );
 
-            if is_fit_width_chord {
-                reset_native_magnification(&app_handle);
-                let _ = app_handle.emit(PDF_VIEW_EVENT, "fit-width");
-                return core::ptr::null_mut();
+            // Cmd+; → Fit Width
+            if is_cmd_only {
+                let is_semicolon_key = key_event.keyCode() == SEMICOLON_KEY_CODE
+                    || key_event
+                        .charactersIgnoringModifiers()
+                        .is_some_and(|characters| matches!(characters.to_string().as_str(), ";" | "；"));
+                if is_semicolon_key {
+                    reset_native_magnification(&app_handle);
+                    let _ = app_handle.emit(PDF_VIEW_EVENT, "fit-width");
+                    return core::ptr::null_mut();
+                }
+
+                // Cmd+F → focus the toolbar search / find bar. Use both
+                // keyCode and character detection for robustness, then
+                // evaluate JS directly in the webview — this avoids the
+                // Tauri event round-trip and works even when the event
+                // listener hasn't been set up yet.
+                let is_f_key = key_event.keyCode() == F_KEY_CODE
+                    || key_event
+                        .charactersIgnoringModifiers()
+                        .is_some_and(|c| matches!(c.to_string().to_lowercase().as_str(), "f"));
+                if is_f_key {
+                    let js = "const el=document.querySelector('.app-toolbar input[type=text]');if(el){el.focus();el.select();}";
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.eval(js);
+                    }
+                    let _ = app_handle.emit(WORKSPACE_EVENT, "focus-toolbar-search");
+                    return core::ptr::null_mut();
+                }
             }
 
             event.as_ptr()

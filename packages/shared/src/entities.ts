@@ -102,9 +102,17 @@ export type FileAsset = {
   size: number;
   mime: string;
   fileName: string;
+  /** Cloud content identity. Device-local availability is deliberately not synced. */
+  contentRef?:
+    | { kind: "arxiv"; arxivId: string }
+    | { kind: "object"; sha256: string }
+    | { kind: "none" };
+  /** @deprecated Migrated into the native device-local file table. */
   localPath?: string;
+  /** @deprecated Legacy server-sync field, ignored by the object-storage protocol. */
   objectKey?: string;
-  downloadState: "local" | "remote" | "missing";
+  /** @deprecated Device-local state retained during the SQLite migration. */
+  downloadState?: "local" | "remote" | "missing";
   createdAt: string;
   updatedAt: string;
   deletedAt?: string;
@@ -156,6 +164,8 @@ export type Annotation = {
   notePosition?: NormalizedPoint;
   quote?: string;
   comment?: string;
+  /** PDF content identity used to prevent drawing coordinates on another revision. */
+  sourceSha256?: string;
   mendeleyId?: string;
   mendeleyFileHash?: string;
   mendeleyPrivacyLevel?: "private" | "group" | "public";
@@ -184,6 +194,7 @@ export type LibraryState = {
   collections: Collection[];
   paperCollections: PaperCollection[];
   annotations: Annotation[];
+  /** @deprecated The object-storage protocol keeps a vector cursor in native SQLite. */
   lastSyncCursor?: number;
 };
 

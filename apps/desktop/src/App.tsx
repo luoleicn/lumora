@@ -76,8 +76,11 @@ import {
 import { downloadMissingArxivFiles, formatFileSize, type ArxivDownloadProgress } from "./lib/arxivFiles";
 import { defaultProxySettings, loadProxySettings, saveProxySettings, type ProxySettings } from "./lib/proxySettings";
 import {
-  login,
+  defaultSyncSettings,
+  loadSyncConfig,
+  saveSyncConfig,
   syncLibrary,
+  testSyncConnection,
   type SyncSettings
 } from "./lib/syncClient";
 import {
@@ -94,7 +97,6 @@ import {
   type MendeleySettings
 } from "./lib/mendeleyClient";
 
-const settingsKey = "lumora:sync-settings";
 const workspaceLayoutKey = "lumora:workspace-layout";
 const collapseThreshold = 82;
 
@@ -155,6 +157,7 @@ export default function App() {
   const pdfRenameInFlightRef = useRef(false);
   const mendeleyCancelRequestedRef = useRef(false);
   const arxivDownloadInFlightRef = useRef(false);
+  const cloudSyncInFlightRef = useRef(false);
   const libraryRef = useRef<LibraryState | undefined>(undefined);
   const lastPersistedLibraryRef = useRef<LibraryState | undefined>(undefined);
   const libraryLoadedRef = useRef(false);
@@ -173,7 +176,7 @@ export default function App() {
   const [pdfSearchState, setPdfSearchState] = useState({ totalMatches: 0, activeMatchIndex: -1 });
   const backfillRunningRef = useRef(false);
   const [fileDataById, setFileDataById] = useState<Record<string, Uint8Array>>({});
-  const [settings, setSettings] = useState<SyncSettings>(() => loadSyncSettings());
+  const [settings, setSettings] = useState<SyncSettings>(defaultSyncSettings);
   const [fileStorageSettings, setFileStorageSettings] = useState<FileStorageSettings>(() => loadFileStorageSettings());
   const [fileStorageModalOpen, setFileStorageModalOpen] = useState(false);
   const [mendeleySyncOpen, setMendeleySyncOpen] = useState(false);
@@ -274,8 +277,20 @@ export default function App() {
   }, [library]);
 
   useEffect(() => {
-    localStorage.setItem(settingsKey, JSON.stringify({ ...settings, password: settings.password ? settings.password : "" }));
-  }, [settings]);
+    void loadSyncConfig().then(setSettings).catch((error) => setStatus(`Failed to load Qiniu settings: ${error}`));
+  }, []);
+
+  // Object-storage sync is intentionally periodic rather than edit-debounced:
+  // one run after startup, then once per hour while the app remains open.
+  useEffect(() => {
+    if (!settings.configured) return;
+    const initial = window.setTimeout(() => void handleSync(), 1_000);
+    const hourly = window.setInterval(() => void handleSync(), 60 * 60 * 1_000);
+    return () => {
+      window.clearTimeout(initial);
+      window.clearInterval(hourly);
+    };
+  }, [settings.configured, settings.bucket, settings.accessKey]);
 
   useEffect(() => {
     localStorage.setItem(workspaceLayoutKey, JSON.stringify(workspaceLayout));
@@ -329,23 +344,20 @@ export default function App() {
         }
       }
 
-      // Cmd+F / Ctrl+F on a paper tab: focus the global search bar which acts as
-      // the find-in-document bar. WKWebView may intercept this on macOS before
-      // the DOM sees it; the contextual toolbar (auto-switch to PDF find mode)
-      // covers the macOS case.
+      // Cmd+F / Ctrl+F: focus the toolbar search bar (library search on
+      // Documents, find-in-document on a paper tab). WKWebView may intercept
+      // Cmd+F on macOS before the DOM sees it; when it does reach us, make
+      // sure both tab types are covered.
       const isFindShortcut = event.key.toLowerCase() === "f"
         && usesPrimaryModifier
         && !event.altKey
         && !event.shiftKey;
       if (isFindShortcut) {
-        const activeTab = workspaceTabs.find((tab) => tab.id === activeWorkspaceTabId);
-        if (activeTab?.kind === "paper") {
-          event.preventDefault();
-          const toolbarInput = document.querySelector<HTMLInputElement>(".app-toolbar input[type='text']");
-          toolbarInput?.focus();
-          toolbarInput?.select();
-          return;
-        }
+        event.preventDefault();
+        const toolbarInput = document.querySelector<HTMLInputElement>(".app-toolbar input[type='text']");
+        toolbarInput?.focus();
+        toolbarInput?.select();
+        return;
       }
 
       const isPanelShortcut = usesPrimaryModifier && !event.altKey && !event.shiftKey;
@@ -398,6 +410,10 @@ export default function App() {
         setDuplicateDocumentsOpen(true);
       } else if (event.payload === "download-arxiv-files") {
         void handleDownloadArxivFiles();
+      } else if (event.payload === "focus-toolbar-search") {
+        const toolbarInput = document.querySelector<HTMLInputElement>(".app-toolbar input[type='text']");
+        toolbarInput?.focus();
+        toolbarInput?.select();
       }
     }).then((nextUnlisten) => {
       if (disposed) {
@@ -496,6 +512,12 @@ export default function App() {
             return true;
           case "recently_added":
             return true;
+          case "no_arxiv":
+            return !paper.arxiv;
+          case "no_pdf":
+            return !library.fileAssets.some(
+              (fileAsset) => fileAsset.paperId === paper.id && !fileAsset.deletedAt && isPdfFile(fileAsset) && fileAsset.downloadState === "local"
+            );
           case "favorites":
             return Boolean(paper.favorite);
           case "unsorted":
@@ -670,11 +692,14 @@ export default function App() {
   const activeWorkspaceTab = workspaceTabs.find((tab) => tab.id === activeWorkspaceTabId) ?? documentsTab;
   const searchMode = activeWorkspaceTab.kind === "paper" ? "pdf" as const : "library" as const;
 
-  // Clear PDF search when switching away from a paper tab.
+  // Clear PDF search when switching away from a paper tab; carry the library
+  // search query over to PDF find when opening a paper tab.
   useEffect(() => {
     if (activeWorkspaceTab.kind !== "paper") {
       setPdfSearchQuery("");
       setPdfSearchState({ totalMatches: 0, activeMatchIndex: -1 });
+    } else if (search.trim() && !pdfSearchQuery.trim()) {
+      setPdfSearchQuery(search);
     }
   }, [activeWorkspaceTabId]);
 
@@ -1381,17 +1406,27 @@ export default function App() {
   }
 
   async function handleLogin() {
-    await runBusy("Logged in.", async () => {
-      const response = await login(settings);
-      setSettings((current) => ({ ...current, token: response.accessToken }));
+    await runBusy("Qiniu private bucket configured.", async () => {
+      const saved = await saveSyncConfig(settings);
+      setSettings({ ...saved, secretKey: undefined });
+      await testSyncConnection();
     });
   }
 
   async function handleSync() {
-    await runBusy("Sync complete.", async () => {
-      const nextState = await syncLibrary(settings, library);
-      setLibrary(nextState);
-    });
+    if (cloudSyncInFlightRef.current || !settings.configured) return;
+    cloudSyncInFlightRef.current = true;
+    try {
+      await runBusy("Sync complete.", async () => {
+        const result = await syncLibrary(settings, libraryRef.current ?? library);
+        setLibrary(result.state);
+        setStatus(
+          `Sync complete: ${result.summary.uploadedChanges} uploaded, ${result.summary.downloadedChanges} downloaded.`
+        );
+      });
+    } finally {
+      cloudSyncInFlightRef.current = false;
+    }
   }
 
   async function handleMendeleyConnect() {
@@ -1994,27 +2029,6 @@ function CollapsedPanelGutter({
       <span>{arrow}</span>
     </button>
   );
-}
-
-function loadSyncSettings(): SyncSettings {
-  const fallback = {
-    serverUrl: "http://localhost:3838",
-    email: "reader@example.com",
-    password: "change-me"
-  };
-
-  const raw = localStorage.getItem(settingsKey);
-  if (!raw) {
-    return fallback;
-  }
-
-  try {
-    const settings = { ...fallback, ...JSON.parse(raw) as SyncSettings };
-    localStorage.setItem(settingsKey, JSON.stringify({ ...settings, password: settings.password ? settings.password : "" }));
-    return settings;
-  } catch {
-    return fallback;
-  }
 }
 
 function loadWorkspaceLayout(): WorkspaceLayout {

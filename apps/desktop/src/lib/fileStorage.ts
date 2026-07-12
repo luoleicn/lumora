@@ -192,6 +192,9 @@ export async function bindPdfToPaper(
     size: bytes.length,
     mime: "application/pdf",
     fileName,
+    contentRef: paper.arxiv
+      ? { kind: "arxiv", arxivId: paper.arxiv }
+      : { kind: "object", sha256 },
     localPath,
     downloadState: "local",
     createdAt: existing?.createdAt ?? now,

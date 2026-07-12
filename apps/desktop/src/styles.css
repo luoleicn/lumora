@@ -41,10 +41,10 @@ button {
   grid-template-columns: minmax(240px, 520px) minmax(120px, 1fr);
   align-items: center;
   gap: 16px;
-  min-height: 56px;
+  min-height: 40px;
   border-bottom: 1px solid #cdd5de;
   background: linear-gradient(#f8fafc, #e9eef3);
-  padding: 8px 14px;
+  padding: 6px 14px;
 }
 
 .toolbar-command-group {
@@ -63,7 +63,7 @@ button {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  height: 34px;
+  height: 28px;
   border: 1px solid #bdc8d3;
   border-radius: 7px;
   background: #ffffff;
@@ -119,7 +119,7 @@ button {
   display: flex;
   align-items: center;
   gap: 8px;
-  height: 34px;
+  height: 28px;
   border: 1px solid #bfc9d3;
   border-radius: 18px;
   background: #ffffff;
@@ -139,7 +139,7 @@ button {
   display: flex;
   align-items: center;
   gap: 6px;
-  height: 34px;
+  height: 28px;
   border: 1px solid #bfc9d3;
   border-radius: 18px;
   background: #ffffff;
@@ -232,7 +232,7 @@ button {
 }
 
 .toolbar-icon {
-  width: 34px;
+  width: 28px;
   padding: 0;
 }
 

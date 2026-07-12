@@ -118,11 +118,16 @@ function PdfReaderComponent({
   const [findMatches, setFindMatches] = useState<PdfSearchMatch[]>([]);
   const [activeMatchIndex, setActiveMatchIndex] = useState(-1);
   const findMatchesRef = useRef<PdfSearchMatch[]>([]);
+  const pagesRenderedRef = useRef(new Set<number>());
+  const pendingSearchRef = useRef<string | null>(null);
   const documentFile = useMemo(() => (fileData ? { data: fileData.slice() } : undefined), [fileData]);
 
   const visibleAnnotations = useMemo(
-    () => annotations.filter((annotation) => !annotation.deletedAt),
-    [annotations]
+    () => annotations.filter((annotation) =>
+      !annotation.deletedAt
+      && (!annotation.sourceSha256 || annotation.sourceSha256 === fileAsset?.sha256)
+    ),
+    [annotations, fileAsset?.sha256]
   );
 
   useLayoutEffect(() => {
@@ -205,6 +210,7 @@ function PdfReaderComponent({
 
   useEffect(() => {
     pageRefs.current = pageRefs.current.slice(0, numPages);
+    pagesRenderedRef.current.clear();
   }, [numPages]);
 
   useEffect(() => {
@@ -367,49 +373,56 @@ function PdfReaderComponent({
     };
   }, [active, numPages]);
 
-  // PDF text search: runs when the global search bar query changes while this
-  // paper tab is active. Walks every rendered page's text layer and collects
-  // match positions as normalised rects.
+  // PDF text search: walks every rendered page's text layer and collects
+  // match positions as normalised rects. Delegates the initial search after
+  // PDF load to onRenderSuccess so it never runs before text layers exist
+  // in the DOM; subsequent queries (re-typing) run immediately.
+  function runSearch(query: string) {
+    const lowerQuery = query.toLowerCase();
+    const allMatches: PdfSearchMatch[] = [];
+    for (let i = 0; i < numPages; i += 1) {
+      const pageEl = pageRefs.current[i];
+      if (!pageEl) continue;
+      const pageMatches = findInPageTextLayer(pageEl, i, lowerQuery);
+      allMatches.push(...pageMatches);
+    }
+
+    setFindMatches(allMatches);
+    findMatchesRef.current = allMatches;
+    const activeIdx = allMatches.length > 0 ? 0 : -1;
+    setActiveMatchIndex(activeIdx);
+    onPdfSearchUpdate?.({ totalMatches: allMatches.length, activeMatchIndex: activeIdx });
+
+    if (allMatches.length > 0) {
+      scrollToFindMatch(allMatches[0]);
+    }
+  }
+
   useEffect(() => {
     const query = pdfSearchQuery?.trim();
-    if (!query || numPages === 0 || !active) {
+    if (!query || !active) {
       setFindMatches([]);
       setActiveMatchIndex(-1);
       findMatchesRef.current = [];
       onPdfSearchUpdate?.({ totalMatches: 0, activeMatchIndex: -1 });
+      pendingSearchRef.current = null;
       return undefined;
     }
 
-    const lowerQuery = query.toLowerCase();
-    let cancelled = false;
+    // PDF hasn't loaded yet — defer the search until pages are rendered.
+    if (numPages === 0) {
+      pendingSearchRef.current = query;
+      return undefined;
+    }
 
-    const timer = window.setTimeout(() => {
-      const allMatches: PdfSearchMatch[] = [];
-      for (let i = 0; i < numPages; i += 1) {
-        const pageEl = pageRefs.current[i];
-        if (!pageEl) continue;
-        const pageMatches = findInPageTextLayer(pageEl, i, lowerQuery);
-        allMatches.push(...pageMatches);
-      }
-
-      if (cancelled) return;
-
-      setFindMatches(allMatches);
-      findMatchesRef.current = allMatches;
-      const activeIdx = allMatches.length > 0 ? 0 : -1;
-      setActiveMatchIndex(activeIdx);
-      onPdfSearchUpdate?.({ totalMatches: allMatches.length, activeMatchIndex: activeIdx });
-
-      // Scroll to the first match.
-      if (allMatches.length > 0) {
-        scrollToFindMatch(allMatches[0]);
-      }
-    }, 150);
-
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
+    // If all pages have already rendered (subsequent queries after the
+    // initial load), search immediately.  Otherwise store the query and
+    // let onRenderSuccess trigger it.
+    if (pagesRenderedRef.current.size === numPages) {
+      runSearch(query);
+    } else {
+      pendingSearchRef.current = query;
+    }
   }, [pdfSearchQuery, numPages, active, onPdfSearchUpdate]);
 
   function scrollToFindMatch(match: PdfSearchMatch) {
@@ -548,6 +561,7 @@ function PdfReaderComponent({
       rects: selection.rects,
       quote: selection.quote,
       comment: kind === "note" ? comment?.trim() : undefined,
+      sourceSha256: fileAsset.sha256,
       createdAt: now,
       updatedAt: now
     });
@@ -738,7 +752,15 @@ function PdfReaderComponent({
                   width={pageWidth * zoom}
                   renderAnnotationLayer
                   renderTextLayer
-                  onRenderSuccess={restorePendingScroll}
+                  onRenderSuccess={() => {
+                    restorePendingScroll();
+                    pagesRenderedRef.current.add(index);
+                    const pending = pendingSearchRef.current;
+                    if (pending && pagesRenderedRef.current.size === numPages && active) {
+                      pendingSearchRef.current = null;
+                      runSearch(pending);
+                    }
+                  }}
                 />
                 <AnnotationOverlay
                   annotations={visibleAnnotations.filter((annotation) => annotation.pageIndex === index)}

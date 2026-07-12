@@ -107,6 +107,7 @@ export async function importPdfFile(
     size: file.size,
     mime: file.type || "application/pdf",
     fileName: file.name,
+    contentRef: { kind: "object", sha256 },
     downloadState: "local",
     createdAt: now,
     updatedAt: now

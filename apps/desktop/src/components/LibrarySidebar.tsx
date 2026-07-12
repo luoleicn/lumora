@@ -8,8 +8,10 @@ import {
   CircleX,
   FilePlus,
   FileText,
+  FileX,
   Folder,
   FolderPlus,
+  Hash,
   Pencil,
   RefreshCw,
   Star,
@@ -113,6 +115,12 @@ export function LibrarySidebar({
   const unfiledPaperCount = activePapers.filter(
     (paper) => !state.paperCollections.some((item) => item.paperId === paper.id && !item.deletedAt)
   ).length;
+  const noArxivCount = activePapers.filter((paper) => !paper.arxiv).length;
+  const noPdfCount = activePapers.filter((paper) =>
+    !state.fileAssets.some((file) => file.paperId === paper.id && !file.deletedAt
+      && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName))
+      && file.downloadState === "local")
+  ).length;
   const authors = [...new Set(activePapers.flatMap((paper) => paper.authors.map((author) => author.fullName)).filter(Boolean))]
     .sort((a, b) => a.localeCompare(b));
   const tags = [...new Set(activePapers.flatMap((paper) => paper.tags ?? []).filter(Boolean))]
@@ -147,6 +155,20 @@ export function LibrarySidebar({
             active={selectedCollectionId === "recently_added"}
             count={activePapers.length}
             onClick={() => onSelectCollection("recently_added")}
+          />
+          <NavButton
+            icon={Hash}
+            label="No arXiv ID"
+            active={selectedCollectionId === "no_arxiv"}
+            count={noArxivCount}
+            onClick={() => onSelectCollection("no_arxiv")}
+          />
+          <NavButton
+            icon={FileX}
+            label="No PDF"
+            active={selectedCollectionId === "no_pdf"}
+            count={noPdfCount}
+            onClick={() => onSelectCollection("no_pdf")}
           />
           <NavButton
             icon={Star}

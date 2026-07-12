@@ -6,48 +6,45 @@ export type SyncChange<T extends SyncEntity = SyncEntity> = {
   data: EntityPayloadMap[T];
 };
 
-export type SyncPushRequest = {
-  clientId: string;
-  changes: SyncChange[];
+export const cloudSyncProtocolVersion = 1;
+
+export type CloudVersion = {
+  putTime: string;
+  deviceId: string;
+  batchSeq: number;
+  opIndex: number;
 };
 
-export type SyncPushResponse = {
-  accepted: number;
-  serverCursor: number;
+export type CloudSyncConfig = {
+  accessKey: string;
+  bucket: string;
+  region?: string;
+  privateDomain: string;
+  prefix: "lumora/v1";
+  configured: boolean;
 };
 
-export type SyncPullResponse = {
-  cursor: number;
-  changes: SyncChange[];
+export type CloudSyncChange = SyncChange & {
+  operationId: string;
 };
 
-export type LoginRequest = {
-  email: string;
-  password: string;
+export type CloudSyncBatch = {
+  protocolVersion: typeof cloudSyncProtocolVersion;
+  deviceId: string;
+  batchSeq: number;
+  createdAt: string;
+  changes: CloudSyncChange[];
 };
 
-export type LoginResponse = {
-  accessToken: string;
-  expiresAt: string;
-};
-
-export type InitUploadRequest = {
-  fileAssetId: string;
-  paperId: string;
-  sha256: string;
-  size: number;
-  mime: string;
-  fileName: string;
-};
-
-export type InitUploadResponse = {
-  fileAssetId: string;
-  objectKey: string;
-  uploadUrl: string;
-};
-
-export type DownloadUrlResponse = {
-  url: string;
+export type CloudSyncSummary = {
+  uploadedChanges: number;
+  downloadedChanges: number;
+  uploadedFiles: number;
+  downloadedFiles: number;
+  arxivDownloads: number;
+  pendingChanges: number;
+  lastSyncedAt: string;
+  errors: string[];
 };
 
 export type ImportJob = {

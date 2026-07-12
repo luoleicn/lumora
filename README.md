@@ -10,10 +10,9 @@ lumora combines Lumos and Aurora: a quiet desktop research library that feels li
 - Modern library UI: collection sidebar, paper list, PDF reader workspace, right-click annotation flow, sync panel.
 - PDF import: stores metadata in browser local storage and PDF blobs in IndexedDB for the MVP desktop/web runtime.
 - PDF annotations: text selection creates normalized highlight/note rectangles without modifying the PDF.
-- Sync API: Fastify server with login, push/pull sync, file upload/download signed URLs, Prisma/Postgres schema.
-- Object storage: S3-compatible storage support via MinIO.
+- Incremental sync: native Tauri sync engine backed directly by each user's private Qiniu Kodo bucket.
+- Cloud files: content-addressed non-arXiv attachments; arXiv PDFs are reconstructed from a pinned version ID.
 - Mendeley: OAuth connection route and metadata/folder import service skeleton.
-- Deployment: Docker Compose for Postgres, MinIO, and the API server.
 
 ## Requirements
 
@@ -28,7 +27,6 @@ This workspace has been verified with Node/npm, Rust stable, Docker, and Docker 
 
 ```bash
 npm install
-npm run prisma:generate
 ```
 
 ## Run The Desktop UI
@@ -51,22 +49,14 @@ npm run tauri:build --workspace @lumora/desktop
 
 The app bundle is written to `apps/desktop/src-tauri/target/release/bundle/macos/lumora.app`.
 
-## Run The Backend
+## Configure Cloud Sync
 
-Start infrastructure:
+Create a private Qiniu Kodo bucket for the library and enter its Access Key,
+Secret Key, bucket name, region, and private download domain in the Sync panel.
+The Secret Key is stored in the operating-system keychain and never in the
+browser store or SQLite. Each bucket hosts one library under `lumora/v1/`.
 
-```bash
-docker compose -f infra/docker-compose.yml up --build
-```
-
-Default login:
-
-- Email: `reader@example.com`
-- Password: `change-me`
-
-For production or long-running personal use, change `JWT_SECRET`, `LUMORA_BOOTSTRAP_PASSWORD`, and S3 credentials in environment variables.
-
-If browser uploads to MinIO are blocked by CORS, apply `infra/minio-cors.json` to the `lumora` bucket with the MinIO client.
+See [docs/qiniu-sync.md](docs/qiniu-sync.md) for protocol, recovery, and security details.
 
 ## Development Checks
 
@@ -93,7 +83,7 @@ Verified in this workspace:
 ## Current MVP Limits
 
 - Local desktop persistence uses localStorage + IndexedDB while the Tauri-native SQLite/file-system layer is still to be added.
-- Sync currently pushes the full local library state each time; a local change-log queue should replace this before large libraries.
+- Cloud conflicts use Qiniu receipt time with deterministic last-write-wins at entity level.
 - Mendeley import currently imports metadata and folders. PDF attachment download and annotation migration need provider-specific hardening.
 - Conflict handling is last-write-wins at record level.
 - The iPhone target is represented by the Tauri-compatible frontend architecture, not a built mobile app yet.
