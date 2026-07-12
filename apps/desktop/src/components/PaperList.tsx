@@ -1,4 +1,4 @@
-import { FileCheck2, FilePlus2, FileQuestion, FileText, FolderMinus, RotateCcw, Star, Trash2 } from "lucide-react";
+import { FileCheck2, FileDown, FilePlus2, FileQuestion, FileText, FolderMinus, RotateCcw, Star, Trash2 } from "lucide-react";
 import type { FileAsset, LibraryState, Paper } from "@lumora/shared";
 import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import { collapseCjkSpaces, splitSnippet, type PaperSearchMeta, type SearchMatchedField } from "../lib/searchIndex";
@@ -331,32 +331,37 @@ export function PaperList({
               </tr>
             </thead>
             <tbody>
-              {sortedPapers.map((paper) => (
-                <PaperRow
-                  key={paper.id}
-                  paper={paper}
-                  searchMeta={searchMeta?.get(paper.id)}
-                  fileAsset={
-                    state.fileAssets.find((file) =>
-                      file.paperId === paper.id
-                      && !file.deletedAt
-                      && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName))
-                      && (Boolean(file.localPath) || file.downloadState === "local")
-                    ) ??
-                    state.fileAssets.find((file) =>
-                      file.paperId === paper.id
-                      && !file.deletedAt
-                      && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName))
-                    )
-                  }
-                  active={paper.id === selectedPaperId}
-                  onClick={() => onSelectPaper(paper.id)}
-                  onDoubleClick={() => onOpenPaper(paper.id)}
-                  onUpdatePaper={onUpdatePaper}
-                  onPointerDown={(event) => handlePaperPointerDown(event, paper.id)}
-                  onContextMenu={(event) => handlePaperContextMenu(event, paper.id)}
-                />
-              ))}
+              {sortedPapers.map((paper) => {
+                const isPaperPdf = (file: FileAsset) =>
+                  file.paperId === paper.id
+                  && !file.deletedAt
+                  && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName));
+                // A PDF is only "local" when its bytes actually live on this
+                // device (localPath, or the legacy downloadState flag). A synced
+                // record with just a cloud reference is "remote" — it must not
+                // read as an available local file, which is exactly what shows up
+                // in the "No PDF" collection on a freshly synced device.
+                const localPdf = state.fileAssets.find(
+                  (file) => isPaperPdf(file) && (Boolean(file.localPath) || file.downloadState === "local")
+                );
+                const anyPdf = localPdf ?? state.fileAssets.find(isPaperPdf);
+                const pdfState: PdfState = localPdf ? "local" : anyPdf ? "remote" : "none";
+                return (
+                  <PaperRow
+                    key={paper.id}
+                    paper={paper}
+                    searchMeta={searchMeta?.get(paper.id)}
+                    fileAsset={anyPdf}
+                    pdfState={pdfState}
+                    active={paper.id === selectedPaperId}
+                    onClick={() => onSelectPaper(paper.id)}
+                    onDoubleClick={() => onOpenPaper(paper.id)}
+                    onUpdatePaper={onUpdatePaper}
+                    onPointerDown={(event) => handlePaperPointerDown(event, paper.id)}
+                    onContextMenu={(event) => handlePaperContextMenu(event, paper.id)}
+                  />
+                );
+              })}
             </tbody>
           </table>
         )}
@@ -444,10 +449,13 @@ function ResizableHeader({
   );
 }
 
+type PdfState = "local" | "remote" | "none";
+
 function PaperRow({
   paper,
   searchMeta,
   fileAsset,
+  pdfState,
   active,
   onClick,
   onDoubleClick,
@@ -458,6 +466,7 @@ function PaperRow({
   paper: Paper;
   searchMeta?: PaperSearchMeta;
   fileAsset?: FileAsset;
+  pdfState: PdfState;
   active: boolean;
   onClick: () => void;
   onDoubleClick: () => void;
@@ -492,11 +501,27 @@ function PaperRow({
       <td className="paper-title-cell" title={paper.title}>
         <div className="paper-title-line">
           <span
-            className={`paper-file-status ${fileAsset ? "has-pdf" : "no-pdf"}`}
-            title={fileAsset ? `PDF attached: ${fileAsset.fileName}` : "No PDF attached"}
-            aria-label={fileAsset ? "PDF attached" : "No PDF attached"}
+            className={`paper-file-status ${pdfState === "local" ? "has-pdf" : pdfState === "remote" ? "remote-pdf" : "no-pdf"}`}
+            title={
+              pdfState === "local"
+                ? `PDF available locally: ${fileAsset?.fileName ?? ""}`
+                : pdfState === "remote"
+                  ? `PDF in cloud — not downloaded to this device${fileAsset ? `: ${fileAsset.fileName}` : ""}`
+                  : "No PDF attached"
+            }
+            aria-label={
+              pdfState === "local"
+                ? "PDF available locally"
+                : pdfState === "remote"
+                  ? "PDF in cloud, not downloaded"
+                  : "No PDF attached"
+            }
           >
-            {fileAsset ? <FileCheck2 size={16} /> : <FileQuestion size={16} />}
+            {pdfState === "local"
+              ? <FileCheck2 size={16} />
+              : pdfState === "remote"
+                ? <FileDown size={16} />
+                : <FileQuestion size={16} />}
           </span>
           <span>{paper.title}</span>
         </div>

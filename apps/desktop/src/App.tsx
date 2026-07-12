@@ -1619,6 +1619,20 @@ export default function App() {
       });
     } catch (error) {
       if (cloudSyncCancelRequestedRef.current) return;
+      // Metadata (papers, collections, membership) is committed to the DB during
+      // the pull phase, before file blobs are fetched. When a later stage throws,
+      // the returned state never reaches setLibrary, leaving the sidebar stale
+      // until a manual refresh. Reload from the DB so everything that did land is
+      // reflected immediately; keep the original sync error if the reload fails.
+      try {
+        const { state: dbState, empty } = await loadLibraryFromDb();
+        if (!empty) {
+          setLibrary(dbState);
+          lastPersistedLibraryRef.current = dbState;
+        }
+      } catch {
+        // Ignore — surface the original sync failure below.
+      }
       setCloudSyncActivity({ state: "error", message: formatActionError(error), completed: 0, total: 5 });
     } finally {
       cloudSyncInFlightRef.current = false;

@@ -1193,6 +1193,12 @@ body.paper-pointer-dragging * {
   color: #23815f;
 }
 
+/* PDF exists in the cloud but hasn't been downloaded to this device. */
+.paper-file-status.remote-pdf {
+  background: #eaf0fb;
+  color: #3a63c0;
+}
+
 .paper-file-status.no-pdf {
   color: #9ba5ae;
 }

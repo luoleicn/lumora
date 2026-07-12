@@ -303,15 +303,24 @@ export async function syncLibrary(
     if (file.contentRef.sha256.startsWith("mendeley-")) continue;
     if ((await readFileBytes(file, storage))?.length) continue;
     onStage?.(`Downloading file from cloud: ${file.fileName}`, 3, 5);
-    let bytes: Uint8Array<ArrayBuffer>;
     try {
       const buffer = await invoke<ArrayBuffer>("qiniu_download_blob", { sha256: file.contentRef.sha256 });
-      bytes = new Uint8Array(buffer);
+      const bytes = new Uint8Array(buffer);
+      let localPath: string | undefined;
+      if (storage.directory) {
+        localPath = await storePdfToDisk(storage.directory, file.fileName, bytes);
+      } else {
+        await putFileBlob(file.id, new Blob([bytes], { type: file.mime }));
+      }
+      downloadedFiles[index] = { ...file, localPath, downloadState: "local" };
+      summary.downloadedFiles += 1;
+      consecutiveDownloadFailures = 0;
     } catch (error) {
-      // One missing or un-fetchable blob must not abort the whole library sync:
-      // record it and move on, leaving the file as a metadata-only placeholder to
-      // retry next time. Bail out fast if downloads fail systemically (e.g. a
-      // wrong region) instead of grinding through hundreds of doomed attempts.
+      // One missing/un-fetchable blob or failed local write must not abort the
+      // whole library sync: record it and move on, leaving the file as a
+      // metadata-only placeholder to retry next time. Bail out fast if downloads
+      // fail systemically (e.g. a wrong region) instead of grinding through
+      // hundreds of doomed attempts.
       const detail = error instanceof Error ? error.message : String(error);
       downloadErrors.push(`${file.fileName}: ${detail}`);
       consecutiveDownloadFailures += 1;
@@ -319,17 +328,7 @@ export async function syncLibrary(
         summary.errors.push(...downloadErrors);
         throw new Error(`Cloud sync aborted after ${consecutiveDownloadFailures} consecutive download failures. Latest — ${file.fileName}: ${detail}`);
       }
-      continue;
     }
-    consecutiveDownloadFailures = 0;
-    let localPath: string | undefined;
-    if (storage.directory) {
-      localPath = await storePdfToDisk(storage.directory, file.fileName, bytes);
-    } else {
-      await putFileBlob(file.id, new Blob([bytes], { type: file.mime }));
-    }
-    downloadedFiles[index] = { ...file, localPath, downloadState: "local" };
-    summary.downloadedFiles += 1;
   }
   summary.errors.push(...downloadErrors);
   if (downloadedFiles.some((file, index) => file !== state.fileAssets[index])) {
