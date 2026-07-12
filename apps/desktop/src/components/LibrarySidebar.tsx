@@ -93,7 +93,20 @@ export function LibrarySidebar({
 }: LibrarySidebarProps) {
   const [authorsExpanded, setAuthorsExpanded] = useState(false);
   const [tagsExpanded, setTagsExpanded] = useState(false);
-  const [collapsedCollections, setCollapsedCollections] = useState<Record<string, boolean>>({});
+  const [collapsedCollections, setCollapsedCollections] = useState<Record<string, boolean>>(() => {
+    try {
+      const raw = localStorage.getItem("lumora-collapsed-collections");
+      return raw ? JSON.parse(raw) as Record<string, boolean> : {};
+    } catch {
+      return {};
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("lumora-collapsed-collections", JSON.stringify(collapsedCollections));
+    } catch { /* quota exceeded — ignore */ }
+  }, [collapsedCollections]);
   const [nativeDragOverCollectionId, setNativeDragOverCollectionId] = useState<string>();
   const [contextMenu, setContextMenu] = useState<CollectionContextMenu>();
   const [trashContextMenu, setTrashContextMenu] = useState<{ x: number; y: number }>();
