@@ -13,7 +13,8 @@
     "dev:desktop": "npm run dev --workspace @lumora/desktop",
     "build": "npm run build --workspace @lumora/shared && npm run build --workspace @lumora/desktop",
     "typecheck": "npm run build --workspace @lumora/shared && npm run typecheck --workspace @lumora/desktop",
-    "test": "npm run test --workspace @lumora/shared && npm run test --workspace @lumora/desktop --if-present",
+    "test": "npm run test --workspace @lumora/shared && npm run test --workspace @lumora/desktop --if-present && npm run test:release-version",
+    "test:release-version": "node --test scripts/release-version.test.mjs",
     "test:coverage": "npm run test:coverage --workspace @lumora/desktop"
   },
   "engines": {

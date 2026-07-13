@@ -32,6 +32,7 @@ TAURI_DIR="$PROJECT_DIR/apps/desktop/src-tauri"
 BUNDLE_DIR="$TAURI_DIR/target/release/bundle/macos"
 APP_BUNDLE="$BUNDLE_DIR/$APP_NAME.app"
 CONFIG_FILE="$TAURI_DIR/tauri.conf.json"
+RELEASE_CONFIG_FILE="$TAURI_DIR/tauri.release.conf.json"
 
 # --------------- helpers ---------------
 
@@ -82,14 +83,19 @@ if ! echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
 fi
 
 VERSION="${TAG#v}"
-log "App: $APP_NAME  Version: $VERSION  Tag: $TAG"
-log "Project: $PROJECT_DIR"
-
 # --------------- check prerequisites ---------------
 
 command -v python3 >/dev/null 2>&1 || err "python3 is required"
+command -v node  >/dev/null 2>&1 || err "node is required (Node.js 22+)"
 command -v npm   >/dev/null 2>&1 || err "npm is required (Node.js 22+)"
 command -v cargo >/dev/null 2>&1 || err "cargo is required (Rust stable toolchain)"
+
+log "App: $APP_NAME  Version: $VERSION  Tag: $TAG"
+log "Project: $PROJECT_DIR"
+
+node "$PROJECT_DIR/scripts/release-version.mjs" "$TAG" "$RELEASE_CONFIG_FILE" \
+  || err "Could not prepare the Tauri release version configuration."
+trap 'rm -f "$RELEASE_CONFIG_FILE"' EXIT
 
 # In --build-only mode (used by CI, where the tag already exists) skip every
 # GitHub token / repo / tag-existence check; only build and stage the DMGs.
@@ -174,7 +180,9 @@ done
 # Build for Apple Silicon
 log "Building for Apple Silicon ($ARM_TARGET)..."
 cd "$PROJECT_DIR"
-npm run tauri:build --workspace @lumora/desktop -- --target "$ARM_TARGET"
+npm run tauri:build --workspace @lumora/desktop -- \
+  --target "$ARM_TARGET" \
+  --config "$RELEASE_CONFIG_FILE"
 
 ARM_APP="$TAURI_DIR/target/$ARM_TARGET/release/bundle/macos/$APP_NAME.app"
 if [[ ! -d "$ARM_APP" ]]; then
@@ -182,15 +190,27 @@ if [[ ! -d "$ARM_APP" ]]; then
 fi
 log "ARM build: $(file -b "$ARM_APP/Contents/MacOS/$APP_NAME")"
 
+ARM_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$ARM_APP/Contents/Info.plist")
+[[ "$ARM_VERSION" == "$VERSION" ]] \
+  || err "ARM app version '$ARM_VERSION' does not match release version '$VERSION'."
+log "ARM app version verified: $ARM_VERSION"
+
 # Build for Intel
 log "Building for Intel ($INTEL_TARGET)..."
-npm run tauri:build --workspace @lumora/desktop -- --target "$INTEL_TARGET"
+npm run tauri:build --workspace @lumora/desktop -- \
+  --target "$INTEL_TARGET" \
+  --config "$RELEASE_CONFIG_FILE"
 
 INTEL_APP="$TAURI_DIR/target/$INTEL_TARGET/release/bundle/macos/$APP_NAME.app"
 if [[ ! -d "$INTEL_APP" ]]; then
   err "Intel build did not produce $INTEL_APP"
 fi
 log "Intel build: $(file -b "$INTEL_APP/Contents/MacOS/$APP_NAME")"
+
+INTEL_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$INTEL_APP/Contents/Info.plist")
+[[ "$INTEL_VERSION" == "$VERSION" ]] \
+  || err "Intel app version '$INTEL_VERSION' does not match release version '$VERSION'."
+log "Intel app version verified: $INTEL_VERSION"
 
 # --------------- package DMGs ---------------
 

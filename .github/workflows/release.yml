@@ -22,7 +22,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -35,6 +35,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -61,6 +63,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -91,6 +95,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -100,8 +106,10 @@ jobs:
         with:
           workspaces: apps/desktop/src-tauri
       - run: npm ci
+      - name: Prepare release version
+        run: node scripts/release-version.mjs "$env:TAG"
       - name: Build Windows bundles
-        run: npm run tauri:build:windows --workspace @lumora/desktop
+        run: npm run tauri:build:windows --workspace @lumora/desktop -- --config src-tauri/tauri.release.conf.json
       - name: Stage Windows artifacts
         shell: pwsh
         run: |
@@ -112,6 +120,9 @@ jobs:
           $exe = Get-ChildItem "$bundle/nsis/*-setup.exe" | Select-Object -First 1
           if (-not $msi) { throw "No .msi found under $bundle/msi" }
           if (-not $exe) { throw "No NSIS -setup.exe found under $bundle/nsis" }
+          $version = $tag -replace '^v', ''
+          if ($msi.Name -notlike "*$version*") { throw "MSI filename does not contain release version $version`: $($msi.Name)" }
+          if ($exe.Name -notlike "*$version*") { throw "NSIS filename does not contain release version $version`: $($exe.Name)" }
           Copy-Item $msi ".release-artifacts/lumora-$tag-windows-x64.msi"
           Copy-Item $exe ".release-artifacts/lumora-$tag-windows-x64-setup.exe"
       - uses: actions/upload-artifact@v4

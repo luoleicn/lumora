@@ -13,3 +13,4 @@ apps/desktop/src-tauri/gen/
 apps/server/prisma/dev.db
 coverage/
 .release-artifacts/
+apps/desktop/src-tauri/tauri.release.conf.json

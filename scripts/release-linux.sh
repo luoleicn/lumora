@@ -33,6 +33,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 APP_NAME="lumora"
 TAURI_DIR="$PROJECT_DIR/apps/desktop/src-tauri"
+RELEASE_CONFIG_FILE="$TAURI_DIR/tauri.release.conf.json"
 DEB_DIR="$TAURI_DIR/target/release/bundle/deb"
 APPIMAGE_DIR="$TAURI_DIR/target/release/bundle/appimage"
 
@@ -85,14 +86,19 @@ if ! echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
 fi
 
 VERSION="${TAG#v}"
-log "App: $APP_NAME  Version: $VERSION  Tag: $TAG"
-log "Project: $PROJECT_DIR"
-
 # --------------- check prerequisites ---------------
 
 command -v python3 >/dev/null 2>&1 || err "python3 is required"
+command -v node  >/dev/null 2>&1 || err "node is required (Node.js 22+)"
 command -v npm   >/dev/null 2>&1 || err "npm is required (Node.js 22+)"
 command -v cargo >/dev/null 2>&1 || err "cargo is required (Rust stable toolchain)"
+
+log "App: $APP_NAME  Version: $VERSION  Tag: $TAG"
+log "Project: $PROJECT_DIR"
+
+node "$PROJECT_DIR/scripts/release-version.mjs" "$TAG" "$RELEASE_CONFIG_FILE" \
+  || err "Could not prepare the Tauri release version configuration."
+trap 'rm -f "$RELEASE_CONFIG_FILE"' EXIT
 
 # In --build-only mode (used by CI, where the tag already exists) skip every
 # GitHub token / repo / tag-existence check; only build and stage artifacts.
@@ -164,7 +170,8 @@ fi  # end: not --build-only (skip GitHub token/repo/tag checks)
 
 log "Building Linux bundles (deb, appimage)..."
 cd "$PROJECT_DIR"
-npm run tauri:build:linux --workspace @lumora/desktop
+npm run tauri:build:linux --workspace @lumora/desktop -- \
+  --config "$RELEASE_CONFIG_FILE"
 
 # Locate the freshly built artifacts. Tauri names them from the config version,
 # e.g. lumora_0.1.0_amd64.deb and lumora_0.1.0_amd64.AppImage.
@@ -174,6 +181,13 @@ APPIMAGE_SRC=$(ls -t "$APPIMAGE_DIR"/*.AppImage 2>/dev/null | head -1) \
   || err "No .AppImage found in $APPIMAGE_DIR"
 [[ -f "$DEB_SRC" ]] || err "No .deb found in $DEB_DIR"
 [[ -f "$APPIMAGE_SRC" ]] || err "No .AppImage found in $APPIMAGE_DIR"
+
+DEB_VERSION=$(dpkg-deb -f "$DEB_SRC" Version)
+[[ "$DEB_VERSION" == "$VERSION" ]] \
+  || err "Deb package version '$DEB_VERSION' does not match release version '$VERSION'."
+[[ "$(basename "$APPIMAGE_SRC")" == *"$VERSION"* ]] \
+  || err "AppImage filename does not contain release version '$VERSION': $APPIMAGE_SRC"
+log "Linux package version verified: $VERSION"
 
 log "Built deb:      $DEB_SRC ($(du -sh "$DEB_SRC" | awk '{print $1}'))"
 log "Built AppImage: $APPIMAGE_SRC ($(du -sh "$APPIMAGE_SRC" | awk '{print $1}'))"
