@@ -1,4 +1,8 @@
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID, WINDOW_SUBMENU_ID};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
@@ -34,6 +38,9 @@ const APP_DUPLICATE_DOCUMENTS: &str = "app-duplicate-documents";
 const FILES_REFRESH_LIBRARY: &str = "files-refresh-library";
 const FILES_DOWNLOAD_ARXIV_FILES: &str = "files-download-arxiv-files";
 const PROXY_SETTINGS_META_KEY: &str = "networkProxySettings";
+const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
+static INITIALIZED_LIBRARY_DATABASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 #[tauri::command]
 fn ping() -> &'static str {
@@ -364,19 +371,37 @@ fn open_library_db<R: Runtime>(app: &AppHandle<R>) -> Result<rusqlite::Connectio
         .map_err(|error| format!("Failed to resolve app data dir: {error}"))?;
     std::fs::create_dir_all(&dir).map_err(|error| format!("Failed to create app data dir: {error}"))?;
 
-    let connection = rusqlite::Connection::open(dir.join("lumora.db"))
+    let database_path = dir.join("lumora.db");
+    let connection = rusqlite::Connection::open(&database_path)
         .map_err(|error| format!("Failed to open library database: {error}"))?;
-    init_library_schema(&connection)?;
-    ensure_search_index(&connection)?;
+    configure_library_connection(&connection)?;
+
+    // Schema setup performs writes and used to run for every command, causing
+    // avoidable lock contention between background sync and UI persistence.
+    let initialized = INITIALIZED_LIBRARY_DATABASES.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut initialized = initialized
+        .lock()
+        .map_err(|_| "Library database initialization lock is poisoned.".to_string())?;
+    if !initialized.contains(&database_path) {
+        init_library_schema(&connection)?;
+        cloud_sync::init_sync_schema(&connection)?;
+        ensure_search_index(&connection)?;
+        initialized.insert(database_path);
+    }
 
     Ok(connection)
+}
+
+fn configure_library_connection(connection: &rusqlite::Connection) -> Result<(), String> {
+    connection
+        .busy_timeout(DATABASE_BUSY_TIMEOUT)
+        .map_err(|error| format!("Failed to configure library database: {error}"))
 }
 
 fn init_library_schema(connection: &rusqlite::Connection) -> Result<(), String> {
     connection
         .execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA busy_timeout = 5000;
              CREATE TABLE IF NOT EXISTS entities (
                entity_type TEXT NOT NULL,
                id TEXT NOT NULL,
@@ -2637,9 +2662,9 @@ fn tokenize(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_fts_column_query, cjk_segment, ensure_search_index, index_paper_body, init_library_schema,
-        normalize_arxiv_id, search_library_rows, sync_search_index_for_change, validate_proxy_settings,
-        ProxySettings, SEARCH_RESULT_LIMIT,
+        build_fts_column_query, cjk_segment, configure_library_connection, ensure_search_index,
+        index_paper_body, init_library_schema, normalize_arxiv_id, search_library_rows,
+        sync_search_index_for_change, validate_proxy_settings, ProxySettings, SEARCH_RESULT_LIMIT,
     };
 
     fn test_connection() -> rusqlite::Connection {
@@ -2647,6 +2672,17 @@ mod tests {
         init_library_schema(&connection).unwrap();
         ensure_search_index(&connection).unwrap();
         connection
+    }
+
+    #[test]
+    fn library_connections_use_extended_busy_timeout() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        configure_library_connection(&connection).unwrap();
+
+        let timeout: u64 = connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 30_000);
     }
 
     fn upsert_entity(

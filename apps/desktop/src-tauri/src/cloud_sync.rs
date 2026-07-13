@@ -363,7 +363,7 @@ fn keyring_entry(access_key: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYRING_SERVICE, access_key).map_err(|error| error.to_string())
 }
 
-fn init_sync_schema(connection: &rusqlite::Connection) -> Result<(), String> {
+pub(super) fn init_sync_schema(connection: &rusqlite::Connection) -> Result<(), String> {
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS sync_cursors (
@@ -424,7 +424,6 @@ fn init_sync_schema(connection: &rusqlite::Connection) -> Result<(), String> {
 
 fn load_config<R: Runtime>(app: &AppHandle<R>) -> Result<QiniuSyncConfig, String> {
     let connection = super::open_library_db(app)?;
-    init_sync_schema(&connection)?;
     let raw = super::get_meta_value(&connection, CONFIG_META_KEY)
         .ok_or_else(|| "Qiniu sync is not configured.".to_string())?;
     serde_json::from_str(&raw).map_err(|error| format!("Invalid Qiniu configuration: {error}"))
@@ -593,7 +592,6 @@ fn collect_local_rows(connection: &rusqlite::Connection) -> Result<Vec<LocalRow>
 
 fn seal_batch<R: Runtime>(app: &AppHandle<R>, device: &str) -> Result<Option<(u64, Vec<u8>, Vec<LocalRow>)>, String> {
     let connection = super::open_library_db(app)?;
-    init_sync_schema(&connection)?;
     let seq = next_batch_seq(&connection);
     let existing_batch: Option<(Vec<u8>, i64)> = connection
         .query_row(
@@ -1001,7 +999,6 @@ async fn pull_remote<R: Runtime>(
 #[tauri::command]
 pub async fn qiniu_sync_config<R: Runtime>(app: AppHandle<R>) -> Result<Option<QiniuSyncConfig>, String> {
     let connection = super::open_library_db(&app)?;
-    init_sync_schema(&connection)?;
     super::get_meta_value(&connection, CONFIG_META_KEY)
         .map(|raw| serde_json::from_str(&raw).map_err(|error| error.to_string()))
         .transpose()
@@ -1033,7 +1030,6 @@ pub async fn qiniu_save_sync_config<R: Runtime>(
         .set_password(&request.secret_key)
         .map_err(|error| format!("Failed to store Qiniu Secret Key in the system keychain: {error}"))?;
     let mut connection = super::open_library_db(&app)?;
-    init_sync_schema(&connection)?;
     let target = format!("{}:{}", config.access_key, config.bucket);
     if super::get_meta_value(&connection, SEEDED_TARGET_META_KEY).as_deref() != Some(&target) {
         let transaction = connection.transaction().map_err(|error| error.to_string())?;
@@ -1168,7 +1164,6 @@ pub async fn qiniu_sync_library<R: Runtime>(app: AppHandle<R>) -> Result<SyncSum
     let secret = load_secret(&config)?;
     let device = {
         let connection = super::open_library_db(&app)?;
-        init_sync_schema(&connection)?;
         device_id(&connection)?
     };
     // A fixed, identical protocol object makes concurrent first-device setup idempotent.
