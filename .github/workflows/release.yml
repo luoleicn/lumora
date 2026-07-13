@@ -53,6 +53,8 @@ jobs:
           name: macos-artifacts
           path: .release-artifacts/*
           if-no-files-found: error
+          # .release-artifacts is a dotfile dir; without this v4 skips its contents.
+          include-hidden-files: true
 
   build-linux:
     name: Build Linux (deb + AppImage)
@@ -81,6 +83,8 @@ jobs:
           name: linux-artifacts
           path: .release-artifacts/*
           if-no-files-found: error
+          # .release-artifacts is a dotfile dir; without this v4 skips its contents.
+          include-hidden-files: true
 
   build-windows:
     name: Build Windows (msi + nsis)
@@ -115,6 +119,8 @@ jobs:
           name: windows-artifacts
           path: .release-artifacts/*
           if-no-files-found: error
+          # .release-artifacts is a dotfile dir; without this v4 skips its contents.
+          include-hidden-files: true
 
   release:
     name: Publish GitHub Release
