@@ -69,16 +69,6 @@ export function SyncPanel({
   );
 }
 
-const documentTypes = [
-  ["journalArticle", "Journal Article"],
-  ["conferencePaper", "Conference Paper"],
-  ["preprint", "Preprint"],
-  ["book", "Book"],
-  ["bookSection", "Book Section"],
-  ["thesis", "Thesis"],
-  ["report", "Report"]
-];
-
 function DetailsTab({
   settings,
   paper,
@@ -327,16 +317,6 @@ function DetailsTab({
         </div>
       )}
       <label>
-        Type
-        <select value={paper.documentType ?? "journalArticle"} onChange={(event) => updatePaper({ documentType: event.target.value })}>
-          {documentTypes.map(([value, label]) => (
-            <option key={value} value={value}>
-              {label}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label>
         Title
         <input value={paper.title} onChange={(event) => updatePaper({ title: event.target.value })} />
       </label>
@@ -362,32 +342,8 @@ function DetailsTab({
           />
         </label>
         <label>
-          Published In
-          <input value={paper.venue ?? ""} onChange={(event) => updatePaper({ venue: clean(event.target.value) })} />
-        </label>
-        <label>
-          DOI
-          <input value={paper.doi ?? ""} onChange={(event) => updatePaper({ doi: clean(event.target.value) })} />
-        </label>
-        <label>
           URL
           <input value={paper.url ?? ""} onChange={(event) => updatePaper({ url: clean(event.target.value) })} />
-        </label>
-        <label>
-          Volume
-          <input value={paper.volume ?? ""} onChange={(event) => updatePaper({ volume: clean(event.target.value) })} />
-        </label>
-        <label>
-          Issue
-          <input value={paper.issue ?? ""} onChange={(event) => updatePaper({ issue: clean(event.target.value) })} />
-        </label>
-        <label>
-          Pages
-          <input value={paper.pages ?? ""} onChange={(event) => updatePaper({ pages: clean(event.target.value) })} />
-        </label>
-        <label>
-          Publisher
-          <input value={paper.publisher ?? ""} onChange={(event) => updatePaper({ publisher: clean(event.target.value) })} />
         </label>
       </div>
       <label>
