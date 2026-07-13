@@ -19,7 +19,7 @@ hex = "0.4"
 hmac = "0.12"
 http = "0.2"
 httpdate = "1"
-keyring = { version = "3", features = ["apple-native", "sync-secret-service"] }
+keyring = { version = "3", features = ["apple-native", "sync-secret-service", "windows-native"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "form", "json", "socks"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 regex = "1"

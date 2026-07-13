@@ -52,16 +52,21 @@ err()  { echo -e "${RED}[release] ERROR:${NC} $1" >&2; exit 1; }
 
 DRAFT=false
 TAG=""
+BUILD_ONLY=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --draft) DRAFT=true; shift ;;
     --tag)   TAG="$2"; shift 2 ;;
+    --build-only) BUILD_ONLY=true; shift ;;
     --help|-h)
-      echo "Usage: $0 --tag vX.Y.Z [--draft]"
+      echo "Usage: $0 --tag vX.Y.Z [--draft] [--build-only]"
       echo ""
-      echo "  --tag    (required) New version tag, e.g. v0.2.0. Must not already exist."
-      echo "  --draft  Create the release as a draft (not publicly visible)."
+      echo "  --tag         (required) New version tag, e.g. v0.2.0."
+      echo "  --draft       Create the release as a draft (not publicly visible)."
+      echo "  --build-only  Only build and stage artifacts into .release-artifacts/;"
+      echo "                skip all GitHub token/repo/tag checks, tagging and release"
+      echo "                creation. Used by CI, where the tag already exists."
       exit 0
       ;;
     *) err "Unknown option: $1" ;;
@@ -88,6 +93,10 @@ log "Project: $PROJECT_DIR"
 command -v python3 >/dev/null 2>&1 || err "python3 is required"
 command -v npm   >/dev/null 2>&1 || err "npm is required (Node.js 22+)"
 command -v cargo >/dev/null 2>&1 || err "cargo is required (Rust stable toolchain)"
+
+# In --build-only mode (used by CI, where the tag already exists) skip every
+# GitHub token / repo / tag-existence check; only build and stage artifacts.
+if [[ "$BUILD_ONLY" != true ]]; then
 
 if [[ -z "${GITHUB_TOKEN:-}" ]]; then
   err "GITHUB_TOKEN env var is required.\n  Create a token at https://github.com/settings/tokens (repo scope)\n  Then: export GITHUB_TOKEN=<your-token>"
@@ -149,6 +158,8 @@ fi
 
 log "Tag '$TAG' is available -- proceeding."
 
+fi  # end: not --build-only (skip GitHub token/repo/tag checks)
+
 # --------------- build .deb and .AppImage ---------------
 
 log "Building Linux bundles (deb, appimage)..."
@@ -180,6 +191,15 @@ APPIMAGE_PATH="$ARTIFACTS_DIR/$APPIMAGE_NAME"
 
 cp "$DEB_SRC" "$DEB_PATH"
 cp "$APPIMAGE_SRC" "$APPIMAGE_PATH"
+
+if [[ "$BUILD_ONLY" == true ]]; then
+  log ""
+  log "${BOLD}Build complete (--build-only).${NC} No tag pushed, no release created."
+  log "Artifacts staged in: $ARTIFACTS_DIR"
+  log "  $DEB_PATH"
+  log "  $APPIMAGE_PATH"
+  exit 0
+fi
 
 # --------------- push tag ---------------
 

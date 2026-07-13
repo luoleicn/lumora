@@ -16,7 +16,7 @@ type PdfMetadataResult = {
   fields: string[];
 };
 
-type PdfTextLine = {
+export type PdfTextLine = {
   text: string;
   x: number;
   y: number;
