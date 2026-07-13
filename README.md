@@ -42,6 +42,16 @@ docs                # 项目主页与同步协议文档
 - **npm ≥ 11**
 - **Rust 稳定版工具链**（用于 `tauri dev` 与原生打包）——通过 [rustup](https://rustup.rs) 安装
 - **macOS**：安装 Xcode Command Line Tools（`xcode-select --install`），提供 C 工具链与 WebKit；`rusqlite` 使用 bundled 模式，**无需**单独安装 SQLite
+- **Ubuntu / Debian**：安装 WebKitGTK 与 GTK 开发库、Secret Service（密钥存储）以及打包工具。`rusqlite` 使用 bundled 模式，**无需**单独安装 SQLite：
+
+  ```bash
+  sudo apt update
+  sudo apt install -y \
+    libwebkit2gtk-4.1-dev libgtk-3-dev libsecret-1-dev librsvg2-dev \
+    build-essential libssl-dev patchelf file
+  ```
+
+  > `libsecret`（配合 GNOME Keyring / KWallet 等 Secret Service 后端）用于安全保存云同步密钥；桌面会话未运行 Secret Service 时，密钥读写会失败。
 - 无需 Docker，无需自建后端
 
 > 当前阶段优先级：**macOS 优先，Linux 其次，iPhone 最后**。目前主力开发与验证在 macOS。
@@ -84,6 +94,34 @@ npm run tauri:build --workspace @lumora/desktop
 ```
 apps/desktop/src-tauri/target/release/bundle/macos/lumora.app
 ```
+
+## 编译打包（Linux / Ubuntu）
+
+在 Ubuntu 上构建原生应用并生成 `.deb` 与 `.AppImage` 分发包：
+
+```bash
+npm run tauri:build:linux --workspace @lumora/desktop
+```
+
+> `tauri:build`（macOS 用）固定 `--bundles app`，而 `app` 不是 Linux 的有效包类型，故 Linux 单独用 `tauri:build:linux` 脚本（`--bundles deb,appimage`）。
+
+产物位于：
+
+```
+apps/desktop/src-tauri/target/release/bundle/deb/lumora_<version>_amd64.deb
+apps/desktop/src-tauri/target/release/bundle/appimage/lumora_<version>_amd64.AppImage
+```
+
+安装与运行：
+
+```bash
+sudo dpkg -i apps/desktop/src-tauri/target/release/bundle/deb/lumora_*_amd64.deb
+# 或直接运行 AppImage（需要可执行权限）
+chmod +x apps/desktop/src-tauri/target/release/bundle/appimage/lumora_*_amd64.AppImage
+./apps/desktop/src-tauri/target/release/bundle/appimage/lumora_*_amd64.AppImage
+```
+
+一键构建并发布到 GitHub Releases，见 `scripts/release-linux.sh`。
 
 ## 配置云同步
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Release lumora macOS build to GitHub Releases.
+# Release lumora Linux build to GitHub Releases.
 #
 # Usage:
-#   ./scripts/release-macos.sh --tag v0.1.0 [--draft]
+#   ./scripts/release-linux.sh --tag v0.1.0 [--draft]
 #
 #   --tag is required. The tag must be new (must not already exist locally or on
 #   the remote). This enforces a clean one-tag-per-release workflow.
@@ -10,17 +10,21 @@
 # Prerequisites:
 #   - Rust stable toolchain
 #   - Node.js 22+, npm 11+
+#   - System libs for Tauri/WebKitGTK + packaging (see README "Ubuntu / Debian"):
+#       libwebkit2gtk-4.1-dev libgtk-3-dev libsecret-1-dev librsvg2-dev
+#       build-essential libssl-dev patchelf file
 #   - GITHUB_TOKEN env var (GitHub personal access token with repo scope)
 #
 # What it does:
 #   1. Validates that --tag was given and that it doesn't already exist
-#   2. Installs the Rust cross-compilation target for the "other" arch
-#   3. Runs `npm run tauri:build` to produce the native .app bundle
-#   4. Cross-compiles the Rust binary for the other architecture
-#   5. Merges both binaries with `lipo` into a universal binary, then re-signs the .app
-#   6. Packages the universal .app into a .zip and a .dmg
-#   7. Pushes the new git tag
-#   8. Creates a GitHub Release and uploads the artifacts
+#   2. Runs `npm run tauri:build:linux` to produce the native .deb and
+#      .AppImage bundles
+#   3. Collects the artifacts (renamed with the tag for clarity)
+#   4. Pushes the new git tag
+#   5. Creates a GitHub Release and uploads the artifacts
+#
+# This mirrors scripts/release-macos.sh but targets x86_64 Linux (amd64), which
+# is the common Ubuntu desktop architecture.
 
 set -euo pipefail
 
@@ -29,9 +33,8 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 APP_NAME="lumora"
 TAURI_DIR="$PROJECT_DIR/apps/desktop/src-tauri"
-BUNDLE_DIR="$TAURI_DIR/target/release/bundle/macos"
-APP_BUNDLE="$BUNDLE_DIR/$APP_NAME.app"
-CONFIG_FILE="$TAURI_DIR/tauri.conf.json"
+DEB_DIR="$TAURI_DIR/target/release/bundle/deb"
+APPIMAGE_DIR="$TAURI_DIR/target/release/bundle/appimage"
 
 # --------------- helpers ---------------
 
@@ -61,7 +64,7 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "  --tag         (required) New version tag, e.g. v0.2.0."
       echo "  --draft       Create the release as a draft (not publicly visible)."
-      echo "  --build-only  Only build and stage the DMGs into .release-artifacts/;"
+      echo "  --build-only  Only build and stage artifacts into .release-artifacts/;"
       echo "                skip all GitHub token/repo/tag checks, tagging and release"
       echo "                creation. Used by CI, where the tag already exists."
       exit 0
@@ -92,7 +95,7 @@ command -v npm   >/dev/null 2>&1 || err "npm is required (Node.js 22+)"
 command -v cargo >/dev/null 2>&1 || err "cargo is required (Rust stable toolchain)"
 
 # In --build-only mode (used by CI, where the tag already exists) skip every
-# GitHub token / repo / tag-existence check; only build and stage the DMGs.
+# GitHub token / repo / tag-existence check; only build and stage artifacts.
 if [[ "$BUILD_ONLY" != true ]]; then
 
 if [[ -z "${GITHUB_TOKEN:-}" ]]; then
@@ -113,9 +116,9 @@ if ! echo "$REPO_SLUG" | grep -qE '^[^/]+/[^/]+$'; then
 fi
 log "Target repo: $REPO_SLUG"
 
-# Validate both the token and its repository selection before doing expensive
-# cross-architecture builds. GitHub intentionally returns 404 when a valid
-# fine-grained token is not authorized for a private repository.
+# Validate both the token and its repository selection before doing the
+# expensive build. GitHub intentionally returns 404 when a valid fine-grained
+# token is not authorized for a private repository.
 REPO_HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
   -H "Authorization: Bearer $GITHUB_TOKEN" \
   -H "Accept: application/vnd.github+json" \
@@ -157,110 +160,44 @@ log "Tag '$TAG' is available -- proceeding."
 
 fi  # end: not --build-only (skip GitHub token/repo/tag checks)
 
-# --------------- build for both architectures ---------------
+# --------------- build .deb and .AppImage ---------------
 
-# Targets to build
-ARM_TARGET="aarch64-apple-darwin"
-INTEL_TARGET="x86_64-apple-darwin"
-
-# Install any missing Rust targets
-for target in "$ARM_TARGET" "$INTEL_TARGET"; do
-  if ! rustup target list --installed 2>/dev/null | grep -q "$target"; then
-    log "Installing Rust target: $target ..."
-    rustup target add "$target"
-  fi
-done
-
-# Build for Apple Silicon
-log "Building for Apple Silicon ($ARM_TARGET)..."
+log "Building Linux bundles (deb, appimage)..."
 cd "$PROJECT_DIR"
-npm run tauri:build --workspace @lumora/desktop -- --target "$ARM_TARGET"
+npm run tauri:build:linux --workspace @lumora/desktop
 
-ARM_APP="$TAURI_DIR/target/$ARM_TARGET/release/bundle/macos/$APP_NAME.app"
-if [[ ! -d "$ARM_APP" ]]; then
-  err "ARM build did not produce $ARM_APP"
-fi
-log "ARM build: $(file -b "$ARM_APP/Contents/MacOS/$APP_NAME")"
+# Locate the freshly built artifacts. Tauri names them from the config version,
+# e.g. lumora_0.1.0_amd64.deb and lumora_0.1.0_amd64.AppImage.
+DEB_SRC=$(ls -t "$DEB_DIR"/*.deb 2>/dev/null | head -1) \
+  || err "No .deb found in $DEB_DIR"
+APPIMAGE_SRC=$(ls -t "$APPIMAGE_DIR"/*.AppImage 2>/dev/null | head -1) \
+  || err "No .AppImage found in $APPIMAGE_DIR"
+[[ -f "$DEB_SRC" ]] || err "No .deb found in $DEB_DIR"
+[[ -f "$APPIMAGE_SRC" ]] || err "No .AppImage found in $APPIMAGE_DIR"
 
-# Build for Intel
-log "Building for Intel ($INTEL_TARGET)..."
-npm run tauri:build --workspace @lumora/desktop -- --target "$INTEL_TARGET"
+log "Built deb:      $DEB_SRC ($(du -sh "$DEB_SRC" | awk '{print $1}'))"
+log "Built AppImage: $APPIMAGE_SRC ($(du -sh "$APPIMAGE_SRC" | awk '{print $1}'))"
 
-INTEL_APP="$TAURI_DIR/target/$INTEL_TARGET/release/bundle/macos/$APP_NAME.app"
-if [[ ! -d "$INTEL_APP" ]]; then
-  err "Intel build did not produce $INTEL_APP"
-fi
-log "Intel build: $(file -b "$INTEL_APP/Contents/MacOS/$APP_NAME")"
-
-# --------------- package DMGs ---------------
+# --------------- stage artifacts with tagged names ---------------
 
 ARTIFACTS_DIR="$PROJECT_DIR/.release-artifacts"
-# Detach any leftover mounts from a previous interrupted run
-if [[ -d "$ARTIFACTS_DIR/.mnt" ]]; then
-  hdiutil detach "$ARTIFACTS_DIR/.mnt" -force >/dev/null 2>&1 || true
-fi
 rm -rf "$ARTIFACTS_DIR"
 mkdir -p "$ARTIFACTS_DIR"
 
-ARM_DMG_NAME="${APP_NAME}-${TAG}-macos-arm64.dmg"
-ARM_DMG_PATH="$ARTIFACTS_DIR/$ARM_DMG_NAME"
-INTEL_DMG_NAME="${APP_NAME}-${TAG}-macos-x64.dmg"
-INTEL_DMG_PATH="$ARTIFACTS_DIR/$INTEL_DMG_NAME"
+DEB_NAME="${APP_NAME}-${TAG}-linux-amd64.deb"
+APPIMAGE_NAME="${APP_NAME}-${TAG}-linux-amd64.AppImage"
+DEB_PATH="$ARTIFACTS_DIR/$DEB_NAME"
+APPIMAGE_PATH="$ARTIFACTS_DIR/$APPIMAGE_NAME"
 
-make_dmg() {
-  local app_bundle="$1"
-  local dmg_path="$2"
-  local dmg_name
-  dmg_name=$(basename "$dmg_path")
-
-  log "Creating DMG: $dmg_name ..."
-
-  local staging="${ARTIFACTS_DIR}/.staging_${APP_NAME}"
-  rm -rf "$staging"
-  mkdir -p "$staging"
-
-  cp -R "$app_bundle" "$staging/"
-  ln -s /Applications "$staging/Applications"
-
-  # Apply pre-generated .DS_Store for Finder window layout (icon positions,
-  # window size, background image, etc.). This avoids mounting the DMG and
-  # running AppleScript during every release build.
-  # Generate (or regenerate) the template with: ./scripts/generate-dmg-dsstore.sh
-  local dsstore_template="$TAURI_DIR/dmg-dsstore"
-  if [[ -f "$dsstore_template" ]]; then
-    cp "$dsstore_template" "$staging/.DS_Store"
-  else
-    warn "No dmg-dsstore template found at $dsstore_template"
-    warn "DMG will have default Finder layout. Run scripts/generate-dmg-dsstore.sh to fix."
-  fi
-
-  # Copy background image if present (referenced by the .DS_Store template)
-  local bg_src="$TAURI_DIR/dmg-background.png"
-  if [[ -f "$bg_src" ]]; then
-    cp "$bg_src" "$staging/.background.png"
-  fi
-
-  hdiutil create -srcfolder "$staging" \
-    -volname "$APP_NAME" \
-    -format UDZO \
-    -imagekey zlib-level=9 \
-    -ov \
-    "$dmg_path" >/dev/null
-
-  rm -rf "$staging"
-
-  log "  DMG: $dmg_path ($(du -sh "$dmg_path" | awk '{print $1}'))"
-}
-
-make_dmg "$ARM_APP" "$ARM_DMG_PATH"
-make_dmg "$INTEL_APP" "$INTEL_DMG_PATH"
+cp "$DEB_SRC" "$DEB_PATH"
+cp "$APPIMAGE_SRC" "$APPIMAGE_PATH"
 
 if [[ "$BUILD_ONLY" == true ]]; then
   log ""
   log "${BOLD}Build complete (--build-only).${NC} No tag pushed, no release created."
   log "Artifacts staged in: $ARTIFACTS_DIR"
-  log "  $ARM_DMG_PATH  (Apple Silicon)"
-  log "  $INTEL_DMG_PATH  (Intel)"
+  log "  $DEB_PATH"
+  log "  $APPIMAGE_PATH"
   exit 0
 fi
 
@@ -275,18 +212,19 @@ log "Tag $TAG pushed."
 
 RELEASE_NOTES="## lumora $TAG
 
-macOS desktop build — separate DMGs for Apple Silicon and Intel Macs.
+Linux desktop build (x86_64 / amd64).
 
 ### Download
-- **$ARM_DMG_NAME** — for Apple Silicon (M1/M2/M3/M4)
-- **$INTEL_DMG_NAME** — for Intel Macs
+- **$DEB_NAME** — Debian/Ubuntu package (\`sudo dpkg -i <file>\`)
+- **$APPIMAGE_NAME** — portable AppImage (\`chmod +x <file> && ./<file>\`)
 
 ### Notes
-- Requires macOS 10.13 (High Sierra) or later.
+- Requires a desktop session with WebKitGTK; the \`.deb\` declares its runtime deps.
+- Cloud-sync secrets are stored via Secret Service (GNOME Keyring / KWallet).
 - Built from $(git -C "$PROJECT_DIR" rev-parse --short HEAD).
 "
 
-ASSETS=("$ARM_DMG_PATH" "$INTEL_DMG_PATH")
+ASSETS=("$DEB_PATH" "$APPIMAGE_PATH")
 
 API_BASE="https://api.github.com/repos/$REPO_SLUG"
 AUTH_HEADER="Authorization: Bearer $GITHUB_TOKEN"
@@ -332,8 +270,8 @@ if [[ "$HTTP_CODE" != "201" ]]; then
 import sys,json
 try:
     data = json.load(sys.stdin)
-    for err in data.get('errors', []):
-        print(f\"  GitHub: {err.get('field','?')}: {err.get('message','')}\")
+    for e in data.get('errors', []):
+        print(f\"  GitHub: {e.get('field','?')}: {e.get('message','')}\")
     msg = data.get('message','')
     if msg:
         print(f'  GitHub: {msg}')
@@ -376,5 +314,5 @@ log "${BOLD}Release $TAG complete!${NC}"
 log "  Release URL: https://github.com/$REPO_SLUG/releases/tag/$TAG"
 log ""
 log "Artifacts:"
-log "  $ARM_DMG_PATH  (Apple Silicon)"
-log "  $INTEL_DMG_PATH  (Intel)"
+log "  $DEB_PATH"
+log "  $APPIMAGE_PATH"

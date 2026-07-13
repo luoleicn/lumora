@@ -27,7 +27,7 @@ export function parseReferenceFile(fileName: string, text: string): Paper[] {
   return parseBibtex(text);
 }
 
-function parseRis(text: string): Paper[] {
+export function parseRis(text: string): Paper[] {
   return text
     .split(/\nER\s+-/i)
     .map((record) => record.trim())
@@ -48,7 +48,7 @@ function parseRis(text: string): Paper[] {
       const endPage = first(fields, "EP");
       return toPaper({
         title: first(fields, "TI", "T1", "CT"),
-        authors: parseAuthors(fields.get("AU") ?? fields.get("A1") ?? []),
+        authors: parseRefAuthors(fields.get("AU") ?? fields.get("A1") ?? []),
         year: parseYear(first(fields, "PY", "Y1", "DA")),
         venue: first(fields, "JO", "JF", "JA", "T2"),
         doi: normalizeDoi(first(fields, "DO")),
@@ -65,7 +65,7 @@ function parseRis(text: string): Paper[] {
     });
 }
 
-function parseBibtex(text: string): Paper[] {
+export function parseBibtex(text: string): Paper[] {
   const entries: string[] = [];
   const entryPattern = /@([a-zA-Z]+)\s*\{/g;
   let match: RegExpExecArray | null;
@@ -92,7 +92,7 @@ function parseBibtex(text: string): Paper[] {
     const keywords = splitList(fields.keywords);
     return toPaper({
       title: stripBibtexBraces(fields.title),
-      authors: parseAuthors(splitAuthors(fields.author)),
+      authors: parseRefAuthors(splitAuthors(fields.author)),
       year: parseYear(fields.year),
       venue: fields.journal ?? fields.booktitle ?? fields.publisher,
       doi: normalizeDoi(fields.doi),
@@ -109,7 +109,7 @@ function parseBibtex(text: string): Paper[] {
   });
 }
 
-function parseBibtexFields(entry: string): Record<string, string> {
+export function parseBibtexFields(entry: string): Record<string, string> {
   const fields: Record<string, string> = {};
   const body = entry.slice(entry.indexOf(",") + 1, entry.lastIndexOf("}"));
   let cursor = 0;
@@ -133,7 +133,7 @@ function parseBibtexFields(entry: string): Record<string, string> {
   return fields;
 }
 
-function readBibtexValue(body: string, start: number) {
+export function readBibtexValue(body: string, start: number) {
   const quote = body[start];
   if (quote === "{" || quote === "\"") {
     const closing = quote === "{" ? "}" : "\"";
@@ -170,14 +170,14 @@ function readBibtexValue(body: string, start: number) {
   };
 }
 
-function skipComma(body: string, cursor: number) {
+export function skipComma(body: string, cursor: number) {
   while (cursor < body.length && /[\s,]/.test(body[cursor])) {
     cursor += 1;
   }
   return cursor;
 }
 
-function toPaper(fields: ReferenceFields): Paper {
+export function toPaper(fields: ReferenceFields): Paper {
   const now = new Date().toISOString();
   return {
     id: createId("paper"),
@@ -204,7 +204,7 @@ function toPaper(fields: ReferenceFields): Paper {
   };
 }
 
-function parseAuthors(values: string[]): Author[] {
+export function parseRefAuthors(values: string[]): Author[] {
   return values
     .map((value) => value.trim())
     .filter(Boolean)
@@ -227,19 +227,19 @@ function parseAuthors(values: string[]): Author[] {
     });
 }
 
-function splitAuthors(value?: string) {
+export function splitAuthors(value?: string) {
   return value ? value.split(/\s+and\s+/i).map((item) => item.trim()).filter(Boolean) : [];
 }
 
-function splitList(value?: string) {
+export function splitList(value?: string) {
   return uniqueStrings(value?.split(/[;,]/).map((item) => item.trim()).filter(Boolean) ?? []);
 }
 
-function uniqueStrings(values: string[]) {
+export function uniqueStrings(values: string[]) {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
 }
 
-function first(fields: Map<string, string[]>, ...keys: string[]) {
+export function first(fields: Map<string, string[]>, ...keys: string[]) {
   for (const key of keys) {
     const value = fields.get(key)?.find(Boolean);
     if (value) {
@@ -249,25 +249,25 @@ function first(fields: Map<string, string[]>, ...keys: string[]) {
   return undefined;
 }
 
-function parseYear(value?: string) {
+export function parseYear(value?: string) {
   const match = value?.match(/\d{4}/);
   return match?.[0] ? Number.parseInt(match[0], 10) : undefined;
 }
 
-function clean(value?: string) {
+export function clean(value?: string) {
   const trimmed = value?.trim();
   return trimmed || undefined;
 }
 
-function normalizeDoi(value?: string) {
+export function normalizeDoi(value?: string) {
   return clean(value?.replace(/^https?:\/\/(dx\.)?doi\.org\//i, ""));
 }
 
-function stripBibtexBraces(value?: string) {
+export function stripBibtexBraces(value?: string) {
   return clean(value?.replace(/[{}]/g, ""));
 }
 
-function risTypeToDocumentType(value?: string) {
+export function risTypeToDocumentType(value?: string) {
   switch (value?.toUpperCase()) {
     case "BOOK":
       return "book";
@@ -283,7 +283,7 @@ function risTypeToDocumentType(value?: string) {
   }
 }
 
-function bibtexTypeToDocumentType(value?: string) {
+export function bibtexTypeToDocumentType(value?: string) {
   switch (value) {
     case "book":
       return "book";

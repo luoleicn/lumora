@@ -2099,6 +2099,9 @@ pub fn run() {
                 enable_trackpad_pinch_zoom(app);
                 install_key_shortcut_monitor(app.handle().clone());
             }
+            // macOS uses `app` above; other platforms have no native setup yet.
+            #[cfg(not(target_os = "macos"))]
+            let _ = app;
             Ok(())
         })
         .menu(build_menu)
@@ -2289,25 +2292,47 @@ fn reset_native_magnification<R: Runtime>(app_handle: &AppHandle<R>) {
 #[cfg(desktop)]
 fn build_menu<R: Runtime>(app_handle: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let pkg_info = app_handle.package_info();
-    let app_menu = Submenu::with_items(
-        app_handle,
-        pkg_info.name.clone(),
-        true,
-        &[
-            &MenuItem::with_id(app_handle, APP_ABOUT, format!("About {}", pkg_info.name), true, None::<&str>)?,
-            &PredefinedMenuItem::separator(app_handle)?,
-            &MenuItem::with_id(app_handle, APP_MENDELEY_SYNC, "Mendeley Sync...", true, None::<&str>)?,
-            &MenuItem::with_id(app_handle, APP_SYNC_SETTINGS, "Sync Settings...", true, None::<&str>)?,
-            &MenuItem::with_id(app_handle, APP_PROXY_SETTINGS, "Proxy...", true, None::<&str>)?,
-            &PredefinedMenuItem::separator(app_handle)?,
-            &PredefinedMenuItem::services(app_handle, None)?,
-            &PredefinedMenuItem::separator(app_handle)?,
-            &PredefinedMenuItem::hide(app_handle, None)?,
-            &PredefinedMenuItem::hide_others(app_handle, None)?,
-            &PredefinedMenuItem::separator(app_handle)?,
-            &PredefinedMenuItem::quit(app_handle, None)?,
-        ],
-    )?;
+
+    // The application ("apple") submenu. `services` and `hide_others` are
+    // macOS-only conventions (they render as dead/no-op entries elsewhere), so
+    // they are included only on macOS. The macOS item sequence is kept
+    // byte-for-byte identical to preserve the existing, verified menu.
+    let about_item = MenuItem::with_id(app_handle, APP_ABOUT, format!("About {}", pkg_info.name), true, None::<&str>)?;
+    let about_sep = PredefinedMenuItem::separator(app_handle)?;
+    let mendeley_item = MenuItem::with_id(app_handle, APP_MENDELEY_SYNC, "Mendeley Sync...", true, None::<&str>)?;
+    let sync_item = MenuItem::with_id(app_handle, APP_SYNC_SETTINGS, "Sync Settings...", true, None::<&str>)?;
+    let proxy_item = MenuItem::with_id(app_handle, APP_PROXY_SETTINGS, "Proxy...", true, None::<&str>)?;
+    let settings_sep = PredefinedMenuItem::separator(app_handle)?;
+    #[cfg(target_os = "macos")]
+    let services_item = PredefinedMenuItem::services(app_handle, None)?;
+    #[cfg(target_os = "macos")]
+    let services_sep = PredefinedMenuItem::separator(app_handle)?;
+    let hide_item = PredefinedMenuItem::hide(app_handle, None)?;
+    #[cfg(target_os = "macos")]
+    let hide_others_item = PredefinedMenuItem::hide_others(app_handle, None)?;
+    let quit_sep = PredefinedMenuItem::separator(app_handle)?;
+    let quit_item = PredefinedMenuItem::quit(app_handle, None)?;
+
+    let mut app_items: Vec<&dyn tauri::menu::IsMenuItem<R>> = vec![
+        &about_item,
+        &about_sep,
+        &mendeley_item,
+        &sync_item,
+        &proxy_item,
+        &settings_sep,
+    ];
+    #[cfg(target_os = "macos")]
+    {
+        app_items.push(&services_item);
+        app_items.push(&services_sep);
+    }
+    app_items.push(&hide_item);
+    #[cfg(target_os = "macos")]
+    app_items.push(&hide_others_item);
+    app_items.push(&quit_sep);
+    app_items.push(&quit_item);
+
+    let app_menu = Submenu::with_items(app_handle, pkg_info.name.clone(), true, &app_items)?;
 
     let files_menu = Submenu::with_items(
         app_handle,
