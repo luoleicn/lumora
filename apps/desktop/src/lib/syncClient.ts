@@ -35,17 +35,64 @@ export const defaultAutoSyncSettings: AutoSyncSettings = {
   intervalMinutes: defaultAutoSyncIntervalMinutes
 };
 
-type QiniuObjectStat = { exists: boolean; size?: number };
+type QiniuNetworkStats = Pick<CloudSyncSummary,
+  "requestCount" | "putRequests" | "getRequests" | "headRequests" | "deleteRequests" | "uploadedBytes" | "downloadedBytes">;
+type QiniuObjectStat = { exists: boolean; size?: number; stats: QiniuNetworkStats };
+type QiniuBlobUploadResult = {
+  uploaded: boolean;
+  stats: QiniuNetworkStats;
+  error?: { kind: "file" | "fatal"; message: string };
+};
 type VerifiedLocalFile = {
   sha256: string;
   storage: "disk" | "indexedDb";
   path?: string;
   size: number;
   modifiedMs?: number;
+  cloudTarget?: string;
+  cloudVerifiedAt?: number;
 };
 
 const verifiedLocalFilesKey = "lumora:qiniu-verified-local-files-v1";
+const cloudVerificationTtlMs = 24 * 60 * 60 * 1_000;
 const sha256Pattern = /^[a-f0-9]{64}$/i;
+
+function emptyNetworkStats(): QiniuNetworkStats {
+  return {
+    requestCount: 0,
+    putRequests: 0,
+    getRequests: 0,
+    headRequests: 0,
+    deleteRequests: 0,
+    uploadedBytes: 0,
+    downloadedBytes: 0
+  };
+}
+
+function addNetworkStats(target: QiniuNetworkStats, source: Partial<QiniuNetworkStats>) {
+  target.requestCount += source.requestCount ?? 0;
+  target.putRequests += source.putRequests ?? 0;
+  target.getRequests += source.getRequests ?? 0;
+  target.headRequests += source.headRequests ?? 0;
+  target.deleteRequests += source.deleteRequests ?? 0;
+  target.uploadedBytes += source.uploadedBytes ?? 0;
+  target.downloadedBytes += source.downloadedBytes ?? 0;
+}
+
+function cloudTargetKey(settings: SyncSettings): string {
+  return JSON.stringify([
+    settings.accessKey,
+    settings.bucket,
+    settings.region ?? "",
+    settings.privateDomain,
+    settings.prefix
+  ]);
+}
+
+async function sha256Hex(buffer: ArrayBuffer): Promise<string> {
+  return Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", buffer)),
+    (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 function loadVerifiedLocalFiles(): Record<string, VerifiedLocalFile> {
   try {
@@ -145,8 +192,12 @@ export async function syncLibrary(
   }).length;
   let uploadedBlobs = 0;
   let uploadedFileOk = 0;
-  let consecutiveFailures = 0;
+  let fileUploadFailures = 0;
+  let uploadsSuspended = false;
   const uploadErrors: string[] = [];
+  const preSyncNetworkStats = emptyNetworkStats();
+  const cloudTarget = cloudTargetKey(_settings);
+  const cloudVerificationCutoff = Date.now() - cloudVerificationTtlMs;
 
   // A successful content hash is cached against device-local file metadata.
   // Only an unchanged local file may use its recorded SHA for the cheap cloud
@@ -154,6 +205,7 @@ export async function syncLibrary(
   const verifiedLocalFiles = loadVerifiedLocalFiles();
   const preflight = new Map<string, QiniuObjectStat>();
   const statPromises = new Map<string, Promise<QiniuObjectStat>>();
+  const ensuredCloudHashes = new Set<string>();
   const ordinaryFiles = prepared.fileAssets.filter((file) => {
     if (file.deletedAt) return false;
     const paper = paperById.get(file.paperId);
@@ -180,17 +232,34 @@ export async function syncLibrary(
       return;
     }
 
+    if (verified.cloudTarget === cloudTarget
+      && (verified.cloudVerifiedAt ?? 0) >= cloudVerificationCutoff) {
+      preflight.set(file.id, { exists: true, size: file.size, stats: emptyNetworkStats() });
+      return;
+    }
+
     let request = statPromises.get(sha256);
     if (!request) {
-      request = invoke<QiniuObjectStat>("qiniu_object_exists", { sha256 });
+      request = invoke<QiniuObjectStat>("qiniu_object_exists", { sha256 }).then((stat) => {
+        addNetworkStats(preSyncNetworkStats, stat.stats);
+        return stat;
+      });
       statPromises.set(sha256, request);
     }
     const stat = await request;
     if (stat.exists && stat.size !== file.size) {
       throw new Error(`Cloud blob ${sha256} has size ${stat.size ?? "unknown"}, expected ${file.size}; refusing to trust it.`);
     }
+    if (stat.exists) {
+      verifiedLocalFiles[file.id] = {
+        ...verified,
+        cloudTarget,
+        cloudVerifiedAt: Date.now()
+      };
+    }
     preflight.set(file.id, stat);
   });
+  saveVerifiedLocalFiles(verifiedLocalFiles);
 
   for (const file of prepared.fileAssets) {
     if (file.deletedAt) {
@@ -208,6 +277,12 @@ export async function syncLibrary(
     }
 
     if (preflight.get(file.id)?.exists) {
+      ensuredCloudHashes.add(file.sha256.trim().toLowerCase());
+      nextFiles.push(file);
+      continue;
+    }
+
+    if (uploadsSuspended) {
       nextFiles.push(file);
       continue;
     }
@@ -225,8 +300,7 @@ export async function syncLibrary(
       // the blob wrong and trips the Rust integrity check. Heal the metadata to
       // the real hash so the upload succeeds and other devices can find it.
       const buffer = new Uint8Array(bytes).buffer as ArrayBuffer;
-      const sha256 = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", buffer)),
-        (byte) => byte.toString(16).padStart(2, "0")).join("");
+      const sha256 = await sha256Hex(buffer);
       if (file.localPath && storage.directory && diskMetadataBefore) {
         const metadataAfter = await getStoredPdfMetadata(storage.directory, file.localPath).catch(() => undefined);
         if (metadataAfter
@@ -243,25 +317,40 @@ export async function syncLibrary(
         saveVerifiedLocalFiles(verifiedLocalFiles);
       }
       try {
-        await invoke<void>("qiniu_upload_blob", buffer, {
-          headers: { "x-lumora-sha256": sha256 }
-        });
-      } catch (error) {
-        // One bad file must not abort the whole library sync. Record it, keep
-        // the file unchanged, and move on — but bail out fast if uploads fail
-        // systemically (e.g. a wrong region) instead of grinding through
-        // hundreds of doomed attempts.
-        const detail = error instanceof Error ? error.message : String(error);
-        uploadErrors.push(`${file.fileName}: ${detail}`);
-        consecutiveFailures += 1;
-        if (consecutiveFailures >= 5) {
-          throw new Error(`Cloud sync aborted after ${consecutiveFailures} consecutive upload failures. Latest — ${file.fileName}: ${detail}`);
+        const uploadResult: QiniuBlobUploadResult = ensuredCloudHashes.has(sha256)
+          ? { uploaded: false, stats: emptyNetworkStats() }
+          : await invoke<QiniuBlobUploadResult>("qiniu_upload_blob", buffer, {
+            headers: { "x-lumora-sha256": sha256 }
+          });
+        addNetworkStats(preSyncNetworkStats, uploadResult.stats);
+        if (uploadResult.error?.kind === "fatal") {
+          throw new Error(uploadResult.error.message);
         }
-        nextFiles.push(file);
-        continue;
+        if (uploadResult.error) {
+          uploadErrors.push(`${file.fileName}: ${uploadResult.error.message}`);
+          fileUploadFailures += 1;
+          if (fileUploadFailures >= 5) {
+            uploadsSuspended = true;
+            uploadErrors.push("Further file uploads were skipped after 5 file-specific failures; metadata sync continued.");
+          }
+          nextFiles.push(file);
+          continue;
+        }
+        ensuredCloudHashes.add(sha256);
+        const localVerification = verifiedLocalFiles[file.id];
+        if (localVerification?.sha256 === sha256) {
+          verifiedLocalFiles[file.id] = {
+            ...localVerification,
+            cloudTarget,
+            cloudVerifiedAt: Date.now()
+          };
+          saveVerifiedLocalFiles(verifiedLocalFiles);
+        }
+        if (uploadResult.uploaded) uploadedFileOk += 1;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`Cloud upload failed for ${file.fileName}: ${detail}`);
       }
-      consecutiveFailures = 0;
-      uploadedFileOk += 1;
       const healed = file.sha256 === sha256 && file.contentRef?.kind === "object" && file.contentRef.sha256 === sha256
         ? file
         : { ...file, sha256, size: bytes.length, contentRef: { kind: "object" as const, sha256 }, updatedAt: new Date().toISOString() };
@@ -285,6 +374,7 @@ export async function syncLibrary(
 
   onStage?.("Syncing changes with Qiniu…", 2, 5);
   const summary = await invoke<CloudSyncSummary>("qiniu_sync_library");
+  addNetworkStats(summary, preSyncNetworkStats);
   summary.uploadedFiles += uploadedFileOk;
   summary.errors.push(...uploadErrors);
   let { state } = await loadLibraryFromDb();
@@ -294,47 +384,90 @@ export async function syncLibrary(
   const downloadedFiles = [...state.fileAssets];
   const downloadErrors: string[] = [];
   let consecutiveDownloadFailures = 0;
+  const indicesBySha256 = new Map<string, number[]>();
   for (const [index, file] of downloadedFiles.entries()) {
     if (file.deletedAt || file.contentRef?.kind !== "object") continue;
     // A synthetic Mendeley hash ("mendeley-sha1:…"/"mendeley-note:…") is a
-    // placeholder for a file whose real bytes were never available to upload, so
-    // no cloud blob exists under that key. Leave it metadata-only rather than
-    // hard-failing the whole sync on a guaranteed 404.
+    // placeholder for a file whose real bytes were never available to upload.
     if (file.contentRef.sha256.startsWith("mendeley-")) continue;
-    if ((await readFileBytes(file, storage))?.length) continue;
-    onStage?.(`Downloading file from cloud: ${file.fileName}`, 3, 5);
-    try {
-      const buffer = await invoke<ArrayBuffer>("qiniu_download_blob", { sha256: file.contentRef.sha256 });
-      const bytes = new Uint8Array(buffer);
-      let localPath: string | undefined;
-      if (storage.directory) {
-        localPath = await storePdfToDisk(storage.directory, file.fileName, bytes);
+    const sha256 = file.contentRef.sha256.toLowerCase();
+    const indices = indicesBySha256.get(sha256) ?? [];
+    indices.push(index);
+    indicesBySha256.set(sha256, indices);
+  }
+
+  for (const [sha256, indices] of indicesBySha256) {
+    const missingIndices: number[] = [];
+    let sharedBytes: Uint8Array | undefined;
+    for (const index of indices) {
+      const localBytes = await readFileBytes(downloadedFiles[index], storage);
+      if (localBytes?.length) {
+        sharedBytes ??= localBytes;
       } else {
-        await putFileBlob(file.id, new Blob([bytes], { type: file.mime }));
+        missingIndices.push(index);
       }
-      downloadedFiles[index] = { ...file, localPath, downloadState: "local" };
-      summary.downloadedFiles += 1;
-      consecutiveDownloadFailures = 0;
-    } catch (error) {
-      // One missing/un-fetchable blob or failed local write must not abort the
-      // whole library sync: record it and move on, leaving the file as a
-      // metadata-only placeholder to retry next time. Bail out fast if downloads
-      // fail systemically (e.g. a wrong region) instead of grinding through
-      // hundreds of doomed attempts.
-      const detail = error instanceof Error ? error.message : String(error);
-      downloadErrors.push(`${file.fileName}: ${detail}`);
-      consecutiveDownloadFailures += 1;
-      if (consecutiveDownloadFailures >= 5) {
-        summary.errors.push(...downloadErrors);
-        throw new Error(`Cloud sync aborted after ${consecutiveDownloadFailures} consecutive download failures. Latest — ${file.fileName}: ${detail}`);
+    }
+    if (missingIndices.length === 0) continue;
+
+    if (sharedBytes) {
+      const localBuffer = new Uint8Array(sharedBytes).buffer as ArrayBuffer;
+      const localSha256 = await sha256Hex(localBuffer);
+      if (localSha256 !== sha256) sharedBytes = undefined;
+    }
+
+    if (!sharedBytes) {
+      const firstMissing = downloadedFiles[missingIndices[0]];
+      onStage?.(`Downloading file from cloud: ${firstMissing.fileName}`, 3, 5);
+      try {
+        const buffer = await invoke<ArrayBuffer>("qiniu_download_blob", { sha256 });
+        sharedBytes = new Uint8Array(buffer);
+        addNetworkStats(summary, {
+          requestCount: 1,
+          getRequests: 1,
+          downloadedBytes: sharedBytes.byteLength
+        });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        downloadErrors.push(`${firstMissing.fileName}: ${detail}`);
+        consecutiveDownloadFailures += 1;
+        if (consecutiveDownloadFailures >= 5) {
+          summary.errors.push(...downloadErrors);
+          throw new Error(`Cloud sync aborted after ${consecutiveDownloadFailures} consecutive download failures. Latest — ${firstMissing.fileName}: ${detail}`);
+        }
+        continue;
+      }
+    }
+
+    // Materialize every FileAsset that references this content, but retain only
+    // one copy of the cloud response in memory and persist each success at once.
+    for (const index of missingIndices) {
+      const file = downloadedFiles[index];
+      try {
+        let localPath: string | undefined;
+        if (storage.directory) {
+          localPath = await storePdfToDisk(storage.directory, file.fileName, sharedBytes);
+        } else {
+          const blobBuffer = new Uint8Array(sharedBytes).buffer as ArrayBuffer;
+          await putFileBlob(file.id, new Blob([blobBuffer], { type: file.mime }));
+        }
+        const downloaded = { ...file, localPath, downloadState: "local" as const };
+        await persistEntities([{ entityType: "fileAsset" as const, entity: downloaded }], "remote");
+        downloadedFiles[index] = downloaded;
+        summary.downloadedFiles += 1;
+        consecutiveDownloadFailures = 0;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        downloadErrors.push(`${file.fileName}: ${detail}`);
+        consecutiveDownloadFailures += 1;
+        if (consecutiveDownloadFailures >= 5) {
+          summary.errors.push(...downloadErrors);
+          throw new Error(`Cloud sync aborted after ${consecutiveDownloadFailures} consecutive download failures. Latest — ${file.fileName}: ${detail}`);
+        }
       }
     }
   }
   summary.errors.push(...downloadErrors);
   if (downloadedFiles.some((file, index) => file !== state.fileAssets[index])) {
-    await persistEntities(downloadedFiles
-      .filter((file, index) => file !== state.fileAssets[index])
-      .map((entity) => ({ entityType: "fileAsset" as const, entity })), "remote");
     state = { ...state, fileAssets: downloadedFiles };
   }
 
@@ -346,7 +479,10 @@ export async function syncLibrary(
     .filter((file) => !file.deletedAt && file.contentRef?.kind === "object")
     .map((file) => file.contentRef?.kind === "object" ? file.contentRef.sha256 : ""));
   for (const hash of promotedObjectHashes) {
-    if (!referencedObjectHashes.has(hash)) await invoke("qiniu_delete_blob", { sha256: hash });
+    if (!referencedObjectHashes.has(hash)) {
+      const deleteStats = await invoke<QiniuNetworkStats>("qiniu_delete_blob", { sha256: hash });
+      addNetworkStats(summary, deleteStats);
+    }
   }
 
   return { state, summary };

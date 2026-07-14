@@ -12,6 +12,7 @@ import {
   syncWithMendeley,
   type MendeleyDocument
 } from "./mendeleyClient";
+import { diffLibraryStates } from "./libraryDb";
 
 const now = "2026-07-10T00:00:00.000Z";
 
@@ -187,6 +188,22 @@ describe("syncWithMendeley", () => {
 
     expect(merged.papers.find((paper) => paper.id === "p1")?.title).toBe("Edited while syncing");
     expect(merged.papers.find((paper) => paper.id === "p2")?.title).toBe("Remote new");
+  });
+
+  it("does not re-persist an unchanged library rebuilt by a background sync", () => {
+    const basePaper: Paper = { id: "p1", title: "Unchanged", authors: [], createdAt: now, updatedAt: now };
+    const empty = { fileAssets: [], collections: [], paperCollections: [], annotations: [] };
+    const base: LibraryState = { ...empty, papers: [basePaper] };
+    const persisted: LibraryState = {
+      ...empty,
+      // Simulate JSON deserialization from SQLite: equal data, new references.
+      papers: [{ ...basePaper }]
+    };
+
+    const merged = mergeBackgroundSyncState(base, persisted, base, "2026-07-10T00:00:01.000Z");
+
+    expect(merged.papers[0]).toBe(persisted.papers[0]);
+    expect(diffLibraryStates(persisted, merged)).toEqual([]);
   });
 
   it("publishes folders and membership before PDF download and then honors cancellation", async () => {

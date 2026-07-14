@@ -1623,21 +1623,33 @@ export default function App() {
       setSyncSettingsOpen(true);
       return;
     }
+    const syncStartedAt = new Date().toISOString();
+    const baseState = libraryRef.current ?? library;
     cloudSyncInFlightRef.current = true;
     cloudSyncCancelRequestedRef.current = false;
     setCloudSyncActivity({ state: "running", message: "Starting sync…", completed: 0, total: 5 });
     try {
       const result = await syncLibrary(
         settings,
-        libraryRef.current ?? library,
+        baseState,
         (message, completed = 0, total = 5) =>
           setCloudSyncActivity({ state: "running", message, completed, total })
       );
       if (cloudSyncCancelRequestedRef.current) return;
-      setLibrary(result.state);
+      // syncLibrary reloads its result from SQLite, so every entity has a new
+      // object identity even when its content did not change. Treat that state
+      // as the persisted baseline before publishing it to React; otherwise the
+      // reference-based persistence diff marks the entire library local again.
+      // Merge on top any edits made while the background sync was in flight.
+      lastPersistedLibraryRef.current = result.state;
+      setLibrary((current) => mergeBackgroundSyncState(baseState, result.state, current, syncStartedAt));
       setCloudSyncActivity({
         state: "success",
-        message: `${result.summary.uploadedChanges} uploaded, ${result.summary.downloadedChanges} downloaded`,
+        message: `${result.summary.uploadedChanges} changes uploaded, ${result.summary.downloadedChanges} downloaded · `
+          + `${formatFileSize(result.summary.uploadedBytes)} PUT, ${formatFileSize(result.summary.downloadedBytes)} GET · `
+          + `${result.summary.requestCount} requests (`
+          + `${result.summary.putRequests} PUT/${result.summary.getRequests} GET/`
+          + `${result.summary.headRequests} HEAD/${result.summary.deleteRequests} DELETE)`,
         completed: 5,
         total: 5
       });

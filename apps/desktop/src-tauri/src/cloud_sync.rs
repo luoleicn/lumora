@@ -6,7 +6,10 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     io::{Read, Write},
-    sync::OnceLock,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Runtime};
@@ -17,15 +20,79 @@ const DEVICE_META_KEY: &str = "qiniuSyncDeviceId";
 const NEXT_BATCH_META_KEY: &str = "qiniuSyncNextBatchSeq";
 const LAST_SYNC_META_KEY: &str = "qiniuSyncLastSuccessAt";
 const SEEDED_TARGET_META_KEY: &str = "qiniuSyncSeededTarget";
+const PROTOCOL_VERIFIED_TARGET_META_KEY: &str = "qiniuSyncProtocolVerifiedTarget";
+const PUBLISHED_DEVICE_STATE_META_KEY: &str = "qiniuSyncPublishedDeviceState";
 const KEYRING_SERVICE: &str = "com.lumora.desktop.qiniu";
 const PREFIX: &str = "lumora/v1";
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_CHANGES_PER_BATCH: usize = 500;
+const DEVICE_STATE_REPUBLISH_INTERVAL_MS: u64 = 24 * 60 * 60 * 1_000;
 
 // A single shared reqwest client. A server that accepts a connection and never
 // responds must fail fast rather than hang the whole sync forever, which would
 // leave the UI stuck and block manual re-syncs.
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+#[derive(Debug, Default)]
+struct NetworkCounters {
+    request_count: AtomicU64,
+    put_requests: AtomicU64,
+    get_requests: AtomicU64,
+    head_requests: AtomicU64,
+    delete_requests: AtomicU64,
+    uploaded_bytes: AtomicU64,
+    downloaded_bytes: AtomicU64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkStats {
+    request_count: u64,
+    put_requests: u64,
+    get_requests: u64,
+    head_requests: u64,
+    delete_requests: u64,
+    uploaded_bytes: u64,
+    downloaded_bytes: u64,
+}
+
+impl NetworkCounters {
+    fn record_request(&self, method: &reqwest::Method, payload_bytes: usize) {
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+        match *method {
+            reqwest::Method::PUT => {
+                self.put_requests.fetch_add(1, Ordering::Relaxed);
+                self.uploaded_bytes.fetch_add(payload_bytes as u64, Ordering::Relaxed);
+            }
+            reqwest::Method::GET => {
+                self.get_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            reqwest::Method::HEAD => {
+                self.head_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            reqwest::Method::DELETE => {
+                self.delete_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    fn record_download(&self, bytes: usize) {
+        self.downloaded_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> NetworkStats {
+        NetworkStats {
+            request_count: self.request_count.load(Ordering::Relaxed),
+            put_requests: self.put_requests.load(Ordering::Relaxed),
+            get_requests: self.get_requests.load(Ordering::Relaxed),
+            head_requests: self.head_requests.load(Ordering::Relaxed),
+            delete_requests: self.delete_requests.load(Ordering::Relaxed),
+            uploaded_bytes: self.uploaded_bytes.load(Ordering::Relaxed),
+            downloaded_bytes: self.downloaded_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
 
 fn http_client() -> reqwest::Client {
     HTTP_CLIENT
@@ -198,6 +265,7 @@ enum S3Resource<'a> {
 async fn s3_send(
     config: &QiniuSyncConfig,
     secret: &str,
+    counters: &NetworkCounters,
     method: reqwest::Method,
     resource: S3Resource<'_>,
     query: &[(&str, &str)],
@@ -254,6 +322,7 @@ async fn s3_send(
         format!("{}{canonical_uri}?{canonical_query}", target.base)
     };
 
+    counters.record_request(&method, payload.len());
     let mut builder = http_client()
         .request(method, &url)
         .header("x-amz-date", &amz_date)
@@ -283,6 +352,29 @@ pub struct QiniuSyncConfig {
 pub struct QiniuObjectStat {
     pub exists: bool,
     pub size: Option<u64>,
+    pub stats: NetworkStats,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobUploadResult {
+    pub uploaded: bool,
+    pub stats: NetworkStats,
+    pub error: Option<BlobUploadIssue>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobUploadIssue {
+    pub kind: BlobUploadIssueKind,
+    pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BlobUploadIssueKind {
+    File,
+    Fatal,
 }
 
 fn default_prefix() -> String {
@@ -329,6 +421,16 @@ struct DeviceState {
     seen: HashMap<String, u64>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublishedDeviceState {
+    target: String,
+    device_id: String,
+    latest_batch_seq: u64,
+    seen: HashMap<String, u64>,
+    published_at_ms: u64,
+}
+
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncSummary {
@@ -340,6 +442,25 @@ pub struct SyncSummary {
     pending_changes: usize,
     last_synced_at: String,
     errors: Vec<String>,
+    request_count: u64,
+    put_requests: u64,
+    get_requests: u64,
+    head_requests: u64,
+    delete_requests: u64,
+    uploaded_bytes: u64,
+    downloaded_bytes: u64,
+}
+
+impl SyncSummary {
+    fn set_network_stats(&mut self, stats: NetworkStats) {
+        self.request_count = stats.request_count;
+        self.put_requests = stats.put_requests;
+        self.get_requests = stats.get_requests;
+        self.head_requests = stats.head_requests;
+        self.delete_requests = stats.delete_requests;
+        self.uploaded_bytes = stats.uploaded_bytes;
+        self.downloaded_bytes = stats.downloaded_bytes;
+    }
 }
 
 #[derive(Debug)]
@@ -357,6 +478,24 @@ fn now_iso() -> String {
         .unwrap_or_default()
         .as_millis();
     format!("unix-ms:{millis}")
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn sync_target_id(config: &QiniuSyncConfig) -> String {
+    serde_json::to_string(&(
+        &config.access_key,
+        &config.bucket,
+        config.region.as_deref().unwrap_or_default(),
+        &config.private_domain,
+        &config.prefix,
+    ))
+    .expect("Qiniu target identity is always serializable")
 }
 
 fn keyring_entry(access_key: &str) -> Result<keyring::Entry, String> {
@@ -394,6 +533,13 @@ pub(super) fn init_sync_schema(connection: &rusqlite::Connection) -> Result<(), 
                put_time INTEGER NOT NULL,
                change_json TEXT NOT NULL,
                PRIMARY KEY(device_id, batch_seq, op_index)
+             );
+             CREATE TABLE IF NOT EXISTS sync_device_heads (
+               target TEXT NOT NULL,
+               device_id TEXT NOT NULL,
+               etag TEXT NOT NULL,
+               latest_batch_seq INTEGER NOT NULL,
+               PRIMARY KEY(target, device_id)
              );
              CREATE TABLE IF NOT EXISTS local_files (
                file_asset_id TEXT PRIMARY KEY,
@@ -449,14 +595,57 @@ fn ungzip_json<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, String> 
     serde_json::from_slice(&json).map_err(|error| error.to_string())
 }
 
-async fn upload_bytes(config: &QiniuSyncConfig, secret: &str, key: &str, bytes: &[u8]) -> Result<(), String> {
-    let response = s3_send(config, secret, reqwest::Method::PUT, S3Resource::Object(key), &[], Some(bytes.to_vec()))
+#[derive(Debug)]
+struct UploadError {
+    kind: BlobUploadIssueKind,
+    message: String,
+}
+
+impl UploadError {
+    fn fatal(message: impl Into<String>) -> Self {
+        Self { kind: BlobUploadIssueKind::Fatal, message: message.into() }
+    }
+
+    fn file(message: impl Into<String>) -> Self {
+        Self { kind: BlobUploadIssueKind::File, message: message.into() }
+    }
+}
+
+fn upload_issue_kind(status: reqwest::StatusCode, body: &str) -> BlobUploadIssueKind {
+    if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE
+        || body.contains("EntityTooLarge")
+        || body.contains("RequestEntityTooLarge")
+    {
+        BlobUploadIssueKind::File
+    } else {
+        BlobUploadIssueKind::Fatal
+    }
+}
+
+impl std::fmt::Display for UploadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+async fn upload_bytes(
+    config: &QiniuSyncConfig,
+    secret: &str,
+    counters: &NetworkCounters,
+    key: &str,
+    bytes: &[u8],
+) -> Result<u64, UploadError> {
+    let response = s3_send(config, secret, counters, reqwest::Method::PUT, S3Resource::Object(key), &[], Some(bytes.to_vec()))
         .await
-        .map_err(|error| format!("Qiniu upload of {key} failed: {error}"))?;
+        .map_err(|error| UploadError::fatal(format!("Qiniu upload of {key} failed: {error}")))?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("Qiniu upload of {key} failed: {status}. Body: {body}"));
+        let message = format!("Qiniu upload of {key} failed: {status}. Body: {body}");
+        if upload_issue_kind(status, &body) == BlobUploadIssueKind::File {
+            return Err(UploadError::file(message));
+        }
+        return Err(UploadError::fatal(message));
     }
 
     // Qiniu Kodo is strongly consistent, so a freshly uploaded object must be
@@ -464,30 +653,41 @@ async fn upload_bytes(config: &QiniuSyncConfig, secret: &str, key: &str, bytes: 
     // nothing actually landed in the bucket — surface that instead of reporting
     // success, which would otherwise mark the file as synced while other devices
     // can never download it.
-    let (_, _, stored_size) = stat_object(config, secret, key).await.map_err(|error| {
-        format!(
+    let (put_time, _, stored_size) = stat_object(config, secret, counters, key).await.map_err(|error| {
+        UploadError::fatal(format!(
             "Qiniu accepted the upload of {key} but the object is missing afterwards ({error}). \
              Verify the bucket name and that its region matches this account."
-        )
+        ))
     })?;
     if stored_size != bytes.len() as u64 {
-        return Err(format!("Qiniu stored {stored_size} bytes for {key} but {} were uploaded.", bytes.len()));
+        return Err(UploadError::file(format!(
+            "Qiniu stored {stored_size} bytes for {key} but {} were uploaded.",
+            bytes.len()
+        )));
     }
-    Ok(())
+    Ok(put_time)
 }
 
-async fn download_bytes(config: &QiniuSyncConfig, secret: &str, key: &str) -> Result<Vec<u8>, String> {
-    let response = s3_send(config, secret, reqwest::Method::GET, S3Resource::Object(key), &[], None).await?;
+async fn download_bytes(
+    config: &QiniuSyncConfig,
+    secret: &str,
+    counters: &NetworkCounters,
+    key: &str,
+) -> Result<Vec<u8>, String> {
+    let response = s3_send(config, secret, counters, reqwest::Method::GET, S3Resource::Object(key), &[], None).await?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
+        counters.record_download(body.len());
         return Err(format!(
             "Qiniu download failed for {key}: {status}. Body: {body}. \
              Verify that the S3 endpoint, bucket, region, Access Key and Secret Key in \
              Settings → Cloud Sync are correct for this bucket."
         ));
     }
-    response.bytes().await.map(|bytes| bytes.to_vec()).map_err(|error| error.to_string())
+    let bytes = response.bytes().await.map_err(|error| error.to_string())?;
+    counters.record_download(bytes.len());
+    Ok(bytes.to_vec())
 }
 
 /// Reads the object size from the `Content-Length` header. reqwest's
@@ -517,8 +717,13 @@ fn put_time_from_response(response: &reqwest::Response) -> u64 {
 
 /// Returns `(put_time, etag, size)`. The etag is unused by callers but kept for
 /// signature parity with the previous implementation.
-async fn stat_object(config: &QiniuSyncConfig, secret: &str, key: &str) -> Result<(u64, String, u64), String> {
-    let response = s3_send(config, secret, reqwest::Method::HEAD, S3Resource::Object(key), &[], None).await?;
+async fn stat_object(
+    config: &QiniuSyncConfig,
+    secret: &str,
+    counters: &NetworkCounters,
+    key: &str,
+) -> Result<(u64, String, u64), String> {
+    let response = s3_send(config, secret, counters, reqwest::Method::HEAD, S3Resource::Object(key), &[], None).await?;
     if !response.status().is_success() {
         let status = response.status();
         return Err(format!("Qiniu stat of {key} failed: {status}."));
@@ -534,23 +739,29 @@ async fn stat_object(config: &QiniuSyncConfig, secret: &str, key: &str) -> Resul
     Ok((put_time, etag, size))
 }
 
-async fn object_exists(config: &QiniuSyncConfig, secret: &str, key: &str) -> bool {
-    stat_object(config, secret, key).await.is_ok()
-}
-
 async fn stat_object_if_exists(
     config: &QiniuSyncConfig,
     secret: &str,
+    counters: &NetworkCounters,
     key: &str,
-) -> Result<Option<u64>, String> {
-    let response = s3_send(config, secret, reqwest::Method::HEAD, S3Resource::Object(key), &[], None).await?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
+) -> Result<Option<(u64, u64)>, String> {
+    let response = s3_send(config, secret, counters, reqwest::Method::HEAD, S3Resource::Object(key), &[], None).await?;
+    match classify_stat_status(response.status()) {
+        Ok(true) => return Ok(None),
+        Ok(false) => {}
+        Err(status) => return Err(format!("Qiniu stat of {key} failed: {status}.")),
     }
-    if !response.status().is_success() {
-        return Err(format!("Qiniu stat of {key} failed: {}.", response.status()));
+    Ok(Some((put_time_from_response(&response), content_length_header(&response).unwrap_or(0))))
+}
+
+fn classify_stat_status(status: reqwest::StatusCode) -> Result<bool, reqwest::StatusCode> {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        Ok(true)
+    } else if status.is_success() {
+        Ok(false)
+    } else {
+        Err(status)
     }
-    Ok(Some(content_length_header(&response).unwrap_or(0)))
 }
 
 fn device_id(connection: &rusqlite::Connection) -> Result<String, String> {
@@ -860,13 +1071,11 @@ fn apply_deferred_inbox<R: Runtime>(app: &AppHandle<R>) -> Result<usize, String>
     Ok(applied)
 }
 
-async fn upload_device_state<R: Runtime>(
+fn current_device_state<R: Runtime>(
     app: &AppHandle<R>,
-    config: &QiniuSyncConfig,
-    secret: &str,
     device: &str,
     latest: u64,
-) -> Result<(), String> {
+) -> Result<DeviceState, String> {
     let seen = {
         let connection = super::open_library_db(app)?;
         let mut seen = HashMap::new();
@@ -880,18 +1089,85 @@ async fn upload_device_state<R: Runtime>(
         }
         seen
     };
-    let state = DeviceState {
+    let mut seen = seen;
+    seen.insert(device.to_string(), latest);
+    Ok(DeviceState {
         protocol_version: PROTOCOL_VERSION,
         device_id: device.to_string(),
         latest_batch_seq: latest,
         updated_at: now_iso(),
         seen,
-    };
-    upload_bytes(config, secret, &format!("{PREFIX}/devices/{device}.json"), &serde_json::to_vec(&state).unwrap()).await
+    })
 }
 
-async fn delete_object(config: &QiniuSyncConfig, secret: &str, key: &str) -> Result<(), String> {
-    let response = s3_send(config, secret, reqwest::Method::DELETE, S3Resource::Object(key), &[], None).await?;
+fn device_state_needs_publish<R: Runtime>(
+    app: &AppHandle<R>,
+    target: &str,
+    state: &DeviceState,
+) -> Result<bool, String> {
+    let connection = super::open_library_db(app)?;
+    let Some(raw) = super::get_meta_value(&connection, PUBLISHED_DEVICE_STATE_META_KEY) else {
+        return Ok(true);
+    };
+    let Ok(published) = serde_json::from_str::<PublishedDeviceState>(&raw) else {
+        return Ok(true);
+    };
+    Ok(!published_device_state_is_current(&published, target, state, now_millis()))
+}
+
+fn published_device_state_is_current(
+    published: &PublishedDeviceState,
+    target: &str,
+    state: &DeviceState,
+    now_ms: u64,
+) -> bool {
+    published.target == target
+        && published.device_id == state.device_id
+        && published.latest_batch_seq == state.latest_batch_seq
+        && published.seen == state.seen
+        && now_ms.saturating_sub(published.published_at_ms) < DEVICE_STATE_REPUBLISH_INTERVAL_MS
+}
+
+async fn upload_device_state<R: Runtime>(
+    app: &AppHandle<R>,
+    config: &QiniuSyncConfig,
+    secret: &str,
+    counters: &NetworkCounters,
+    target: &str,
+    state: &DeviceState,
+) -> Result<(), String> {
+    upload_bytes(
+        config,
+        secret,
+        counters,
+        &format!("{PREFIX}/devices/{}.json", state.device_id),
+        &serde_json::to_vec(&state).unwrap(),
+    )
+    .await
+    .map_err(|error| error.to_string())
+    .map(|_| ())?;
+    let published = PublishedDeviceState {
+        target: target.to_string(),
+        device_id: state.device_id.clone(),
+        latest_batch_seq: state.latest_batch_seq,
+        seen: state.seen.clone(),
+        published_at_ms: now_millis(),
+    };
+    let connection = super::open_library_db(app)?;
+    super::set_meta_value(
+        &connection,
+        PUBLISHED_DEVICE_STATE_META_KEY,
+        &serde_json::to_string(&published).map_err(|error| error.to_string())?,
+    )
+}
+
+async fn delete_object(
+    config: &QiniuSyncConfig,
+    secret: &str,
+    counters: &NetworkCounters,
+    key: &str,
+) -> Result<(), String> {
+    let response = s3_send(config, secret, counters, reqwest::Method::DELETE, S3Resource::Object(key), &[], None).await?;
     // S3 DELETE is idempotent: a 204 (deleted) and a 404 (already gone) are both
     // success from our perspective.
     if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -919,60 +1195,122 @@ fn extract_xml_values(xml: &str, tag: &str) -> Vec<String> {
     values
 }
 
-async fn list_device_keys(config: &QiniuSyncConfig, secret: &str) -> Result<Vec<String>, String> {
+#[derive(Debug, PartialEq, Eq)]
+struct ListedDeviceObject {
+    key: String,
+    etag: String,
+}
+
+fn extract_listed_device_objects(xml: &str, prefix: &str) -> Vec<ListedDeviceObject> {
+    extract_xml_values(xml, "Contents")
+        .into_iter()
+        .filter_map(|contents| {
+            let key = extract_xml_values(&contents, "Key").into_iter().next()?;
+            if !key.starts_with(prefix) || !key.ends_with(".json") {
+                return None;
+            }
+            let etag = extract_xml_values(&contents, "ETag")
+                .into_iter()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .trim_matches('"')
+                .to_string();
+            Some(ListedDeviceObject { key, etag })
+        })
+        .collect()
+}
+
+fn device_id_from_head_key<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
+    key.strip_prefix(prefix).and_then(|value| value.strip_suffix(".json"))
+}
+
+fn device_head_needs_fetch(etag: &str, cached: Option<&(String, u64)>, current: u64) -> bool {
+    etag.is_empty() || !cached.is_some_and(|(cached_etag, latest)| cached_etag == etag && current >= *latest)
+}
+
+async fn list_device_objects(
+    config: &QiniuSyncConfig,
+    secret: &str,
+    counters: &NetworkCounters,
+) -> Result<Vec<ListedDeviceObject>, String> {
     let prefix = format!("{PREFIX}/devices/");
-    let mut keys = Vec::new();
+    let mut objects = Vec::new();
     let mut continuation: Option<String> = None;
     loop {
         let mut query: Vec<(&str, &str)> = vec![("list-type", "2"), ("prefix", prefix.as_str())];
         if let Some(token) = continuation.as_deref() {
             query.push(("continuation-token", token));
         }
-        let response = s3_send(config, secret, reqwest::Method::GET, S3Resource::Bucket, &query, None).await?;
+        let response = s3_send(config, secret, counters, reqwest::Method::GET, S3Resource::Bucket, &query, None).await?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            counters.record_download(body.len());
             return Err(format!("Qiniu device list failed: {status}. Body: {body}"));
         }
         let xml = response.text().await.map_err(|error| error.to_string())?;
-        for key in extract_xml_values(&xml, "Key") {
-            if key.starts_with(&prefix) && key.ends_with(".json") {
-                keys.push(key);
-            }
-        }
+        counters.record_download(xml.len());
+        objects.extend(extract_listed_device_objects(&xml, &prefix));
         match extract_xml_values(&xml, "NextContinuationToken").into_iter().next() {
             Some(token) if !token.is_empty() => continuation = Some(token),
             _ => break,
         }
     }
-    Ok(keys)
+    Ok(objects)
 }
 
 async fn pull_remote<R: Runtime>(
     app: &AppHandle<R>,
     config: &QiniuSyncConfig,
     secret: &str,
+    counters: &NetworkCounters,
+    local_device: &str,
+    target: &str,
 ) -> Result<usize, String> {
-    let keys = list_device_keys(config, secret).await?;
+    let objects = list_device_objects(config, secret, counters).await?;
+    let device_prefix = format!("{PREFIX}/devices/");
     let mut applied = 0;
-    for key in keys {
-        let state: DeviceState = serde_json::from_slice(&download_bytes(config, secret, &key).await?)
+    for object in objects {
+        let Some(listed_device) = device_id_from_head_key(&object.key, &device_prefix) else {
+            continue;
+        };
+        if listed_device == local_device {
+            continue;
+        }
+        let (current, cached_head) = {
+            let connection = super::open_library_db(app)?;
+            let current = connection
+                .query_row("SELECT batch_seq FROM sync_cursors WHERE device_id=?1", [listed_device], |row| row.get::<_, i64>(0))
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(0) as u64;
+            let cached = connection
+                .query_row(
+                    "SELECT etag,latest_batch_seq FROM sync_device_heads WHERE target=?1 AND device_id=?2",
+                    params![target, listed_device],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            (current, cached)
+        };
+        if !device_head_needs_fetch(&object.etag, cached_head.as_ref(), current) {
+            continue;
+        }
+
+        let state: DeviceState = serde_json::from_slice(&download_bytes(config, secret, counters, &object.key).await?)
             .map_err(|error| error.to_string())?;
         if state.protocol_version != PROTOCOL_VERSION {
             return Err(format!("Unsupported cloud protocol version {}", state.protocol_version));
         }
-        let current = {
-            let connection = super::open_library_db(app)?;
-            connection
-                .query_row("SELECT batch_seq FROM sync_cursors WHERE device_id=?1", [&state.device_id], |row| row.get::<_, i64>(0))
-                .optional()
-                .map_err(|error| error.to_string())?
-                .unwrap_or(0) as u64
-        };
+        if state.device_id != listed_device {
+            return Err(format!("Qiniu device head {} identifies itself as {}", object.key, state.device_id));
+        }
         for seq in (current + 1)..=state.latest_batch_seq {
             let batch_key = format!("{PREFIX}/changes/{}/{seq:020}.json.gz", state.device_id);
-            let (put_time, _, _) = stat_object(config, secret, &batch_key).await?;
-            let batch: CloudBatch = ungzip_json(&download_bytes(config, secret, &batch_key).await?)?;
+            let (put_time, _, _) = stat_object(config, secret, counters, &batch_key).await?;
+            let batch: CloudBatch = ungzip_json(&download_bytes(config, secret, counters, &batch_key).await?)?;
             if batch.protocol_version != PROTOCOL_VERSION || batch.device_id != state.device_id || batch.batch_seq != seq {
                 return Err(format!("Invalid cloud batch {batch_key}"));
             }
@@ -992,6 +1330,14 @@ async fn pull_remote<R: Runtime>(
                 .map_err(|error| error.to_string())?;
             transaction.commit().map_err(|error| error.to_string())?;
         }
+        let connection = super::open_library_db(app)?;
+        connection
+            .execute(
+                "INSERT INTO sync_device_heads(target,device_id,etag,latest_batch_seq) VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(target,device_id) DO UPDATE SET etag=excluded.etag,latest_batch_seq=excluded.latest_batch_seq",
+                params![target, state.device_id, object.etag, state.latest_batch_seq as i64],
+            )
+            .map_err(|error| error.to_string())?;
     }
     Ok(applied)
 }
@@ -1050,19 +1396,20 @@ pub async fn qiniu_test_sync_connection<R: Runtime>(app: AppHandle<R>) -> Result
         .map_err(|error| format!("Qiniu connection test failed while reading the saved configuration: {error}"))?;
     let secret = load_secret(&config)
         .map_err(|error| format!("Qiniu connection test failed while reading the Secret Key from Keychain: {error}"))?;
+    let counters = NetworkCounters::default();
     let key = format!("{PREFIX}/connection-test-{}.json", uuid::Uuid::new_v4());
-    upload_bytes(&config, &secret, &key, br#"{"ok":true}"#)
+    upload_bytes(&config, &secret, &counters, &key, br#"{"ok":true}"#)
         .await
         .map_err(|error| format!("Qiniu connection test failed during test-object upload: {error}"))?;
-    stat_object(&config, &secret, &key)
+    stat_object(&config, &secret, &counters, &key)
         .await
         .map_err(|error| format!("Qiniu connection test uploaded the object, but Stat failed: {error}"))?;
     // Round-trip a download too, so a signing/endpoint/region mismatch that only
     // affects reads is caught here rather than during a real sync.
-    download_bytes(&config, &secret, &key)
+    download_bytes(&config, &secret, &counters, &key)
         .await
         .map_err(|error| format!("Qiniu connection test: upload succeeded but downloading through the S3 endpoint ({}) failed: {error}", config.private_domain))?;
-    delete_object(&config, &secret, &key)
+    delete_object(&config, &secret, &counters, &key)
         .await
         .map_err(|error| format!("Qiniu connection test uploaded and verified the object, but cleanup deletion failed: {error}"))?;
     Ok(())
@@ -1084,7 +1431,8 @@ pub async fn qiniu_disconnect_sync<R: Runtime>(app: AppHandle<R>) -> Result<(), 
 pub async fn qiniu_upload_blob<R: Runtime>(
     app: AppHandle<R>,
     request: tauri::ipc::Request<'_>,
-) -> Result<(), String> {
+) -> Result<BlobUploadResult, String> {
+    let counters = NetworkCounters::default();
     let tauri::ipc::InvokeBody::Raw(raw) = request.body() else {
         return Err("Expected a binary file payload.".to_string());
     };
@@ -1097,15 +1445,39 @@ pub async fn qiniu_upload_blob<R: Runtime>(
         .to_ascii_lowercase();
     let actual = hex::encode(Sha256::digest(&bytes));
     if actual != expected {
-        return Err("Local file SHA-256 does not match its FileAsset metadata.".to_string());
+        return Ok(BlobUploadResult {
+            uploaded: false,
+            stats: counters.snapshot(),
+            error: Some(BlobUploadIssue {
+                kind: BlobUploadIssueKind::File,
+                message: "Local file SHA-256 does not match its FileAsset metadata.".to_string(),
+            }),
+        });
     }
     let config = load_config(&app)?;
     let secret = load_secret(&config)?;
     let key = format!("{PREFIX}/blobs/sha256/{expected}");
-    if !object_exists(&config, &secret, &key).await {
-        upload_bytes(&config, &secret, &key, &bytes).await?;
-    }
-    Ok(())
+    let uploaded = match stat_object_if_exists(&config, &secret, &counters, &key).await {
+        Ok(Some(_)) => false,
+        Ok(None) => match upload_bytes(&config, &secret, &counters, &key, &bytes).await {
+            Ok(_) => true,
+            Err(error) => {
+                return Ok(BlobUploadResult {
+                    uploaded: false,
+                    stats: counters.snapshot(),
+                    error: Some(BlobUploadIssue { kind: error.kind, message: error.message }),
+                });
+            }
+        },
+        Err(error) => {
+            return Ok(BlobUploadResult {
+                uploaded: false,
+                stats: counters.snapshot(),
+                error: Some(BlobUploadIssue { kind: BlobUploadIssueKind::Fatal, message: error }),
+            });
+        }
+    };
+    Ok(BlobUploadResult { uploaded, stats: counters.snapshot(), error: None })
 }
 
 /// Checks a content-addressed blob without transferring any file bytes.
@@ -1123,10 +1495,11 @@ pub async fn qiniu_object_exists<R: Runtime>(
     }
     let config = load_config(&app)?;
     let secret = load_secret(&config)?;
+    let counters = NetworkCounters::default();
     let key = format!("{PREFIX}/blobs/sha256/{expected}");
-    match stat_object_if_exists(&config, &secret, &key).await? {
-        Some(size) => Ok(QiniuObjectStat { exists: true, size: Some(size) }),
-        None => Ok(QiniuObjectStat { exists: false, size: None }),
+    match stat_object_if_exists(&config, &secret, &counters, &key).await? {
+        Some((_, size)) => Ok(QiniuObjectStat { exists: true, size: Some(size), stats: counters.snapshot() }),
+        None => Ok(QiniuObjectStat { exists: false, size: None, stats: counters.snapshot() }),
     }
 }
 
@@ -1138,8 +1511,9 @@ pub async fn qiniu_download_blob<R: Runtime>(
     let expected = sha256.trim().to_ascii_lowercase();
     let config = load_config(&app)?;
     let secret = load_secret(&config)?;
+    let counters = NetworkCounters::default();
     let key = format!("{PREFIX}/blobs/sha256/{expected}");
-    let bytes = download_bytes(&config, &secret, &key).await?;
+    let bytes = download_bytes(&config, &secret, &counters, &key).await?;
     if hex::encode(Sha256::digest(&bytes)) != expected {
         return Err("Downloaded Qiniu object failed SHA-256 verification.".to_string());
     }
@@ -1147,49 +1521,70 @@ pub async fn qiniu_download_blob<R: Runtime>(
 }
 
 #[tauri::command]
-pub async fn qiniu_delete_blob<R: Runtime>(app: AppHandle<R>, sha256: String) -> Result<(), String> {
+pub async fn qiniu_delete_blob<R: Runtime>(app: AppHandle<R>, sha256: String) -> Result<NetworkStats, String> {
     let config = load_config(&app)?;
     let secret = load_secret(&config)?;
+    let counters = NetworkCounters::default();
     let key = format!("{PREFIX}/blobs/sha256/{}", sha256.trim().to_ascii_lowercase());
-    if !object_exists(&config, &secret, &key).await {
-        return Ok(());
+    if stat_object_if_exists(&config, &secret, &counters, &key).await?.is_none() {
+        return Ok(counters.snapshot());
     }
-    delete_object(&config, &secret, &key).await?;
-    Ok(())
+    delete_object(&config, &secret, &counters, &key).await?;
+    Ok(counters.snapshot())
 }
 
 #[tauri::command]
 pub async fn qiniu_sync_library<R: Runtime>(app: AppHandle<R>) -> Result<SyncSummary, String> {
     let config = load_config(&app)?;
     let secret = load_secret(&config)?;
+    let counters = NetworkCounters::default();
     let device = {
         let connection = super::open_library_db(&app)?;
         device_id(&connection)?
     };
-    // A fixed, identical protocol object makes concurrent first-device setup idempotent.
-    let protocol_key = format!("{PREFIX}/protocol.json");
-    if !object_exists(&config, &secret, &protocol_key).await {
-        upload_bytes(&config, &secret, &protocol_key, br#"{"protocolVersion":1}"#).await?;
+    // The protocol marker is immutable. Verify it once per configured target,
+    // then avoid a redundant HEAD during every hourly steady-state sync.
+    let target = sync_target_id(&config);
+    let protocol_verified = {
+        let connection = super::open_library_db(&app)?;
+        super::get_meta_value(&connection, PROTOCOL_VERIFIED_TARGET_META_KEY).as_deref() == Some(&target)
+    };
+    if !protocol_verified {
+        let protocol_key = format!("{PREFIX}/protocol.json");
+        if stat_object_if_exists(&config, &secret, &counters, &protocol_key).await?.is_none() {
+            upload_bytes(&config, &secret, &counters, &protocol_key, br#"{"protocolVersion":1}"#)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let connection = super::open_library_db(&app)?;
+        super::set_meta_value(&connection, PROTOCOL_VERIFIED_TARGET_META_KEY, &target)?;
     }
     let mut summary = SyncSummary::default();
     let _ = app.emit("qiniu-sync-stage", "Uploading local changes to Qiniu…");
     while let Some((seq, body, rows)) = seal_batch(&app, &device)? {
         let key = format!("{PREFIX}/changes/{device}/{seq:020}.json.gz");
-        if !object_exists(&config, &secret, &key).await {
-            upload_bytes(&config, &secret, &key, &body).await?;
-        }
-        let (put_time, _, _) = stat_object(&config, &secret, &key).await?;
-        upload_device_state(&app, &config, &secret, &device, seq).await?;
+        let put_time = match stat_object_if_exists(&config, &secret, &counters, &key).await? {
+            Some((put_time, _)) => put_time,
+            None => upload_bytes(&config, &secret, &counters, &key, &body)
+                .await
+                .map_err(|error| error.to_string())?,
+        };
+        let state = current_device_state(&app, &device, seq)?;
+        upload_device_state(&app, &config, &secret, &counters, &target, &state).await?;
         confirm_local_batch(&app, &device, seq, put_time, &rows)?;
         summary.uploaded_changes += rows.len();
     }
     summary.downloaded_changes += apply_deferred_inbox(&app)?;
-    // Ensure an empty/new device is discoverable too.
-    let latest = next_batch_seq(&super::open_library_db(&app)?).saturating_sub(1);
-    upload_device_state(&app, &config, &secret, &device, latest).await?;
     let _ = app.emit("qiniu-sync-stage", "Fetching changes from other devices…");
-    summary.downloaded_changes += pull_remote(&app, &config, &secret).await?;
+    summary.downloaded_changes += pull_remote(&app, &config, &secret, &counters, &device, &target).await?;
     summary.downloaded_changes += apply_deferred_inbox(&app)?;
+    // Publish an empty/new device once, refresh when its semantic state changes,
+    // and periodically republish so an externally deleted head self-heals.
+    let latest = next_batch_seq(&super::open_library_db(&app)?).saturating_sub(1);
+    let state = current_device_state(&app, &device, latest)?;
+    if device_state_needs_publish(&app, &target, &state)? {
+        upload_device_state(&app, &config, &secret, &counters, &target, &state).await?;
+    }
     let last_synced_at = now_iso();
     let connection = super::open_library_db(&app)?;
     super::set_meta_value(&connection, LAST_SYNC_META_KEY, &last_synced_at)?;
@@ -1197,6 +1592,7 @@ pub async fn qiniu_sync_library<R: Runtime>(app: AppHandle<R>) -> Result<SyncSum
         .query_row("SELECT COUNT(*) FROM entities WHERE local_seq>0", [], |row| row.get::<_, i64>(0))
         .map_err(|error| error.to_string())? as usize;
     summary.last_synced_at = last_synced_at;
+    summary.set_network_stats(counters.snapshot());
     Ok(summary)
 }
 
@@ -1223,6 +1619,84 @@ mod tests {
         assert_eq!(uri_encode("lumora/v1/a-b_c.json", false), "lumora/v1/a-b_c.json");
         assert_eq!(uri_encode("lumora/v1", true), "lumora%2Fv1");
         assert_eq!(uri_encode("a b+c", true), "a%20b%2Bc");
+    }
+
+    #[test]
+    fn network_counters_track_requests_and_payload_bytes() {
+        let counters = NetworkCounters::default();
+        counters.record_request(&reqwest::Method::PUT, 128);
+        counters.record_request(&reqwest::Method::HEAD, 0);
+        counters.record_request(&reqwest::Method::GET, 0);
+        counters.record_download(64);
+        let stats = counters.snapshot();
+        assert_eq!(stats.request_count, 3);
+        assert_eq!(stats.put_requests, 1);
+        assert_eq!(stats.get_requests, 1);
+        assert_eq!(stats.head_requests, 1);
+        assert_eq!(stats.uploaded_bytes, 128);
+        assert_eq!(stats.downloaded_bytes, 64);
+    }
+
+    #[test]
+    fn only_not_found_is_classified_as_a_missing_object() {
+        assert_eq!(classify_stat_status(reqwest::StatusCode::NOT_FOUND), Ok(true));
+        assert_eq!(classify_stat_status(reqwest::StatusCode::OK), Ok(false));
+        assert_eq!(
+            classify_stat_status(reqwest::StatusCode::FORBIDDEN),
+            Err(reqwest::StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            classify_stat_status(reqwest::StatusCode::REQUEST_TIMEOUT),
+            Err(reqwest::StatusCode::REQUEST_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn upload_failures_distinguish_file_limits_from_global_errors() {
+        assert_eq!(
+            upload_issue_kind(reqwest::StatusCode::PAYLOAD_TOO_LARGE, ""),
+            BlobUploadIssueKind::File
+        );
+        assert_eq!(
+            upload_issue_kind(reqwest::StatusCode::BAD_REQUEST, "<Code>EntityTooLarge</Code>"),
+            BlobUploadIssueKind::File
+        );
+        assert_eq!(
+            upload_issue_kind(reqwest::StatusCode::FORBIDDEN, "signature mismatch"),
+            BlobUploadIssueKind::Fatal
+        );
+    }
+
+    #[test]
+    fn unchanged_device_state_is_cached_until_periodic_republish() {
+        let seen = HashMap::from([("remote-a".to_string(), 3)]);
+        let state = DeviceState {
+            protocol_version: PROTOCOL_VERSION,
+            device_id: "local".into(),
+            latest_batch_seq: 7,
+            updated_at: "new".into(),
+            seen: seen.clone(),
+        };
+        let published = PublishedDeviceState {
+            target: "target-a".into(),
+            device_id: "local".into(),
+            latest_batch_seq: 7,
+            seen,
+            published_at_ms: 1_000,
+        };
+        assert!(published_device_state_is_current(
+            &published,
+            "target-a",
+            &state,
+            1_000 + DEVICE_STATE_REPUBLISH_INTERVAL_MS - 1
+        ));
+        assert!(!published_device_state_is_current(
+            &published,
+            "target-a",
+            &state,
+            1_000 + DEVICE_STATE_REPUBLISH_INTERVAL_MS
+        ));
+        assert!(!published_device_state_is_current(&published, "target-b", &state, 1_001));
     }
 
     #[test]
@@ -1294,6 +1768,29 @@ mod tests {
         assert_eq!(extract_xml_values(xml, "Key"), vec!["k1".to_string(), "k2".to_string()]);
         assert_eq!(extract_xml_values(xml, "NextContinuationToken"), vec!["tok".to_string()]);
         assert!(extract_xml_values(xml, "Missing").is_empty());
+    }
+
+    #[test]
+    fn device_list_extracts_etags_and_device_ids() {
+        let xml = "<ListBucketResult>\
+          <Contents><Key>lumora/v1/devices/local.json</Key><ETag>\"etag-local\"</ETag><Size>10</Size></Contents>\
+          <Contents><Key>lumora/v1/devices/remote.json</Key><ETag>\"etag-remote\"</ETag><Size>11</Size></Contents>\
+          <Contents><Key>lumora/v1/blobs/sha256/x</Key><ETag>\"blob\"</ETag></Contents>\
+        </ListBucketResult>";
+        let objects = extract_listed_device_objects(xml, "lumora/v1/devices/");
+        assert_eq!(
+            objects,
+            vec![
+                ListedDeviceObject { key: "lumora/v1/devices/local.json".into(), etag: "etag-local".into() },
+                ListedDeviceObject { key: "lumora/v1/devices/remote.json".into(), etag: "etag-remote".into() },
+            ]
+        );
+        assert_eq!(device_id_from_head_key(&objects[0].key, "lumora/v1/devices/"), Some("local"));
+        let cached = ("etag-remote".to_string(), 4);
+        assert!(!device_head_needs_fetch("etag-remote", Some(&cached), 4));
+        assert!(device_head_needs_fetch("etag-new", Some(&cached), 4));
+        assert!(device_head_needs_fetch("etag-remote", Some(&cached), 3));
+        assert!(device_head_needs_fetch("", Some(&cached), 4));
     }
 
     #[test]

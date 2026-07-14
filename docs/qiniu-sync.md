@@ -30,6 +30,12 @@ instead of overwriting the edit.
 The app syncs once after startup, then every hour while running. Manual sync is
 always available. There is no edit-debounce sync.
 
+Device heads are published on first use, when their latest batch/vector state
+changes, or as a 24-hour self-healing audit. An idle hourly sync does not
+rewrite an unchanged head. ListObjects ETags are stored with SQLite cursors, so
+unchanged remote device heads are not downloaded again; the current device's
+own listed head is always skipped.
+
 ## Files and arXiv
 
 Device-local paths and availability never enter cloud batches. Ordinary files
@@ -46,13 +52,23 @@ the same hash.
 
 To avoid repeatedly reading the user's whole PDF library, the desktop keeps a
 device-local verification fingerprint (path, size, modification time, and the
-last computed SHA-256). An unchanged file is checked with a Qiniu Stat request;
-its bytes are read and hashed only when the object is missing or the local
-fingerprint changed. Stats are deduplicated by SHA-256 and run with bounded
-concurrency. A missing-object response is distinct from authentication,
-timeout, region, and other service errors, so an outage cannot trigger a full
-local-library scan. Uploads still verify SHA-256 before transfer and Stat the
-stored size afterwards.
+last computed SHA-256). A successful cloud Stat is cached for 24 hours and
+scoped to the configured Qiniu target, so hourly steady-state syncs do not HEAD
+every unchanged object. After the cache expires, Stats are deduplicated by
+SHA-256 and run with bounded concurrency. File bytes are read and hashed only
+when the object is missing or the local fingerprint changed. A 404 response is
+the only response treated as a missing object; authentication, timeout, region,
+and other service errors abort the upload path instead of triggering a PUT.
+Uploads still verify SHA-256 before transfer and Stat the stored size afterwards.
+Authentication, endpoint, region and transport failures stop the sync, while
+file-specific failures such as an oversized object are reported and skipped so
+metadata and other files can continue. After five file-specific failures, the
+remaining file uploads are deferred but metadata sync still runs.
+
+Downloads are grouped by SHA-256, so multiple FileAssets that reference the
+same content cause at most one cloud GET per sync. Each local materialization is
+committed immediately. The sync summary reports actual PUT/GET payload bytes
+and request counts split by HTTP method.
 
 ## Security and operational limits
 

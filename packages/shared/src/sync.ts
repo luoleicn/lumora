@@ -45,6 +45,13 @@ export type CloudSyncSummary = {
   pendingChanges: number;
   lastSyncedAt: string;
   errors: string[];
+  requestCount: number;
+  putRequests: number;
+  getRequests: number;
+  headRequests: number;
+  deleteRequests: number;
+  uploadedBytes: number;
+  downloadedBytes: number;
 };
 
 export type ImportJob = {

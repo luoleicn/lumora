@@ -2679,7 +2679,7 @@ mod tests {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         configure_library_connection(&connection).unwrap();
 
-        let timeout: u64 = connection
+        let timeout: i64 = connection
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
         assert_eq!(timeout, 30_000);
