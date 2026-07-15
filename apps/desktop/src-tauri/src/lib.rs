@@ -80,7 +80,7 @@ struct YoudaoTranslation {
     page_url: String,
 }
 
-const EXTERNAL_URL_HOSTS: [&str; 2] = ["dict.youdao.com", "dev.mendeley.com"];
+const EXTERNAL_URL_HOSTS: [&str; 3] = ["dict.youdao.com", "dev.mendeley.com", "scholar.google.com"];
 
 #[tauri::command]
 fn open_external_url(url: String) -> Result<(), String> {

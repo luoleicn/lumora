@@ -1,4 +1,4 @@
-import { DatabaseZap, Download, ExternalLink, FileSearch, FolderOpen, Search, Send, Trash2 } from "lucide-react";
+import { DatabaseZap, Download, ExternalLink, FileSearch, FolderOpen, GraduationCap, Search, Send, Trash2 } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Annotation, ArxivMetadata, FileAsset, Paper } from "@lumora/shared";
 import { invoke } from "@tauri-apps/api/core";
@@ -221,6 +221,17 @@ function DetailsTab({
     }));
   }
 
+  async function handleGoogleScholarSearch() {
+    const query = currentPaper.title.trim();
+    if (!query) return;
+    const url = `https://scholar.google.com/scholar?q=${encodeURIComponent(query)}`;
+    try {
+      await invoke("open_external_url", { url });
+    } catch (error) {
+      console.error("Failed to open Google Scholar:", error);
+    }
+  }
+
   async function handlePdfMetadataExtract() {
     if (!fileData) {
       setPdfMetadataStatus("No local PDF file available.");
@@ -256,6 +267,15 @@ function DetailsTab({
             {pdfMetadataBusy ? "Extracting..." : "Extract PDF"}
           </button>
           <div className="arxiv-action-stack">
+            <button
+              type="button"
+              onClick={() => void handleGoogleScholarSearch()}
+              disabled={!paper.title.trim()}
+              title="Search this title on Google Scholar"
+            >
+              <GraduationCap size={15} />
+              Google Scholar
+            </button>
             <button type="button" onClick={handleArxivLookup} disabled={arxivLookupBusy || !paper.title.trim()}>
               <Search size={15} />
               {arxivLookupBusy ? "Searching..." : "Search arXiv"}
