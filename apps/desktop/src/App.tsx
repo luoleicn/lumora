@@ -1320,6 +1320,8 @@ export default function App() {
 
   function handleSelectCollection(collectionId: string) {
     setSelectedCollectionId(collectionId);
+    // Clicking a collection always lands on the Documents tab, even while reading a paper.
+    setActiveWorkspaceTabId(documentsTab.id);
     if (!selectedPaperId) return;
     const current = libraryRef.current ?? library;
     const paper = current.papers.find((item) => item.id === selectedPaperId);
