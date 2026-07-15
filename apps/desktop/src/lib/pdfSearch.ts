@@ -1,4 +1,5 @@
 import type { NormalizedRect } from "@lumora/shared";
+import type { PDFDocumentProxy } from "pdfjs-dist";
 import { normalizeRect } from "@lumora/shared";
 
 // PDF text-layer search: walks the rendered DOM spans that react-pdf produces and
@@ -13,7 +14,74 @@ export type PdfSearchMatch = {
   rect: NormalizedRect;
   /** Unique key for React list rendering */
   key: string;
+  /** Zero-based occurrence within this page. */
+  matchIndex: number;
 };
+
+export type PdfSearchTarget = {
+  pageIndex: number;
+  pageMatchIndex: number;
+  key: string;
+};
+
+// Search the PDF text model rather than the rendered DOM. This keeps find-in-
+// document complete when only a small virtual window of pages is mounted.
+export async function findInPdfText(
+  document: PDFDocumentProxy,
+  query: string,
+  shouldCancel: () => boolean = () => false
+): Promise<PdfSearchTarget[]> {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) {
+    return [];
+  }
+
+  const targets: PdfSearchTarget[] = [];
+  for (let pageIndex = 0; pageIndex < document.numPages; pageIndex += 1) {
+    if (shouldCancel()) {
+      return [];
+    }
+
+    const page = await document.getPage(pageIndex + 1);
+    const content = await page.getTextContent();
+    let pageMatchIndex = 0;
+    for (const item of content.items as Array<{ str?: unknown }>) {
+      if (typeof item.str !== "string") {
+        continue;
+      }
+      const count = countTextOccurrences(item.str, normalizedQuery);
+      for (let occurrence = 0; occurrence < count; occurrence += 1) {
+        targets.push({
+          pageIndex,
+          pageMatchIndex,
+          key: `pdf-search-target-${pageIndex}-${pageMatchIndex}`
+        });
+        pageMatchIndex += 1;
+      }
+    }
+  }
+
+  return shouldCancel() ? [] : targets;
+}
+
+export function countTextOccurrences(text: string, normalizedQuery: string): number {
+  if (!normalizedQuery) {
+    return 0;
+  }
+
+  const normalizedText = text.toLowerCase();
+  let count = 0;
+  let searchFrom = 0;
+  while (searchFrom < normalizedText.length) {
+    const position = normalizedText.indexOf(normalizedQuery, searchFrom);
+    if (position === -1) {
+      break;
+    }
+    count += 1;
+    searchFrom = position + normalizedQuery.length;
+  }
+  return count;
+}
 
 /**
  * Searches the rendered text layer of a single PDF page for a query string.
@@ -51,6 +119,8 @@ export function findInPageTextLayer(
     while (searchFrom < text.length) {
       const pos = lowerText.indexOf(query, searchFrom);
       if (pos === -1) break;
+      const currentMatchIndex = matchIndex;
+      let matchRectIndex = 0;
 
       const textNode = span.firstChild;
       if (textNode && textNode.nodeType === Node.TEXT_NODE && textNode.textContent) {
@@ -68,7 +138,8 @@ export function findInPageTextLayer(
               matches.push({
                 pageIndex,
                 rect: normalizeRect(rect, pageRect),
-                key: `pdf-search-${pageIndex}-${matchIndex++}`
+                key: `pdf-search-${pageIndex}-${currentMatchIndex}-${matchRectIndex++}`,
+                matchIndex: currentMatchIndex
               });
             }
           }
@@ -79,10 +150,12 @@ export function findInPageTextLayer(
         matches.push({
           pageIndex,
           rect: normalizeRect(spanRect, pageRect),
-          key: `pdf-search-${pageIndex}-${matchIndex++}`
+          key: `pdf-search-${pageIndex}-${currentMatchIndex}-0`,
+          matchIndex: currentMatchIndex
         });
       }
 
+      matchIndex += 1;
       searchFrom = pos + query.length;
     }
   }

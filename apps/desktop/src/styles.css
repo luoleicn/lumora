@@ -1411,6 +1411,55 @@ body.paper-pointer-dragging * {
   box-shadow: 0 5px 20px rgba(29, 41, 57, 0.15);
 }
 
+.runtime-error-fallback {
+  display: grid;
+  width: 100vw;
+  height: 100vh;
+  padding: 32px;
+  place-items: center;
+  background: #f2f5f7;
+  color: #26313a;
+}
+
+.runtime-error-fallback section {
+  width: min(680px, 100%);
+  padding: 28px;
+  border: 1px solid #cfd7df;
+  border-radius: 10px;
+  background: #ffffff;
+  box-shadow: 0 12px 32px rgba(29, 41, 57, 0.12);
+}
+
+.runtime-error-fallback h1 {
+  margin: 0 0 12px;
+  font-size: 20px;
+}
+
+.runtime-error-fallback p {
+  margin: 0 0 20px;
+  color: #5c6874;
+  white-space: pre-wrap;
+}
+
+.runtime-error-fallback button {
+  border: 1px solid #9eabb7;
+  border-radius: 7px;
+  background: #ffffff;
+  padding: 8px 14px;
+}
+
+.pdf-page-list {
+  position: relative;
+  width: 100%;
+}
+
+.page-shell.virtualized {
+  position: absolute;
+  left: 50%;
+  margin: 0;
+  transform: translateX(-50%);
+}
+
 .page-jump-popover {
   position: absolute;
   top: 14px;
