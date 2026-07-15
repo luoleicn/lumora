@@ -16,6 +16,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { Annotation, Collection, FileAsset, LibraryState, Paper } from "@lumora/shared";
 import { FileText, X } from "lucide-react";
 import { AppToolbar } from "./components/AppToolbar";
+import { ArxivDownloadToast } from "./components/ArxivDownloadToast";
 import { CollectionModal, DeleteCollectionModal, RenameCollectionModal } from "./components/CollectionModal";
 import { LibrarySidebar, type LibrarySyncActivity } from "./components/LibrarySidebar";
 import { ManualReferenceModal, type ManualReferenceDraft } from "./components/ManualReferenceModal";
@@ -228,6 +229,8 @@ export default function App() {
   const [mendeleyConnection, setMendeleyConnection] = useState<MendeleyConnection>();
   const [mendeleySyncBusy, setMendeleySyncBusy] = useState(false);
   const [arxivDownloadBusy, setArxivDownloadBusy] = useState(false);
+  const [arxivBatchProgress, setArxivBatchProgress] = useState<ArxivDownloadProgress>();
+  const arxivBatchToastDismissedRef = useRef(false);
   const [mendeleySyncActivity, setMendeleySyncActivity] = useState<LibrarySyncActivity>();
   const [cloudSyncActivity, setCloudSyncActivity] = useState<LibrarySyncActivity>();
   const [fileStorageBusy, setFileStorageBusy] = useState(false);
@@ -1482,6 +1485,8 @@ export default function App() {
     }
     arxivDownloadInFlightRef.current = true;
     setArxivDownloadBusy(true);
+    arxivBatchToastDismissedRef.current = false;
+    const isBatch = !paperId;
     const startingState = libraryRef.current ?? library;
     const startingFiles = new Map(startingState.fileAssets.map((file) => [file.id, file]));
     try {
@@ -1489,6 +1494,9 @@ export default function App() {
         paperIds: paperId ? [paperId] : undefined,
         onProgress: (progress) => {
           detailProgress?.(progress);
+          if (isBatch && !arxivBatchToastDismissedRef.current) {
+            setArxivBatchProgress(progress.total > 0 ? progress : undefined);
+          }
           const position = Math.min(progress.total, progress.done + (progress.phase === "downloading" ? 1 : 0));
           const byteProgress = progress.downloadedBytes !== undefined
             ? ` — ${formatFileSize(progress.downloadedBytes)}${progress.totalBytes ? ` / ${formatFileSize(progress.totalBytes)}` : ""}`
@@ -1521,6 +1529,7 @@ export default function App() {
     } finally {
       arxivDownloadInFlightRef.current = false;
       setArxivDownloadBusy(false);
+      setArxivBatchProgress(undefined);
     }
   }
 
@@ -1985,6 +1994,16 @@ export default function App() {
         }}
       />
       </section>
+
+      {arxivBatchProgress && (
+        <ArxivDownloadToast
+          progress={arxivBatchProgress}
+          onDismiss={() => {
+            arxivBatchToastDismissedRef.current = true;
+            setArxivBatchProgress(undefined);
+          }}
+        />
+      )}
 
       <ManualReferenceModal
         open={manualModalOpen}
