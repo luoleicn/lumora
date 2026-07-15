@@ -67,6 +67,7 @@ import { FileStorageSettingsModal } from "./components/FileStorageSettingsModal"
 import { MendeleySyncModal } from "./components/MendeleySyncModal";
 import { ProxySettingsModal } from "./components/ProxySettingsModal";
 import { DuplicateDocumentsModal } from "./components/DuplicateDocumentsModal";
+import { UpdateModal } from "./components/UpdateModal";
 import { parseReferenceFile } from "./lib/referenceImport";
 import {
   extractPdfBodyText,
@@ -104,6 +105,7 @@ import {
   type MendeleySyncProgress,
   type MendeleySettings
 } from "./lib/mendeleyClient";
+import { AppUpdater, initialAppUpdateState, type AppUpdateState } from "./lib/appUpdater";
 
 const workspaceLayoutKey = "lumora:workspace-layout";
 const collapseThreshold = 82;
@@ -183,6 +185,10 @@ function isLocalPdfFile(fileAsset: FileAsset): boolean {
 }
 
 export default function App() {
+  const appUpdaterRef = useRef<AppUpdater | undefined>(undefined);
+  if (!appUpdaterRef.current) {
+    appUpdaterRef.current = new AppUpdater();
+  }
   const fileInputRef = useRef<HTMLInputElement>(null);
   const referenceInputRef = useRef<HTMLInputElement>(null);
   const bindPdfInputRef = useRef<HTMLInputElement>(null);
@@ -223,6 +229,7 @@ export default function App() {
   const [proxySettingsOpen, setProxySettingsOpen] = useState(false);
   const [duplicateDocumentsOpen, setDuplicateDocumentsOpen] = useState(false);
   const [proxySettings, setProxySettings] = useState<ProxySettings>(defaultProxySettings);
+  const [proxySettingsLoaded, setProxySettingsLoaded] = useState(false);
   const [proxySettingsBusy, setProxySettingsBusy] = useState(false);
   const [proxySettingsError, setProxySettingsError] = useState<string>();
   const [mendeleySettings, setMendeleySettings] = useState<MendeleySettings>(() => loadMendeleySettings());
@@ -246,6 +253,7 @@ export default function App() {
   const [renameCollectionId, setRenameCollectionId] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string>();
+  const [appUpdateState, setAppUpdateState] = useState<AppUpdateState>(initialAppUpdateState);
   const collectionPaperCounts = useMemo(() => getCollectionPaperCounts(library), [library]);
 
   useEffect(() => {
@@ -253,10 +261,20 @@ export default function App() {
   }, [library]);
 
   useEffect(() => {
-    void loadProxySettings().then(setProxySettings).catch((error) => {
-      setStatus(error instanceof Error ? error.message : String(error));
-    });
+    void loadProxySettings()
+      .then(setProxySettings)
+      .catch((error) => {
+        setStatus(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => setProxySettingsLoaded(true));
   }, []);
+
+  useEffect(() => appUpdaterRef.current!.subscribe(setAppUpdateState), []);
+
+  useEffect(() => {
+    if (!proxySettingsLoaded || import.meta.env.DEV) return;
+    void appUpdaterRef.current!.checkForUpdates("startup", proxySettings);
+  }, [proxySettings, proxySettingsLoaded]);
 
   // Startup: SQLite is the source of truth. When it is empty this is a first
   // run on the new storage layer, so the legacy localStorage state (already in
@@ -474,6 +492,8 @@ export default function App() {
         setShortcutsHelpOpen(true);
       } else if (event.payload === "show-about") {
         setAboutOpen(true);
+      } else if (event.payload === "check-for-updates") {
+        void appUpdaterRef.current!.checkForUpdates("manual", proxySettings);
       } else if (event.payload === "show-file-storage-settings") {
         setFileStorageModalOpen(true);
       } else if (event.payload === "show-mendeley-sync") {
@@ -505,7 +525,7 @@ export default function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [activeWorkspaceTabId, workspaceTabs, fileStorageSettings]);
+  }, [activeWorkspaceTabId, workspaceTabs, fileStorageSettings, proxySettings]);
 
   useEffect(() => {
     if (!resizeDrag) {
@@ -2014,6 +2034,13 @@ export default function App() {
       />
       <ShortcutsHelpModal open={shortcutsHelpOpen} onClose={() => setShortcutsHelpOpen(false)} />
       <AboutModal open={aboutOpen} onClose={() => setAboutOpen(false)} />
+      <UpdateModal
+        state={appUpdateState}
+        onClose={() => void appUpdaterRef.current!.dismiss()}
+        onInstall={() => void appUpdaterRef.current!.downloadAndInstall()}
+        onRetry={() => void appUpdaterRef.current!.retry(proxySettings)}
+        onRestart={() => void appUpdaterRef.current!.restart()}
+      />
       <SyncSettingsModal
         open={syncSettingsOpen}
         settings={settings}

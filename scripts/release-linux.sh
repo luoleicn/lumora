@@ -92,6 +92,7 @@ command -v python3 >/dev/null 2>&1 || err "python3 is required"
 command -v node  >/dev/null 2>&1 || err "node is required (Node.js 22+)"
 command -v npm   >/dev/null 2>&1 || err "npm is required (Node.js 22+)"
 command -v cargo >/dev/null 2>&1 || err "cargo is required (Rust stable toolchain)"
+[[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]] || err "TAURI_SIGNING_PRIVATE_KEY is required for updater artifacts"
 
 log "App: $APP_NAME  Version: $VERSION  Tag: $TAG"
 log "Project: $PROJECT_DIR"
@@ -206,12 +207,26 @@ APPIMAGE_PATH="$ARTIFACTS_DIR/$APPIMAGE_NAME"
 cp "$DEB_SRC" "$DEB_PATH"
 cp "$APPIMAGE_SRC" "$APPIMAGE_PATH"
 
+# Recent updater clients select the installer that matches the existing Linux
+# installation. Sign both formats even if a bundler version only emits the
+# AppImage signature automatically.
+for source in "$DEB_SRC" "$APPIMAGE_SRC"; do
+  if [[ ! -f "$source.sig" ]]; then
+    npx tauri signer sign "$source"
+  fi
+  [[ -f "$source.sig" ]] || err "Updater signature was not generated for $source"
+done
+cp "$DEB_SRC.sig" "$DEB_PATH.sig"
+cp "$APPIMAGE_SRC.sig" "$APPIMAGE_PATH.sig"
+
 if [[ "$BUILD_ONLY" == true ]]; then
   log ""
   log "${BOLD}Build complete (--build-only).${NC} No tag pushed, no release created."
   log "Artifacts staged in: $ARTIFACTS_DIR"
   log "  $DEB_PATH"
   log "  $APPIMAGE_PATH"
+  log "  $DEB_PATH.sig"
+  log "  $APPIMAGE_PATH.sig"
   exit 0
 fi
 

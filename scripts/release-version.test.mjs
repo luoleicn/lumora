@@ -23,14 +23,20 @@ test("rejects tags that are not canonical release versions", () => {
   }
 });
 
-test("writes a Tauri configuration overlay containing the release version", () => {
+test("writes a signed-updater release overlay with macOS ad-hoc signing", () => {
   const directory = mkdtempSync(join(tmpdir(), "lumora-release-version-"));
   const outputPath = join(directory, "tauri.release.conf.json");
 
   try {
     const result = writeTauriReleaseConfig("v3.4.5", outputPath);
     assert.equal(result.version, "3.4.5");
-    assert.deepEqual(JSON.parse(readFileSync(outputPath, "utf8")), { version: "3.4.5" });
+    assert.deepEqual(JSON.parse(readFileSync(outputPath, "utf8")), {
+      version: "3.4.5",
+      bundle: {
+        createUpdaterArtifacts: true,
+        macOS: { signingIdentity: "-" },
+      },
+    });
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

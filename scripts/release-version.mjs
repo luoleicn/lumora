@@ -32,7 +32,13 @@ export function writeTauriReleaseConfig(tag, outputPath = DEFAULT_CONFIG_PATH) {
   mkdirSync(dirname(resolvedOutputPath), { recursive: true });
   writeFileSync(
     resolvedOutputPath,
-    `${JSON.stringify({ version }, null, 2)}\n`,
+    `${JSON.stringify({
+      version,
+      bundle: {
+        createUpdaterArtifacts: true,
+        macOS: { signingIdentity: "-" },
+      },
+    }, null, 2)}\n`,
     "utf8",
   );
 

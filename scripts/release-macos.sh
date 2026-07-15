@@ -89,6 +89,7 @@ command -v python3 >/dev/null 2>&1 || err "python3 is required"
 command -v node  >/dev/null 2>&1 || err "node is required (Node.js 22+)"
 command -v npm   >/dev/null 2>&1 || err "npm is required (Node.js 22+)"
 command -v cargo >/dev/null 2>&1 || err "cargo is required (Rust stable toolchain)"
+[[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]] || err "TAURI_SIGNING_PRIVATE_KEY is required for updater artifacts"
 
 log "App: $APP_NAME  Version: $VERSION  Tag: $TAG"
 log "Project: $PROJECT_DIR"
@@ -275,12 +276,28 @@ make_dmg() {
 make_dmg "$ARM_APP" "$ARM_DMG_PATH"
 make_dmg "$INTEL_APP" "$INTEL_DMG_PATH"
 
+# Tauri's updater bundle is separate from the user-facing DMG. Keep both: the
+# DMG is for fresh installs, while the signed app archive is consumed by the
+# in-app updater.
+ARM_UPDATER_SRC="$TAURI_DIR/target/$ARM_TARGET/release/bundle/macos/$APP_NAME.app.tar.gz"
+INTEL_UPDATER_SRC="$TAURI_DIR/target/$INTEL_TARGET/release/bundle/macos/$APP_NAME.app.tar.gz"
+[[ -f "$ARM_UPDATER_SRC" && -f "$ARM_UPDATER_SRC.sig" ]] || err "ARM updater archive/signature was not generated"
+[[ -f "$INTEL_UPDATER_SRC" && -f "$INTEL_UPDATER_SRC.sig" ]] || err "Intel updater archive/signature was not generated"
+ARM_UPDATER_PATH="$ARTIFACTS_DIR/${APP_NAME}-${TAG}-macos-arm64.app.tar.gz"
+INTEL_UPDATER_PATH="$ARTIFACTS_DIR/${APP_NAME}-${TAG}-macos-x64.app.tar.gz"
+cp "$ARM_UPDATER_SRC" "$ARM_UPDATER_PATH"
+cp "$ARM_UPDATER_SRC.sig" "$ARM_UPDATER_PATH.sig"
+cp "$INTEL_UPDATER_SRC" "$INTEL_UPDATER_PATH"
+cp "$INTEL_UPDATER_SRC.sig" "$INTEL_UPDATER_PATH.sig"
+
 if [[ "$BUILD_ONLY" == true ]]; then
   log ""
   log "${BOLD}Build complete (--build-only).${NC} No tag pushed, no release created."
   log "Artifacts staged in: $ARTIFACTS_DIR"
   log "  $ARM_DMG_PATH  (Apple Silicon)"
   log "  $INTEL_DMG_PATH  (Intel)"
+  log "  $ARM_UPDATER_PATH  (signed updater)"
+  log "  $INTEL_UPDATER_PATH  (signed updater)"
   exit 0
 fi
 

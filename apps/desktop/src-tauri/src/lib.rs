@@ -29,6 +29,7 @@ const PDF_VIEW_ZOOM_PREFIX: &str = "pdf-view-zoom-";
 const WORKSPACE_EVENT: &str = "lumora-workspace-command";
 const WORKSPACE_CLOSE_ACTIVE_TAB: &str = "workspace-close-active-tab";
 const HELP_KEYBOARD_SHORTCUTS: &str = "help-keyboard-shortcuts";
+const HELP_CHECK_FOR_UPDATES: &str = "help-check-for-updates";
 const APP_ABOUT: &str = "app-about";
 const APP_FILE_STORAGE_SETTINGS: &str = "app-file-storage-settings";
 const APP_MENDELEY_SYNC: &str = "app-mendeley-sync";
@@ -2144,6 +2145,8 @@ pub fn run() {
                 let _ = app.emit(WORKSPACE_EVENT, "close-active-tab");
             } else if id == HELP_KEYBOARD_SHORTCUTS {
                 let _ = app.emit(WORKSPACE_EVENT, "show-shortcuts-help");
+            } else if id == HELP_CHECK_FOR_UPDATES {
+                let _ = app.emit(WORKSPACE_EVENT, "check-for-updates");
             } else if id == APP_ABOUT {
                 let _ = app.emit(WORKSPACE_EVENT, "show-about");
             } else if id == APP_FILE_STORAGE_SETTINGS {
@@ -2163,6 +2166,8 @@ pub fn run() {
             }
         })
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             ping,
             open_external_url,
@@ -2419,7 +2424,11 @@ fn build_menu<R: Runtime>(app_handle: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         HELP_SUBMENU_ID,
         "Help",
         true,
-        &[&MenuItem::with_id(app_handle, HELP_KEYBOARD_SHORTCUTS, "Keyboard Shortcuts", true, None::<&str>)?],
+        &[
+            &MenuItem::with_id(app_handle, HELP_CHECK_FOR_UPDATES, "Check for Updates…", true, None::<&str>)?,
+            &PredefinedMenuItem::separator(app_handle)?,
+            &MenuItem::with_id(app_handle, HELP_KEYBOARD_SHORTCUTS, "Keyboard Shortcuts", true, None::<&str>)?,
+        ],
     )?;
 
     Menu::with_items(app_handle, &[&app_menu, &files_menu, &edit_menu, &view_menu, &window_menu, &help_menu])
