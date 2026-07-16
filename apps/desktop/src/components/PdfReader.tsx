@@ -19,6 +19,7 @@ import {
   pageOffset,
   type PdfPageRange
 } from "../lib/pdfVirtualization";
+import { isLegacyWebKit } from "../lib/webkitPolyfills";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
 
@@ -99,7 +100,9 @@ const minZoom = 0.5;
 const maxZoom = 3;
 const virtualPageOverscan = 2;
 const zoomCommitDelayMs = 160;
-const maxPdfDevicePixelRatio = 1.5;
+// Legacy WebKit machines trade sharpness and live pinch feedback for render
+// speed; capable environments keep full Retina resolution and instant zoom.
+const maxPdfDevicePixelRatio = isLegacyWebKit ? 1.5 : 2;
 
 function PdfReaderComponent({
   paper,
@@ -709,6 +712,14 @@ function PdfReaderComponent({
   }
 
   function scheduleZoom(nextZoom: number) {
+    if (!isLegacyWebKit) {
+      // zoomRef only syncs post-render; update it now so wheel events landing
+      // before the next render compound from the latest value.
+      zoomRef.current = clamp(nextZoom, minZoom, maxZoom);
+      commitZoom(zoomRef.current, true);
+      return;
+    }
+
     pendingZoomRef.current = clamp(nextZoom, minZoom, maxZoom);
     setHasExplicitZoom(true);
     if (zoomCommitTimerRef.current !== undefined) {

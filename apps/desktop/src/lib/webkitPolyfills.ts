@@ -26,6 +26,16 @@ export function installWebKitPolyfills(
   }
 }
 
+/**
+ * True when this WebKit lacks Promise.withResolvers() natively — the same
+ * older, slower environments (e.g. macOS Ventura x86_64 WKWebView, old
+ * WebKitGTK) that need the polyfill also need the PDF renderer's conservative
+ * performance fallbacks. Must be evaluated before installWebKitPolyfills()
+ * runs below, otherwise the polyfill masks the signal.
+ */
+export const isLegacyWebKit =
+  typeof (Promise as unknown as CompatiblePromiseConstructor).withResolvers !== "function";
+
 export function createPromiseResolvers<T>(): PromiseResolvers<T> {
   let resolve!: PromiseResolvers<T>["resolve"];
   let reject!: PromiseResolvers<T>["reject"];
