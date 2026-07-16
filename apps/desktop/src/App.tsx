@@ -878,13 +878,19 @@ export default function App() {
       }
 
       setFileDataById((current) => {
+        let changed = false;
         const next = { ...current };
         for (const loadedFile of loadedFiles) {
           if (loadedFile?.bytes) {
             next[loadedFile.fileId] = loadedFile.bytes;
+            changed = true;
           }
         }
-        return next;
+        // When every required file is missing from disk, nothing gets added.
+        // Returning a fresh object would keep re-triggering this effect (it
+        // depends on fileDataById) and spin the WebKit process at 100% CPU, so
+        // return the original reference to let React bail out of the update.
+        return changed ? next : current;
       });
     });
 
