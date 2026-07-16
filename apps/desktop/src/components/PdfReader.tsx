@@ -100,6 +100,7 @@ const minZoom = 0.5;
 const maxZoom = 3;
 const virtualPageOverscan = 2;
 const zoomCommitDelayMs = 160;
+const viewStateCommitDelayMs = 200;
 // Legacy WebKit machines trade sharpness and live pinch feedback for render
 // speed; capable environments keep full Retina resolution and instant zoom.
 const maxPdfDevicePixelRatio = isLegacyWebKit ? 1.5 : 2;
@@ -125,6 +126,9 @@ function PdfReaderComponent({
   const gestureStartZoomRef = useRef(1);
   const pendingZoomRef = useRef<number | undefined>(undefined);
   const zoomCommitTimerRef = useRef<number | undefined>(undefined);
+  const pendingViewStateRef = useRef<PdfReaderViewState | undefined>(undefined);
+  const viewStateCommitTimerRef = useRef<number | undefined>(undefined);
+  const onViewStateChangeRef = useRef(onViewStateChange);
   const [numPages, setNumPages] = useState(0);
   const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy>();
   const [pageWidth, setPageWidth] = useState(760);
@@ -227,7 +231,18 @@ function PdfReaderComponent({
     setFindMatches([]);
     setSearchTargets([]);
     searchTargetsRef.current = [];
+    // A pending scroll commit belongs to the previous document; dropping it
+    // stops the old position from being written under the new paper's key.
+    pendingViewStateRef.current = undefined;
+    if (viewStateCommitTimerRef.current !== undefined) {
+      window.clearTimeout(viewStateCommitTimerRef.current);
+      viewStateCommitTimerRef.current = undefined;
+    }
   }, [fileData, paper?.id]);
+
+  useEffect(() => {
+    onViewStateChangeRef.current = onViewStateChange;
+  }, [onViewStateChange]);
 
   useEffect(() => {
     zoomRef.current = zoom;
@@ -263,6 +278,9 @@ function PdfReaderComponent({
     if (zoomCommitTimerRef.current !== undefined) {
       window.clearTimeout(zoomCommitTimerRef.current);
     }
+    // Only the active tab's reader stays mounted, so a tab switch during the
+    // debounce window must still persist the last scroll position.
+    flushPendingViewState();
   }, []);
 
   useEffect(() => {
@@ -690,10 +708,30 @@ function PdfReaderComponent({
       return;
     }
 
-    onViewStateChange?.({
+    // Committing per scroll event re-renders the whole app at scroll frequency;
+    // the position is only needed for restore, so persist it after the scroll
+    // settles. The unmount cleanup flushes mid-debounce tab switches.
+    pendingViewStateRef.current = {
       scrollTop,
       zoom: hasExplicitZoom ? zoom : undefined
-    });
+    };
+    if (viewStateCommitTimerRef.current !== undefined) {
+      window.clearTimeout(viewStateCommitTimerRef.current);
+    }
+    viewStateCommitTimerRef.current = window.setTimeout(flushPendingViewState, viewStateCommitDelayMs);
+  }
+
+  function flushPendingViewState() {
+    if (viewStateCommitTimerRef.current !== undefined) {
+      window.clearTimeout(viewStateCommitTimerRef.current);
+      viewStateCommitTimerRef.current = undefined;
+    }
+
+    const pending = pendingViewStateRef.current;
+    if (pending) {
+      pendingViewStateRef.current = undefined;
+      onViewStateChangeRef.current?.(pending);
+    }
   }
 
   function updatePageRange(scrollTop: number) {
@@ -995,13 +1033,15 @@ function PdfReaderComponent({
 export const PdfReader = memo(PdfReaderComponent, arePdfReaderPropsEqual);
 
 function arePdfReaderPropsEqual(previous: PdfReaderProps, next: PdfReaderProps) {
+  // viewState is deliberately not compared: the reader only reads it when a
+  // document mounts or resets, and its updates originate from this component's
+  // own scroll persistence — re-rendering on them would run the whole reader
+  // once per debounced scroll commit for no visible change.
   return previous.paper?.id === next.paper?.id
     && previous.paper?.title === next.paper?.title
     && previous.fileAsset?.id === next.fileAsset?.id
     && previous.fileData === next.fileData
     && previous.active === next.active
-    && previous.viewState?.scrollTop === next.viewState?.scrollTop
-    && previous.viewState?.zoom === next.viewState?.zoom
     && previous.pdfSearchQuery === next.pdfSearchQuery
     && annotationsEqual(previous.annotations, next.annotations);
 }
@@ -1039,6 +1079,15 @@ function AnnotationOverlay({
   onOpenAnnotationMenu: (annotation: Annotation, event: React.MouseEvent) => void;
 }) {
   const [openNoteId, setOpenNoteId] = useState<string>();
+  // Visual position of the marker being dragged. Kept local so a drag never
+  // touches the library state (whose every update re-renders the app and
+  // enqueues a whole-library diff + SQLite write); the move is committed once
+  // on pointer release.
+  const [dragPosition, setDragPosition] = useState<{
+    annotationId: string;
+    x: number;
+    y: number;
+  }>();
   const markerDragRef = useRef<{
     annotation: Annotation;
     pointerId: number;
@@ -1049,11 +1098,24 @@ function AnnotationOverlay({
     pageWidth: number;
     pageHeight: number;
     dragging: boolean;
+    lastPosition?: NonNullable<Annotation["notePosition"]>;
   } | undefined>(undefined);
   const suppressClickRef = useRef<string | undefined>(undefined);
   const notePopoverRef = useRef<HTMLElement>(null);
   const openNote = annotations.find((annotation) => annotation.id === openNoteId && annotation.kind === "note");
-  const openNotePosition = openNote ? getNoteMarkerPosition(openNote) : undefined;
+  const openNotePosition = openNote
+    ? dragPosition?.annotationId === openNote.id ? dragPosition : getNoteMarkerPosition(openNote)
+    : undefined;
+
+  // The commit round-trips through the app state; keep showing the local drag
+  // position until the updated annotation arrives so the marker never snaps
+  // back to its pre-drag spot for a frame.
+  useEffect(() => {
+    if (dragPosition && !markerDragRef.current) {
+      setDragPosition(undefined);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [annotations]);
 
   useEffect(() => {
     if (!openNote) return;
@@ -1107,10 +1169,12 @@ function AnnotationOverlay({
 
     drag.dragging = true;
     event.preventDefault();
-    onMoveAnnotation(drag.annotation, {
-      x: drag.startMarkerX + (event.clientX - drag.startX) / drag.pageWidth,
-      y: drag.startMarkerY + (event.clientY - drag.startY) / drag.pageHeight
-    });
+    const position = {
+      x: clamp01(drag.startMarkerX + (event.clientX - drag.startX) / drag.pageWidth),
+      y: clamp01(drag.startMarkerY + (event.clientY - drag.startY) / drag.pageHeight)
+    };
+    drag.lastPosition = position;
+    setDragPosition({ annotationId: drag.annotation.id, ...position });
   }
 
   function handleMarkerPointerUp(event: React.PointerEvent<HTMLButtonElement>) {
@@ -1126,6 +1190,9 @@ function AnnotationOverlay({
     if (drag.dragging) {
       suppressClickRef.current = drag.annotation.id;
       event.preventDefault();
+      if (drag.lastPosition) {
+        onMoveAnnotation(drag.annotation, drag.lastPosition);
+      }
       setOpenNoteId(drag.annotation.id);
     }
 
@@ -1151,7 +1218,9 @@ function AnnotationOverlay({
         ))
       )}
       {annotations.filter((annotation) => annotation.kind === "note").map((annotation) => {
-        const markerPosition = getNoteMarkerPosition(annotation);
+        const markerPosition = dragPosition?.annotationId === annotation.id
+          ? dragPosition
+          : getNoteMarkerPosition(annotation);
         if (!markerPosition) {
           return null;
         }
