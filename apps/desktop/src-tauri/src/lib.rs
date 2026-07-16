@@ -214,80 +214,28 @@ fn open_url_with_system(url: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn open_file_with_system(file_path: String) -> Result<(), String> {
-    let path = std::path::Path::new(&file_path);
-    if !path.exists() {
-        return Err(format!("File not found: {file_path}"));
-    }
-    open_path_with_system(&file_path)
+fn open_file_with_system(dir: String, file_name: String) -> Result<(), String> {
+    let path = resolve_stored_file_path(&dir, &file_name)?;
+    tauri_plugin_opener::open_path(&path, None::<&str>)
+        .map_err(|error| format!("Failed to open {}: {error}", path.display()))
 }
 
 #[tauri::command]
-fn reveal_file_in_folder(file_path: String) -> Result<(), String> {
-    let path = std::path::Path::new(&file_path);
-    if !path.exists() {
-        return Err(format!("File not found: {file_path}"));
+fn reveal_file_in_folder(dir: String, file_name: String) -> Result<(), String> {
+    let path = resolve_stored_file_path(&dir, &file_name)?;
+    tauri_plugin_opener::reveal_item_in_dir(&path)
+        .map_err(|error| format!("Failed to reveal {}: {error}", path.display()))
+}
+
+fn resolve_stored_file_path(dir: &str, file_name: &str) -> Result<std::path::PathBuf, String> {
+    validate_stored_file_name(file_name)?;
+    let path = std::path::Path::new(dir).join(file_name);
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| format!("File not found or unreadable ({}): {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("Not a file: {}", path.display()));
     }
-    reveal_in_folder(&file_path)
-}
-
-#[cfg(target_os = "macos")]
-fn open_path_with_system(path: &str) -> Result<(), String> {
-    std::process::Command::new("open")
-        .arg(path)
-        .spawn()
-        .map_err(|error| format!("Failed to open file: {error}"))?;
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn open_path_with_system(path: &str) -> Result<(), String> {
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", path])
-        .spawn()
-        .map_err(|error| format!("Failed to open file: {error}"))?;
-    Ok(())
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn open_path_with_system(path: &str) -> Result<(), String> {
-    std::process::Command::new("xdg-open")
-        .arg(path)
-        .spawn()
-        .map_err(|error| format!("Failed to open file: {error}"))?;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn reveal_in_folder(path: &str) -> Result<(), String> {
-    std::process::Command::new("open")
-        .args(["-R", path])
-        .spawn()
-        .map_err(|error| format!("Failed to reveal file: {error}"))?;
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn reveal_in_folder(path: &str) -> Result<(), String> {
-    std::process::Command::new("explorer")
-        .args(["/select,", path])
-        .spawn()
-        .map_err(|error| format!("Failed to reveal file: {error}"))?;
-    Ok(())
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn reveal_in_folder(path: &str) -> Result<(), String> {
-    // xdg-open the parent directory as a fallback (no universal "select file" on Linux)
-    let parent = std::path::Path::new(path)
-        .parent()
-        .and_then(|p| p.to_str())
-        .unwrap_or(path);
-    std::process::Command::new("xdg-open")
-        .arg(parent)
-        .spawn()
-        .map_err(|error| format!("Failed to open folder: {error}"))?;
-    Ok(())
+    Ok(path)
 }
 
 #[tauri::command]
@@ -2772,9 +2720,29 @@ mod tests {
     use super::{
         build_fts_column_query, cjk_segment, classify_linux_graphics_capability,
         configure_library_connection, ensure_search_index, index_paper_body, init_library_schema,
-        normalize_arxiv_id, search_library_rows, sync_search_index_for_change,
-        validate_proxy_settings, ProxySettings, SEARCH_RESULT_LIMIT,
+        normalize_arxiv_id, resolve_stored_file_path, search_library_rows,
+        sync_search_index_for_change, validate_proxy_settings, ProxySettings, SEARCH_RESULT_LIMIT,
     };
+
+    #[test]
+    fn resolves_an_existing_stored_file_and_rejects_path_traversal() {
+        let directory = std::env::temp_dir().join(format!(
+            "lumora-file-action-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let file_path = directory.join("paper.pdf");
+        std::fs::write(&file_path, b"%PDF-1.4").unwrap();
+
+        assert_eq!(
+            resolve_stored_file_path(directory.to_str().unwrap(), "paper.pdf").unwrap(),
+            file_path
+        );
+        assert!(resolve_stored_file_path(directory.to_str().unwrap(), "../paper.pdf").is_err());
+        assert!(resolve_stored_file_path(directory.to_str().unwrap(), "missing.pdf").is_err());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn classifies_linux_graphics_without_initializing_webgl() {

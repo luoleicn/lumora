@@ -98,6 +98,7 @@ function DetailsTab({
   const [arxivDownloadProgress, setArxivDownloadProgress] = useState<ArxivDownloadProgress>();
   const [pdfMetadataStatus, setPdfMetadataStatus] = useState<string>();
   const [pdfMetadataBusy, setPdfMetadataBusy] = useState(false);
+  const [fileActionStatus, setFileActionStatus] = useState<string>();
   const [fileContextMenu, setFileContextMenu] = useState<{ x: number; y: number } | undefined>(undefined);
   const [fileContextMenuStyle, setFileContextMenuStyle] = useState<{ left: number; top: number } | undefined>(undefined);
   const fileContextMenuRef = useRef<HTMLDivElement>(null);
@@ -135,31 +136,34 @@ function DetailsTab({
     setFileContextMenu({ x: event.clientX, y: event.clientY });
   }
 
-  function getAbsolutePath(): string | undefined {
-    if (!fileAsset?.localPath || !fileStorageSettings.directory) return undefined;
-    return `${fileStorageSettings.directory}/${fileAsset.localPath}`;
-  }
-
   async function handleOpenFileExternally() {
-    const absPath = getAbsolutePath();
-    if (!absPath) return;
+    if (!fileAsset?.localPath || !fileStorageSettings.directory) return;
+    setFileContextMenu(undefined);
+    setFileActionStatus(undefined);
     try {
-      await invoke("open_file_with_system", { filePath: absPath });
+      await invoke("open_file_with_system", {
+        dir: fileStorageSettings.directory,
+        fileName: fileAsset.localPath
+      });
     } catch (error) {
       console.error("Failed to open file:", error);
+      setFileActionStatus(`Could not open the file: ${String(error)}`);
     }
-    setFileContextMenu(undefined);
   }
 
   async function handleRevealFileInFolder() {
-    const absPath = getAbsolutePath();
-    if (!absPath) return;
+    if (!fileAsset?.localPath || !fileStorageSettings.directory) return;
+    setFileContextMenu(undefined);
+    setFileActionStatus(undefined);
     try {
-      await invoke("reveal_file_in_folder", { filePath: absPath });
+      await invoke("reveal_file_in_folder", {
+        dir: fileStorageSettings.directory,
+        fileName: fileAsset.localPath
+      });
     } catch (error) {
       console.error("Failed to reveal file:", error);
+      setFileActionStatus(`Could not show the file in its folder: ${String(error)}`);
     }
-    setFileContextMenu(undefined);
   }
 
   if (!paper) {
@@ -388,12 +392,13 @@ function DetailsTab({
         </label>
       </div>
       <p
-        className={`details-file ${fileAsset?.localPath ? "has-local-file" : ""}`}
-        onContextMenu={fileAsset?.localPath ? handleFileContextMenu : undefined}
-        title={fileAsset?.localPath ? "Right-click for options" : undefined}
+        className={`details-file ${fileAsset?.localPath && fileStorageSettings.directory ? "has-local-file" : ""}`}
+        onContextMenu={fileAsset?.localPath && fileStorageSettings.directory ? handleFileContextMenu : undefined}
+        title={fileAsset?.localPath && fileStorageSettings.directory ? "Right-click for options" : undefined}
       >
         File: {fileAsset?.fileName ?? "No file attached"}
       </p>
+      {fileActionStatus && <p className="metadata-lookup-status" role="alert">{fileActionStatus}</p>}
 
       {fileContextMenu && (
         <div
