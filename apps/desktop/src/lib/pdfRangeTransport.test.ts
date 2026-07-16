@@ -8,6 +8,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 import {
   createLocalPdfRangeTransport,
+  localPdfRangeChunkSize,
   readStoredPdfRange,
   type PdfDataRangeTransportConstructor
 } from "./pdfRangeTransport";
@@ -36,6 +37,10 @@ class FakePdfDataRangeTransport {
 const FakeTransport = FakePdfDataRangeTransport as unknown as PdfDataRangeTransportConstructor;
 
 describe("local PDF range transport", () => {
+  it("uses 1 MiB chunks to reduce native IPC round trips", () => {
+    expect(localPdfRangeChunkSize).toBe(1024 * 1024);
+  });
+
   it("reads only the byte range requested by PDF.js", async () => {
     const readRange = vi.fn().mockResolvedValue(new Uint8Array([4, 5, 6]));
     const onError = vi.fn();

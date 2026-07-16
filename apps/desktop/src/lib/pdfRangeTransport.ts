@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { PDFDataRangeTransport } from "pdfjs-dist";
 
-export const localPdfRangeChunkSize = 256 * 1024;
+export const localPdfRangeChunkSize = 1024 * 1024;
 
 export type LocalPdfRangeSource = {
   directory: string;
