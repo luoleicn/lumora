@@ -1,6 +1,7 @@
 import { FileCheck2, FileDown, FilePlus2, FileQuestion, FileText, FolderMinus, RotateCcw, Star, Trash2 } from "lucide-react";
 import type { FileAsset, LibraryState, Paper } from "@lumora/shared";
 import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { resolveVirtualListRange } from "../lib/listVirtualization";
 import { collapseCjkSpaces, splitSnippet, type PaperSearchMeta, type SearchMatchedField } from "../lib/searchIndex";
 
 const matchedFieldLabels: Record<SearchMatchedField, string> = {
@@ -46,6 +47,9 @@ type PaperContextMenu = {
 };
 
 const columnWidthsKey = "lumora:documents-column-widths";
+const paperRowHeight = 34;
+const paperTableHeaderHeight = 29;
+const paperRowOverscan = 12;
 
 const paperColumns: PaperColumn[] = [
   { key: "favorite", label: "Favorite", defaultWidth: 32, minWidth: 28, maxWidth: 72 },
@@ -102,6 +106,8 @@ export function PaperList({
   const [contextMenu, setContextMenu] = useState<PaperContextMenu>();
   const columnResizeRef = useRef<ColumnResizeDrag | undefined>(undefined);
   const internalPaperDragRef = useRef<InternalPaperDrag | undefined>(undefined);
+  const tableWrapRef = useRef<HTMLDivElement>(null);
+  const [tableViewport, setTableViewport] = useState({ scrollTop: 0, height: 700 });
   // Search results arrive relevance-ordered; keep that order until the user
   // explicitly clicks a column header, and reset once the search ends.
   const relevanceOrdered = Boolean(searchMeta) && !searchSortOverride;
@@ -119,6 +125,33 @@ export function PaperList({
     () => paperColumns.reduce((total, column) => total + columnWidths[column.key], 0),
     [columnWidths]
   );
+  const virtualRange = useMemo(() => resolveVirtualListRange(
+    sortedPapers.length,
+    tableViewport.scrollTop,
+    tableViewport.height,
+    {
+      itemHeight: paperRowHeight,
+      leadingHeight: paperTableHeaderHeight,
+      overscanItems: paperRowOverscan
+    }
+  ), [sortedPapers.length, tableViewport]);
+  const visiblePapers = sortedPapers.slice(virtualRange.start, virtualRange.end);
+
+  useEffect(() => {
+    const element = tableWrapRef.current;
+    if (!element) {
+      return;
+    }
+
+    const updateHeight = () => {
+      const height = element.clientHeight;
+      setTableViewport((current) => current.height === height ? current : { ...current, height });
+    };
+    updateHeight();
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     localStorage.setItem(columnWidthsKey, JSON.stringify(columnWidths));
@@ -299,7 +332,14 @@ export function PaperList({
         <span>{papers.length} shown</span>
       </header>
 
-      <div className={resizingColumn ? "paper-table-wrap resizing-columns" : "paper-table-wrap"}>
+      <div
+        ref={tableWrapRef}
+        className={resizingColumn ? "paper-table-wrap resizing-columns" : "paper-table-wrap"}
+        onScroll={(event) => {
+          const scrollTop = event.currentTarget.scrollTop;
+          setTableViewport((current) => current.scrollTop === scrollTop ? current : { ...current, scrollTop });
+        }}
+      >
         {sortedPapers.length === 0 ? (
           <div className="empty-list">
             <FileText size={24} />
@@ -331,7 +371,12 @@ export function PaperList({
               </tr>
             </thead>
             <tbody>
-              {sortedPapers.map((paper) => {
+              {virtualRange.paddingBefore > 0 && (
+                <tr className="paper-table-spacer" aria-hidden>
+                  <td colSpan={paperColumns.length} style={{ height: virtualRange.paddingBefore }} />
+                </tr>
+              )}
+              {visiblePapers.map((paper) => {
                 const isPaperPdf = (file: FileAsset) =>
                   file.paperId === paper.id
                   && !file.deletedAt
@@ -362,6 +407,11 @@ export function PaperList({
                   />
                 );
               })}
+              {virtualRange.paddingAfter > 0 && (
+                <tr className="paper-table-spacer" aria-hidden>
+                  <td colSpan={paperColumns.length} style={{ height: virtualRange.paddingAfter }} />
+                </tr>
+              )}
             </tbody>
           </table>
         )}

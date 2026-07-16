@@ -106,6 +106,7 @@ import {
   type MendeleySettings
 } from "./lib/mendeleyClient";
 import { AppUpdater, initialAppUpdateState, type AppUpdateState } from "./lib/appUpdater";
+import { isLinuxNativePdfPlatform } from "./lib/nativePdfRenderer";
 
 const workspaceLayoutKey = "lumora:workspace-layout";
 const collapseThreshold = 82;
@@ -153,6 +154,7 @@ type WorkspaceTab =
   | { id: string; kind: "paper"; paperId: string; title: string };
 
 const documentsTab: WorkspaceTab = { id: "documents", kind: "documents", title: "Documents" };
+const useNativePdfFilePaths = isLinuxNativePdfPlatform();
 
 function isPdfFile(fileAsset: FileAsset) {
   return fileAsset.mime === "application/pdf" || /\.pdf$/i.test(fileAsset.fileName);
@@ -787,7 +789,8 @@ export default function App() {
       fileAsset.paperId === selectedPaper.id
       && !fileAsset.deletedAt
       && isLocalPdfFile(fileAsset)
-      && Boolean(fileDataById[fileAsset.id]?.length)
+      && (Boolean(fileDataById[fileAsset.id]?.length)
+        || Boolean(useNativePdfFilePaths && fileStorageSettings.directory && fileAsset.localPath))
     )
     : false;
   const activeWorkspaceTab = workspaceTabs.find((tab) => tab.id === activeWorkspaceTabId) ?? documentsTab;
@@ -805,27 +808,35 @@ export default function App() {
   }, [activeWorkspaceTabId]);
 
   const openPaperFileIds = useMemo(() => {
-    const fileIds: string[] = [];
-    if (activeWorkspaceTab.kind === "paper") {
-      const paper = library.papers.find((item) => item.id === activeWorkspaceTab.paperId && !item.deletedAt);
+    const fileIds = workspaceTabs.flatMap((tab) => {
+      if (tab.kind !== "paper") {
+        return [];
+      }
+
+      const paper = library.papers.find((item) => item.id === tab.paperId && !item.deletedAt);
+      if (!paper) {
+        return [];
+      }
       // Prefer a fileAsset that is actually on disk or marked local, then fall
       // back to any non-deleted file for the paper. Without this a Mendeley
       // "remote" entry would shadow a local PDF that lives in the storage folder.
       const fileAsset =
-        paper
-          ? library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt && isLocalPdfFile(item))
-            ?? library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt && isPdfFile(item))
-          : undefined;
-      if (fileAsset) {
-        fileIds.push(fileAsset.id);
-      }
-    }
+        library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt && isLocalPdfFile(item))
+        ?? library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt && isPdfFile(item));
+      const opensNatively = useNativePdfFilePaths
+        && Boolean(fileStorageSettings.directory)
+        && Boolean(fileAsset?.localPath);
+      return fileAsset && !opensNatively ? [fileAsset.id] : [];
+    });
 
     // The Details panel (Extract PDF, metadata preview) needs bytes for the
     // selected paper even when its reader tab isn't open.
     const selectedFileIds = selectedPaperId
       ? library.fileAssets
-        .filter((item) => item.paperId === selectedPaperId && !item.deletedAt && isPdfFile(item))
+        .filter((item) => item.paperId === selectedPaperId
+          && !item.deletedAt
+          && isPdfFile(item)
+          && !(useNativePdfFilePaths && fileStorageSettings.directory && item.localPath))
         .map((item) => item.id)
       : [];
     for (const selectedFileId of selectedFileIds) {
@@ -835,11 +846,12 @@ export default function App() {
     }
 
     return fileIds;
-  }, [activeWorkspaceTab, library.fileAssets, library.papers, selectedPaperId]);
+  }, [fileStorageSettings.directory, library.fileAssets, library.papers, selectedPaperId, workspaceTabs]);
 
   // PDF bytes are large and each retained Uint8Array prevents the corresponding
-  // document from being reclaimed. Keep only files needed by the active reader
-  // and Details panel; switching tabs will reload bytes from disk on demand.
+  // document from being reclaimed. Keep the files owned by open tabs warm so a
+  // tab switch never rebuilds its PDF.js document, while closing a tab still
+  // releases bytes that are no longer needed by the Details panel.
   useEffect(() => {
     const requiredFileIds = new Set(openPaperFileIds);
     setFileDataById((current) => {
@@ -1943,39 +1955,51 @@ export default function App() {
               onSelectTab={handleActivateWorkspaceTab}
               onCloseTab={handleCloseWorkspaceTab}
             >
-              <div
-                key={activeWorkspaceTab.id}
-                className="workspace-tab-pane active"
-                role="tabpanel"
-              >
-                <WorkspaceTabContent
-                  active
-                  tab={activeWorkspaceTab}
-                  library={library}
-                  filteredPapers={displayedPapers}
-                  searchMeta={searchMetaByPaperId}
-                  selectedPaperId={selectedPaperId}
-                  selectedCollectionId={selectedCollectionId}
-                  fileDataById={fileDataById}
-                  pdfViewStates={pdfViewStates}
-                  pdfSearchQuery={searchMode === "pdf" ? pdfSearchQuery : undefined}
-                  onPdfSearchUpdate={setPdfSearchState}
-                  onSelectPaper={handleSelectPaper}
-                  onOpenPaper={handleOpenPaperTab}
-                  onUpdatePaper={handleUpdatePaper}
-                  onPaperDragStart={handlePaperDragStart}
-                  onPaperDragMove={handlePaperDragMove}
-                  onPaperDragEnd={handlePaperDragEnd}
-                  onRemovePaperFromCollection={handleRemovePaperFromSelectedCollection}
-                  onDeletePaper={handleDeletePaper}
-                  onRestorePaper={handleRestorePaper}
-                  onPermanentlyDeletePaper={(paperId) => void handlePermanentlyDeletePaper(paperId)}
-                  onBindLocalPdf={handleRequestBindLocalPdf}
-                  onUpdatePdfViewState={handleUpdatePdfViewState}
-                  onCreateAnnotation={handleCreateAnnotation}
-                  onDeleteAnnotation={handleDeleteAnnotation}
-                />
-              </div>
+              {workspaceTabs
+                // Paper tabs stay warm to preserve their renderer session and
+                // visible page cache. Non-paper views are cheap to recreate and
+                // would otherwise keep a large hidden document list rendering.
+                .filter((tab) => tab.kind === "paper" || tab.id === activeWorkspaceTabId)
+                .map((tab) => {
+                  const tabActive = tab.id === activeWorkspaceTabId;
+                  return (
+                    <div
+                      key={tab.id}
+                      className={tabActive ? "workspace-tab-pane active" : "workspace-tab-pane"}
+                      aria-hidden={!tabActive}
+                      role="tabpanel"
+                    >
+                      <WorkspaceTabContent
+                        active={tabActive}
+                        tab={tab}
+                        library={library}
+                        filteredPapers={displayedPapers}
+                        searchMeta={searchMetaByPaperId}
+                        selectedPaperId={selectedPaperId}
+                        selectedCollectionId={selectedCollectionId}
+                        fileDataById={fileDataById}
+                        fileStorageDirectory={fileStorageSettings.directory}
+                        pdfViewStates={pdfViewStates}
+                        pdfSearchQuery={tabActive && tab.kind === "paper" ? pdfSearchQuery : undefined}
+                        onPdfSearchUpdate={tabActive ? setPdfSearchState : undefined}
+                        onSelectPaper={handleSelectPaper}
+                        onOpenPaper={handleOpenPaperTab}
+                        onUpdatePaper={handleUpdatePaper}
+                        onPaperDragStart={handlePaperDragStart}
+                        onPaperDragMove={handlePaperDragMove}
+                        onPaperDragEnd={handlePaperDragEnd}
+                        onRemovePaperFromCollection={handleRemovePaperFromSelectedCollection}
+                        onDeletePaper={handleDeletePaper}
+                        onRestorePaper={handleRestorePaper}
+                        onPermanentlyDeletePaper={(paperId) => void handlePermanentlyDeletePaper(paperId)}
+                        onBindLocalPdf={handleRequestBindLocalPdf}
+                        onUpdatePdfViewState={handleUpdatePdfViewState}
+                        onCreateAnnotation={handleCreateAnnotation}
+                        onDeleteAnnotation={handleDeleteAnnotation}
+                      />
+                    </div>
+                  );
+                })}
             </WorkspaceTabs>
           )}
 
@@ -2255,6 +2279,7 @@ function WorkspaceTabContent({
   selectedPaperId,
   selectedCollectionId,
   fileDataById,
+  fileStorageDirectory,
   pdfViewStates,
   pdfSearchQuery,
   onPdfSearchUpdate,
@@ -2281,6 +2306,7 @@ function WorkspaceTabContent({
   selectedPaperId?: string;
   selectedCollectionId: string;
   fileDataById: Record<string, Uint8Array>;
+  fileStorageDirectory?: string;
   pdfViewStates: Record<string, PdfReaderViewState>;
   pdfSearchQuery?: string;
   onPdfSearchUpdate?: (state: { totalMatches: number; activeMatchIndex: number }) => void;
@@ -2334,7 +2360,8 @@ function WorkspaceTabContent({
 
   const paper = library.papers.find((item) => item.id === tab.paperId && !item.deletedAt);
   const fileAsset = paper
-    ? library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt)
+    ? library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt && isLocalPdfFile(item))
+      ?? library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt && isPdfFile(item))
     : undefined;
   const fileData = fileAsset ? fileDataById[fileAsset.id] : undefined;
   const annotations = paper
@@ -2346,6 +2373,7 @@ function WorkspaceTabContent({
       paper={paper}
       fileAsset={fileAsset}
       fileData={fileData}
+      fileStorageDirectory={fileStorageDirectory}
       annotations={annotations}
       active={active}
       viewState={pdfViewStates[tab.paperId]}

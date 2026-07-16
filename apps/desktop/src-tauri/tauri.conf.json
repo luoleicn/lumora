@@ -49,9 +49,16 @@
     "linux": {
       "deb": {
         "depends": [
-          "libsecret-1-0"
+          "libsecret-1-0",
+          "poppler-utils"
         ],
         "desktopTemplate": "linux/lumora.desktop"
+      },
+      "rpm": {
+        "depends": [
+          "libsecret",
+          "poppler-utils"
+        ]
       }
     }
   }

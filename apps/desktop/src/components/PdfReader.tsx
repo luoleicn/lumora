@@ -6,7 +6,16 @@ import type { PDFDocumentProxy } from "pdfjs-dist";
 import { Languages, MessageSquare, StickyNote, Trash2, X } from "lucide-react";
 import type { Annotation, FileAsset, Paper } from "@lumora/shared";
 import { clamp01, mergeNearbyRects, normalizeRect } from "@lumora/shared";
+import { NativePdfPage } from "./NativePdfPage";
+import { NativePdfTextLayer } from "./NativePdfTextLayer";
 import { createId } from "../lib/id";
+import {
+  openNativePdfDocument,
+  openNativePdfPath,
+  findInNativePdfText,
+  shouldUseNativePdfRenderer,
+  type NativePdfDocumentInfo
+} from "../lib/nativePdfRenderer";
 import {
   findInPageTextLayer,
   findInPdfText,
@@ -15,10 +24,17 @@ import {
 } from "../lib/pdfSearch";
 import {
   buildPdfPageMetrics,
+  defaultPdfPageAspectRatio,
   findPdfPageRange,
   pageOffset,
   type PdfPageRange
 } from "../lib/pdfVirtualization";
+import {
+  detectPdfRenderPolicy,
+  detectPdfRenderPolicyWithGraphics,
+  resolvePdfDevicePixelRatio,
+  type PdfRenderPolicy
+} from "../lib/pdfRenderPolicy";
 import { isLegacyWebKit } from "../lib/webkitPolyfills";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
@@ -75,6 +91,7 @@ type PdfReaderProps = {
   paper?: Paper;
   fileAsset?: FileAsset;
   fileData?: Uint8Array;
+  fileStorageDirectory?: string;
   annotations: Annotation[];
   active?: boolean;
   viewState?: PdfReaderViewState;
@@ -89,6 +106,11 @@ type WebKitGestureEvent = Event & {
   scale: number;
 };
 
+type NativePdfRendererState =
+  | { status: "disabled" | "loading" }
+  | { status: "unavailable"; error: string }
+  | { status: "ready"; document: NativePdfDocumentInfo };
+
 export type PdfReaderViewState = {
   scrollTop: number;
   zoom?: number;
@@ -98,17 +120,20 @@ const colors = ["#ffe45c", "#8ee6a8", "#82cfff", "#ffadad"];
 const pdfViewEvent = "lumora-pdf-view-command";
 const minZoom = 0.5;
 const maxZoom = 3;
-const virtualPageOverscan = 2;
 const zoomCommitDelayMs = 160;
 const viewStateCommitDelayMs = 200;
-// Legacy WebKit machines trade sharpness and live pinch feedback for render
-// speed; capable environments keep full Retina resolution and instant zoom.
-const maxPdfDevicePixelRatio = isLegacyWebKit ? 1.5 : 2;
+const initialPageRange: PdfPageRange = { start: 0, end: 0 };
+let activePdfRenderPolicy = detectPdfRenderPolicy(isLegacyWebKit);
+const pdfRenderPolicyReady = detectPdfRenderPolicyWithGraphics(isLegacyWebKit).then((policy) => {
+  activePdfRenderPolicy = policy;
+  return policy;
+});
 
 function PdfReaderComponent({
   paper,
   fileAsset,
   fileData,
+  fileStorageDirectory,
   annotations,
   active = true,
   viewState,
@@ -129,12 +154,21 @@ function PdfReaderComponent({
   const pendingViewStateRef = useRef<PdfReaderViewState | undefined>(undefined);
   const viewStateCommitTimerRef = useRef<number | undefined>(undefined);
   const onViewStateChangeRef = useRef(onViewStateChange);
+  const [pdfRenderPolicy, setPdfRenderPolicy] = useState<PdfRenderPolicy>(() => activePdfRenderPolicy);
+  const nativePdfEnabled = shouldUseNativePdfRenderer(pdfRenderPolicy);
+  const nativePdfFileName = fileAsset?.localPath;
+  const hasNativePdfPath = nativePdfEnabled && Boolean(fileStorageDirectory && nativePdfFileName);
+  const [nativeRenderer, setNativeRenderer] = useState<NativePdfRendererState>(() => (
+    nativePdfEnabled ? { status: "loading" } : { status: "disabled" }
+  ));
+  const useNativePageRenderer = nativePdfEnabled;
+  const nativePdfSessionId = nativeRenderer.status === "ready" ? nativeRenderer.document.sessionId : undefined;
   const [numPages, setNumPages] = useState(0);
   const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy>();
   const [pageWidth, setPageWidth] = useState(760);
   const [viewportHeight, setViewportHeight] = useState(700);
   const [pageAspectRatios, setPageAspectRatios] = useState<Record<number, number>>({});
-  const [pageRange, setPageRange] = useState<PdfPageRange>({ start: 0, end: 4 });
+  const [pageRange, setPageRange] = useState<PdfPageRange>(initialPageRange);
   const [zoom, setZoom] = useState(viewState?.zoom ?? 1);
   const zoomRef = useRef(zoom);
   const [hasExplicitZoom, setHasExplicitZoom] = useState(viewState?.zoom !== undefined);
@@ -147,7 +181,10 @@ function PdfReaderComponent({
   const [searchTargets, setSearchTargets] = useState<PdfSearchTarget[]>([]);
   const [activeMatchIndex, setActiveMatchIndex] = useState(-1);
   const searchTargetsRef = useRef<PdfSearchTarget[]>([]);
-  const documentFile = useMemo(() => (fileData ? { data: fileData.slice() } : undefined), [fileData]);
+  const documentFile = useMemo(
+    () => (!useNativePageRenderer && fileData ? { data: fileData.slice() } : undefined),
+    [fileData, useNativePageRenderer]
+  );
   const renderedPageWidth = pageWidth * zoom;
   const pageMetrics = useMemo(
     () => buildPdfPageMetrics(numPages, renderedPageWidth, pageAspectRatios),
@@ -170,6 +207,51 @@ function PdfReaderComponent({
     [annotations, fileAsset?.sha256]
   );
 
+  useEffect(() => {
+    let cancelled = false;
+    void pdfRenderPolicyReady.then((policy) => {
+      if (!cancelled) {
+        setPdfRenderPolicy(policy);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!nativePdfEnabled || (!hasNativePdfPath && !fileData)) {
+      setNativeRenderer({ status: "disabled" });
+      return;
+    }
+
+    let cancelled = false;
+    setNativeRenderer({ status: "loading" });
+    const openDocument = hasNativePdfPath
+      ? openNativePdfPath(fileStorageDirectory!, nativePdfFileName!)
+      : openNativePdfDocument(fileData!);
+    void openDocument.then((document) => {
+      if (cancelled) {
+        return;
+      }
+      setNativeRenderer({ status: "ready", document });
+      setNumPages(document.pages.length);
+      setPageAspectRatios(Object.fromEntries(document.pages.map((page, index) => [
+        index,
+        page.height / page.width
+      ])));
+    }).catch((error) => {
+      if (!cancelled) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn("Native PDF renderer unavailable.", error);
+        setNativeRenderer({ status: "unavailable", error: message });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [fileData, fileStorageDirectory, hasNativePdfPath, nativePdfEnabled, nativePdfFileName, paper?.id]);
+
   useLayoutEffect(() => {
     const element = scrollRef.current;
     if (!element) {
@@ -185,7 +267,7 @@ function PdfReaderComponent({
     const observer = new ResizeObserver(resize);
     observer.observe(element);
     return () => observer.disconnect();
-  }, [fileData, paper?.id]);
+  }, [fileData, nativePdfFileName, paper?.id]);
 
   useEffect(() => {
     if (!active) {
@@ -220,7 +302,7 @@ function PdfReaderComponent({
     setNumPages(0);
     setPdfDocument(undefined);
     setPageAspectRatios({});
-    setPageRange({ start: 0, end: 4 });
+    setPageRange(initialPageRange);
     setLoadError(undefined);
     setPageJumpOpen(false);
     setPageJumpValue("");
@@ -272,14 +354,14 @@ function PdfReaderComponent({
 
   useLayoutEffect(() => {
     updatePageRange(scrollRef.current?.scrollTop ?? viewState?.scrollTop ?? 0);
-  }, [pageMetrics, viewportHeight]);
+  }, [pageMetrics, pdfRenderPolicy.overscanPages, viewportHeight]);
 
   useEffect(() => () => {
     if (zoomCommitTimerRef.current !== undefined) {
       window.clearTimeout(zoomCommitTimerRef.current);
     }
-    // Only the active tab's reader stays mounted, so a tab switch during the
-    // debounce window must still persist the last scroll position.
+    // A closed tab can unmount during the debounce window; persist its last
+    // scroll position before releasing the warm PDF reader.
     flushPendingViewState();
   }, []);
 
@@ -404,7 +486,7 @@ function PdfReaderComponent({
       element.removeEventListener("gestureend", handleGestureEnd);
       element.removeEventListener("wheel", handleWheelZoom);
     };
-  }, [active]);
+  }, [active, pdfRenderPolicy.debounceZoom]);
 
   useEffect(() => {
     if (!active) {
@@ -464,7 +546,7 @@ function PdfReaderComponent({
   // DOM ranges are only measured for the small set of pages currently mounted.
   useEffect(() => {
     const query = pdfSearchQuery?.trim();
-    if (!query || !active || !pdfDocument) {
+    if (!query || !active || (!pdfDocument && !nativePdfSessionId)) {
       setFindMatches([]);
       setSearchTargets([]);
       setActiveMatchIndex(-1);
@@ -474,7 +556,10 @@ function PdfReaderComponent({
     }
 
     let cancelled = false;
-    void findInPdfText(pdfDocument, query, () => cancelled).then((targets) => {
+    const search = nativePdfSessionId
+      ? findInNativePdfText(nativePdfSessionId, query)
+      : findInPdfText(pdfDocument!, query, () => cancelled);
+    void search.then((targets) => {
       if (cancelled) {
         return;
       }
@@ -502,7 +587,7 @@ function PdfReaderComponent({
     return () => {
       cancelled = true;
     };
-  }, [pdfDocument, pdfSearchQuery, active, onPdfSearchUpdate, refreshVisibleSearchHighlights]);
+  }, [pdfDocument, nativePdfSessionId, pdfSearchQuery, active, onPdfSearchUpdate, refreshVisibleSearchHighlights]);
 
   function goToNextFindMatch() {
     const targets = searchTargetsRef.current;
@@ -735,7 +820,7 @@ function PdfReaderComponent({
   }
 
   function updatePageRange(scrollTop: number) {
-    const nextRange = findPdfPageRange(pageMetrics, scrollTop, viewportHeight, virtualPageOverscan);
+    const nextRange = findPdfPageRange(pageMetrics, scrollTop, viewportHeight, pdfRenderPolicy.overscanPages);
     setPageRange((current) => current.start === nextRange.start && current.end === nextRange.end ? current : nextRange);
   }
 
@@ -750,7 +835,7 @@ function PdfReaderComponent({
   }
 
   function scheduleZoom(nextZoom: number) {
-    if (!isLegacyWebKit) {
+    if (!pdfRenderPolicy.debounceZoom) {
       // zoomRef only syncs post-render; update it now so wheel events landing
       // before the next render compound from the latest value.
       zoomRef.current = clamp(nextZoom, minZoom, maxZoom);
@@ -855,7 +940,7 @@ function PdfReaderComponent({
     );
   }
 
-  if (!fileData) {
+  if (!fileData && !hasNativePdfPath) {
     return (
       <section className="reader-empty">
         <div>
@@ -867,7 +952,11 @@ function PdfReaderComponent({
   }
 
   return (
-    <section className="reader">
+    <section
+      className="reader"
+      data-pdf-render-tier={pdfRenderPolicy.tier}
+      data-pdf-renderer={nativePdfEnabled ? `native-${nativeRenderer.status}` : "pdfjs"}
+    >
       <div className="reader-body" ref={readerBodyRef}>
         <div
           ref={scrollRef}
@@ -876,16 +965,16 @@ function PdfReaderComponent({
           onPointerUp={handleSelectionPointerUp}
           onScroll={handleReaderScroll}
         >
-          <Document
-            file={documentFile}
-            loading={<div className="pdf-status">Loading PDF...</div>}
-            error={<div className="pdf-status">Failed to load PDF.{loadError ? <span>{loadError}</span> : null}</div>}
-            onLoadSuccess={(document) => {
-              setPdfDocument(document);
-              setNumPages(document.numPages);
-            }}
-            onLoadError={(error) => setLoadError(error.message)}
-          >
+          {nativeRenderer.status === "loading" && (
+            <div className="pdf-status">Preparing native PDF renderer...</div>
+          )}
+          {nativeRenderer.status === "unavailable" && (
+            <div className="pdf-status">
+              Native PDF renderer is unavailable. Install poppler-utils and restart Lumora.
+              <span>{nativeRenderer.error}</span>
+            </div>
+          )}
+          {nativeRenderer.status === "ready" ? (
             <div className="pdf-page-list" style={{ height: pageMetrics.totalHeight }}>
               {virtualPageIndexes.map((index) => (
                 <div
@@ -900,27 +989,32 @@ function PdfReaderComponent({
                     minHeight: pageMetrics.heights[index]
                   }}
                 >
-                  <Page
-                    pageNumber={index + 1}
-                    width={renderedPageWidth}
-                    devicePixelRatio={Math.min(window.devicePixelRatio || 1, maxPdfDevicePixelRatio)}
-                    renderAnnotationLayer
-                    renderTextLayer
-                    onLoadSuccess={(page) => {
-                      const ratio = page.originalHeight / page.originalWidth;
-                      if (!Number.isFinite(ratio) || ratio <= 0) {
-                        return;
-                      }
-                      setPageAspectRatios((current) => current[index] === ratio
-                        ? current
-                        : { ...current, [index]: ratio }
-                      );
+                  <div
+                    className="native-pdf-page-frame"
+                    style={{
+                      width: renderedPageWidth,
+                      height: pageMetrics.heights[index]
                     }}
-                    onRenderSuccess={restorePendingScroll}
-                    // react-pdf reruns its text-layer layout effect when this
-                    // callback changes. Keep it stable so updating highlights
-                    // cannot recursively render the application root.
-                    onRenderTextLayerSuccess={refreshVisibleSearchHighlights}
+                  >
+                    <NativePdfPage
+                      sessionId={nativeRenderer.document.sessionId}
+                      pageNumber={index + 1}
+                      cssWidth={renderedPageWidth}
+                      devicePixelRatio={resolvePdfDevicePixelRatio(
+                        window.devicePixelRatio || 1,
+                        renderedPageWidth,
+                        pageAspectRatios[index] ?? defaultPdfPageAspectRatio,
+                        pdfRenderPolicy
+                      )}
+                      onLoad={restorePendingScroll}
+                    />
+                  </div>
+                  <NativePdfTextLayer
+                    sessionId={nativeRenderer.document.sessionId}
+                    pageNumber={index + 1}
+                    page={nativeRenderer.document.pages[index]}
+                    cssHeight={pageMetrics.heights[index]}
+                    onReady={refreshVisibleSearchHighlights}
                   />
                   <AnnotationOverlay
                     annotations={visibleAnnotations.filter((annotation) => annotation.pageIndex === index)}
@@ -938,30 +1032,99 @@ function PdfReaderComponent({
                       });
                     }}
                   />
-                  {findMatches
-                    .filter((match) => match.pageIndex === index)
-                    .map((match) => {
-                      const activeTarget = searchTargets[activeMatchIndex];
-                      const isActive = activeTarget?.pageIndex === match.pageIndex
-                        && activeTarget.pageMatchIndex === match.matchIndex;
-                      return (
-                        <span
-                          key={match.key}
-                          className={isActive ? "search-highlight-rect active" : "search-highlight-rect"}
-                          aria-hidden
-                          style={{
-                            left: `${match.rect.x * 100}%`,
-                            top: `${match.rect.y * 100}%`,
-                            width: `${match.rect.width * 100}%`,
-                            height: `${match.rect.height * 100}%`
-                          }}
-                        />
-                      );
-                    })}
                 </div>
               ))}
             </div>
-          </Document>
+          ) : nativePdfEnabled ? null : (
+            <Document
+              file={documentFile}
+              loading={<div className="pdf-status">Loading PDF...</div>}
+              error={<div className="pdf-status">Failed to load PDF.{loadError ? <span>{loadError}</span> : null}</div>}
+              onLoadSuccess={(document) => {
+                setPdfDocument(document);
+                setNumPages(document.numPages);
+              }}
+              onLoadError={(error) => setLoadError(error.message)}
+            >
+              <div className="pdf-page-list" style={{ height: pageMetrics.totalHeight }}>
+                {virtualPageIndexes.map((index) => (
+                  <div
+                    className="page-shell virtualized"
+                    data-page-index={index}
+                    key={index}
+                    ref={(element) => {
+                      pageRefs.current[index] = element;
+                    }}
+                    style={{
+                      top: pageMetrics.offsets[index],
+                      minHeight: pageMetrics.heights[index]
+                    }}
+                  >
+                    <Page
+                      pageNumber={index + 1}
+                      width={renderedPageWidth}
+                      devicePixelRatio={resolvePdfDevicePixelRatio(
+                      window.devicePixelRatio || 1,
+                      renderedPageWidth,
+                      pageAspectRatios[index] ?? defaultPdfPageAspectRatio,
+                      pdfRenderPolicy
+                    )}
+                      renderAnnotationLayer
+                      renderTextLayer
+                      onLoadSuccess={(page) => {
+                        const ratio = page.originalHeight / page.originalWidth;
+                        if (!Number.isFinite(ratio) || ratio <= 0) {
+                          return;
+                        }
+                        setPageAspectRatios((current) => current[index] === ratio
+                          ? current
+                          : { ...current, [index]: ratio }
+                        );
+                      }}
+                      onRenderSuccess={restorePendingScroll}
+                      onRenderTextLayerSuccess={refreshVisibleSearchHighlights}
+                    />
+                    <AnnotationOverlay
+                      annotations={visibleAnnotations.filter((annotation) => annotation.pageIndex === index)}
+                      onMoveAnnotation={(annotation, position) => onCreateAnnotation(moveNoteMarker(annotation, position))}
+                      onOpenAnnotationMenu={(annotation, event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        setContextMenu({
+                          kind: "existing",
+                          x: event.clientX,
+                          y: event.clientY,
+                          annotation,
+                          mode: "actions",
+                          noteText: annotation.comment ?? ""
+                        });
+                      }}
+                    />
+                    {findMatches
+                      .filter((match) => match.pageIndex === index)
+                      .map((match) => {
+                        const activeTarget = searchTargets[activeMatchIndex];
+                        const isActive = activeTarget?.pageIndex === match.pageIndex
+                          && activeTarget.pageMatchIndex === match.matchIndex;
+                        return (
+                          <span
+                            key={match.key}
+                            className={isActive ? "search-highlight-rect active" : "search-highlight-rect"}
+                            aria-hidden
+                            style={{
+                              left: `${(match.rect.x * 100).toFixed(2)}%`,
+                              top: `${(match.rect.y * 100).toFixed(2)}%`,
+                              width: `${(match.rect.width * 100).toFixed(2)}%`,
+                              height: `${(match.rect.height * 100).toFixed(2)}%`
+                            }}
+                          />
+                        );
+                      })}
+                  </div>
+                ))}
+              </div>
+            </Document>
+          )}
         </div>
         {contextMenu && (
           <AnnotationContextMenu
@@ -1654,16 +1817,26 @@ function isEditableShortcutTarget(target: EventTarget | null) {
   return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
 }
 
+// Sub-pixel tolerance for match-rect comparison. WebKitGTK's getClientRects()
+// returns values that jitter below the pixel on successive layouts of the same
+// text, so exact float equality here would report "changed" every time the text
+// layer re-renders, commit a new findMatches, re-render, and never converge — a
+// main-thread loop that pins one CPU and explodes the AtomString table (each
+// full-precision "left: …%" style string is a brand-new atom). ~0.15% of the
+// page (~1px on a 700px page) is finer than any real match move and coarser
+// than the jitter, so genuine changes still register while noise is absorbed.
+const searchRectEpsilon = 0.0015;
+
 function areSearchMatchesEqual(current: PdfSearchMatch[], next: PdfSearchMatch[]) {
   return current.length === next.length && current.every((match, index) => {
     const nextMatch = next[index];
     return nextMatch !== undefined
       && match.key === nextMatch.key
       && match.matchIndex === nextMatch.matchIndex
-      && match.rect.x === nextMatch.rect.x
-      && match.rect.y === nextMatch.rect.y
-      && match.rect.width === nextMatch.rect.width
-      && match.rect.height === nextMatch.rect.height;
+      && Math.abs(match.rect.x - nextMatch.rect.x) < searchRectEpsilon
+      && Math.abs(match.rect.y - nextMatch.rect.y) < searchRectEpsilon
+      && Math.abs(match.rect.width - nextMatch.rect.width) < searchRectEpsilon
+      && Math.abs(match.rect.height - nextMatch.rect.height) < searchRectEpsilon;
   });
 }
 

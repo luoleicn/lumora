@@ -7,6 +7,7 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID, 
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 mod cloud_sync;
+mod native_pdf;
 
 #[derive(Clone, serde::Serialize)]
 #[serde(tag = "event", rename_all = "camelCase", rename_all_fields = "camelCase")]
@@ -46,6 +47,97 @@ static INITIALIZED_LIBRARY_DATABASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLo
 #[tauri::command]
 fn ping() -> &'static str {
     "lumora-ready"
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LinuxGraphicsCapability {
+    tier: &'static str,
+}
+
+
+/// Detect Linux graphics hardware outside WebKit. Creating a WebGL context just
+/// to probe the renderer can itself trigger WebKitGTK driver bugs, so the
+/// frontend receives a conservative capability tier derived from DRM/sysfs.
+#[tauri::command]
+fn linux_graphics_capability() -> LinuxGraphicsCapability {
+    #[cfg(target_os = "linux")]
+    {
+        let software_requested = [
+            "LIBGL_ALWAYS_SOFTWARE",
+            "GALLIUM_DRIVER",
+            "MESA_LOADER_DRIVER_OVERRIDE",
+        ]
+        .iter()
+        .any(|name| {
+            std::env::var(name).is_ok_and(|value| {
+                let value = value.to_ascii_lowercase();
+                value == "1"
+                    || value == "true"
+                    || value.contains("llvmpipe")
+                    || value.contains("softpipe")
+                    || value.contains("swrast")
+            })
+        });
+        let has_render_node = std::fs::read_dir("/dev/dri").is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("renderD")
+            })
+        });
+        let mut vendors = Vec::new();
+        let mut has_large_dedicated_vram = false;
+        if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with("card") || name.contains('-') {
+                    continue;
+                }
+                let device = entry.path().join("device");
+                if let Ok(vendor) = std::fs::read_to_string(device.join("vendor")) {
+                    vendors.push(vendor.trim().to_ascii_lowercase());
+                }
+                if let Ok(vram) = std::fs::read_to_string(device.join("mem_info_vram_total")) {
+                    has_large_dedicated_vram |= vram
+                        .trim()
+                        .parse::<u64>()
+                        .is_ok_and(|bytes| bytes >= 2 * 1024 * 1024 * 1024);
+                }
+            }
+        }
+
+        return LinuxGraphicsCapability {
+            tier: classify_linux_graphics_capability(
+                &vendors,
+                has_render_node,
+                has_large_dedicated_vram,
+                software_requested,
+            ),
+        };
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    LinuxGraphicsCapability { tier: "unknown" }
+}
+
+fn classify_linux_graphics_capability(
+    vendors: &[String],
+    has_render_node: bool,
+    has_large_dedicated_vram: bool,
+    software_requested: bool,
+) -> &'static str {
+    if software_requested || !has_render_node || vendors.is_empty() {
+        return "software";
+    }
+    if vendors.iter().any(|vendor| vendor == "0x10de")
+        || (vendors.iter().any(|vendor| vendor == "0x1002") && has_large_dedicated_vram)
+    {
+        return "discrete";
+    }
+    "hardware"
 }
 
 #[derive(serde::Serialize)]
@@ -2170,6 +2262,13 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             ping,
+            linux_graphics_capability,
+            native_pdf::native_pdf_open_path,
+            native_pdf::native_pdf_stage_chunk,
+            native_pdf::native_pdf_open_upload,
+            native_pdf::native_pdf_render_page,
+            native_pdf::native_pdf_page_text,
+            native_pdf::native_pdf_search,
             open_external_url,
             open_file_with_system,
             reveal_file_in_folder,
@@ -2671,10 +2770,35 @@ fn tokenize(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_fts_column_query, cjk_segment, configure_library_connection, ensure_search_index,
-        index_paper_body, init_library_schema, normalize_arxiv_id, search_library_rows,
-        sync_search_index_for_change, validate_proxy_settings, ProxySettings, SEARCH_RESULT_LIMIT,
+        build_fts_column_query, cjk_segment, classify_linux_graphics_capability,
+        configure_library_connection, ensure_search_index, index_paper_body, init_library_schema,
+        normalize_arxiv_id, search_library_rows, sync_search_index_for_change,
+        validate_proxy_settings, ProxySettings, SEARCH_RESULT_LIMIT,
     };
+
+    #[test]
+    fn classifies_linux_graphics_without_initializing_webgl() {
+        assert_eq!(
+            classify_linux_graphics_capability(&["0x10de".into()], true, false, false),
+            "discrete"
+        );
+        assert_eq!(
+            classify_linux_graphics_capability(&["0x1002".into()], true, true, false),
+            "discrete"
+        );
+        assert_eq!(
+            classify_linux_graphics_capability(&["0x8086".into()], true, false, false),
+            "hardware"
+        );
+        assert_eq!(
+            classify_linux_graphics_capability(&["0x8086".into()], true, false, true),
+            "software"
+        );
+        assert_eq!(
+            classify_linux_graphics_capability(&[], false, false, false),
+            "software"
+        );
+    }
 
     fn test_connection() -> rusqlite::Connection {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
