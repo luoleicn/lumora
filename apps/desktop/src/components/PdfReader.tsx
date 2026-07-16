@@ -1,12 +1,24 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Document, Page, pdfjs } from "react-pdf";
+import type { PDFDocumentProxy } from "pdfjs-dist";
 import { Languages, MessageSquare, StickyNote, Trash2, X } from "lucide-react";
 import type { Annotation, FileAsset, Paper } from "@lumora/shared";
 import { clamp01, mergeNearbyRects, normalizeRect } from "@lumora/shared";
 import { createId } from "../lib/id";
-import { findInPageTextLayer, type PdfSearchMatch } from "../lib/pdfSearch";
+import {
+  findInPageTextLayer,
+  findInPdfText,
+  type PdfSearchMatch,
+  type PdfSearchTarget
+} from "../lib/pdfSearch";
+import {
+  buildPdfPageMetrics,
+  findPdfPageRange,
+  pageOffset,
+  type PdfPageRange
+} from "../lib/pdfVirtualization";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
 
@@ -85,6 +97,9 @@ const colors = ["#ffe45c", "#8ee6a8", "#82cfff", "#ffadad"];
 const pdfViewEvent = "lumora-pdf-view-command";
 const minZoom = 0.5;
 const maxZoom = 3;
+const virtualPageOverscan = 2;
+const zoomCommitDelayMs = 160;
+const maxPdfDevicePixelRatio = 1.5;
 
 function PdfReaderComponent({
   paper,
@@ -105,8 +120,14 @@ function PdfReaderComponent({
   const pendingScrollRestoreRef = useRef<number | undefined>(undefined);
   const restoringScrollRef = useRef(false);
   const gestureStartZoomRef = useRef(1);
+  const pendingZoomRef = useRef<number | undefined>(undefined);
+  const zoomCommitTimerRef = useRef<number | undefined>(undefined);
   const [numPages, setNumPages] = useState(0);
+  const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy>();
   const [pageWidth, setPageWidth] = useState(760);
+  const [viewportHeight, setViewportHeight] = useState(700);
+  const [pageAspectRatios, setPageAspectRatios] = useState<Record<number, number>>({});
+  const [pageRange, setPageRange] = useState<PdfPageRange>({ start: 0, end: 4 });
   const [zoom, setZoom] = useState(viewState?.zoom ?? 1);
   const zoomRef = useRef(zoom);
   const [hasExplicitZoom, setHasExplicitZoom] = useState(viewState?.zoom !== undefined);
@@ -116,11 +137,23 @@ function PdfReaderComponent({
   const [pageJumpValue, setPageJumpValue] = useState("");
   const [loadError, setLoadError] = useState<string>();
   const [findMatches, setFindMatches] = useState<PdfSearchMatch[]>([]);
+  const [searchTargets, setSearchTargets] = useState<PdfSearchTarget[]>([]);
   const [activeMatchIndex, setActiveMatchIndex] = useState(-1);
-  const findMatchesRef = useRef<PdfSearchMatch[]>([]);
-  const pagesRenderedRef = useRef(new Set<number>());
-  const pendingSearchRef = useRef<string | null>(null);
+  const searchTargetsRef = useRef<PdfSearchTarget[]>([]);
   const documentFile = useMemo(() => (fileData ? { data: fileData.slice() } : undefined), [fileData]);
+  const renderedPageWidth = pageWidth * zoom;
+  const pageMetrics = useMemo(
+    () => buildPdfPageMetrics(numPages, renderedPageWidth, pageAspectRatios),
+    [numPages, pageAspectRatios, renderedPageWidth]
+  );
+  const virtualPageIndexes = useMemo(() => {
+    if (pageRange.end < pageRange.start || numPages === 0) {
+      return [];
+    }
+    const start = Math.min(Math.max(pageRange.start, 0), numPages - 1);
+    const end = Math.min(Math.max(pageRange.end, start), numPages - 1);
+    return Array.from({ length: end - start + 1 }, (_, offset) => start + offset);
+  }, [numPages, pageRange]);
 
   const visibleAnnotations = useMemo(
     () => annotations.filter((annotation) =>
@@ -138,6 +171,7 @@ function PdfReaderComponent({
 
     const resize = () => {
       setPageWidth(Math.max(420, element.clientWidth - 56));
+      setViewportHeight(Math.max(1, element.clientHeight));
     };
     resize();
 
@@ -177,6 +211,9 @@ function PdfReaderComponent({
   useEffect(() => {
     setContextMenu(undefined);
     setNumPages(0);
+    setPdfDocument(undefined);
+    setPageAspectRatios({});
+    setPageRange({ start: 0, end: 4 });
     setLoadError(undefined);
     setPageJumpOpen(false);
     setPageJumpValue("");
@@ -184,6 +221,9 @@ function PdfReaderComponent({
     restoringScrollRef.current = true;
     setHasExplicitZoom(viewState?.zoom !== undefined);
     setZoom(viewState?.zoom ?? 1);
+    setFindMatches([]);
+    setSearchTargets([]);
+    searchTargetsRef.current = [];
   }, [fileData, paper?.id]);
 
   useEffect(() => {
@@ -210,8 +250,17 @@ function PdfReaderComponent({
 
   useEffect(() => {
     pageRefs.current = pageRefs.current.slice(0, numPages);
-    pagesRenderedRef.current.clear();
   }, [numPages]);
+
+  useLayoutEffect(() => {
+    updatePageRange(scrollRef.current?.scrollTop ?? viewState?.scrollTop ?? 0);
+  }, [pageMetrics, viewportHeight]);
+
+  useEffect(() => () => {
+    if (zoomCommitTimerRef.current !== undefined) {
+      window.clearTimeout(zoomCommitTimerRef.current);
+    }
+  }, []);
 
   useEffect(() => {
     if (!active) {
@@ -304,8 +353,11 @@ function PdfReaderComponent({
         return;
       }
 
-      setHasExplicitZoom(true);
-      setZoom(clamp(gestureStartZoomRef.current * scale, minZoom, maxZoom));
+      scheduleZoom(clamp(gestureStartZoomRef.current * scale, minZoom, maxZoom));
+    };
+    const handleGestureEnd = (event: Event) => {
+      event.preventDefault();
+      commitPendingZoom();
     };
 
     const handleWheelZoom = (event: WheelEvent) => {
@@ -315,12 +367,12 @@ function PdfReaderComponent({
 
       event.preventDefault();
       const scale = Math.exp(-event.deltaY * 0.002);
-      setHasExplicitZoom(true);
-      setZoom((current) => clamp(current * scale, minZoom, maxZoom));
+      scheduleZoom(clamp((pendingZoomRef.current ?? zoomRef.current) * scale, minZoom, maxZoom));
     };
 
     element.addEventListener("gesturestart", handleGestureStart);
     element.addEventListener("gesturechange", handleGestureChange);
+    element.addEventListener("gestureend", handleGestureEnd);
     // React attaches `onWheel` as a passive listener, which silently ignores
     // preventDefault(); registering natively with {passive: false} is required
     // to stop the browser's own ctrl+wheel zoom.
@@ -328,6 +380,7 @@ function PdfReaderComponent({
     return () => {
       element.removeEventListener("gesturestart", handleGestureStart);
       element.removeEventListener("gesturechange", handleGestureChange);
+      element.removeEventListener("gestureend", handleGestureEnd);
       element.removeEventListener("wheel", handleWheelZoom);
     };
   }, [active]);
@@ -355,8 +408,7 @@ function PdfReaderComponent({
       if (command.startsWith("zoom:")) {
         const nextZoom = Number.parseFloat(command.slice("zoom:".length));
         if (Number.isFinite(nextZoom)) {
-          setHasExplicitZoom(true);
-          setZoom(nextZoom);
+          commitZoom(nextZoom, true);
         }
       }
     }).then((nextUnlisten) => {
@@ -373,80 +425,80 @@ function PdfReaderComponent({
     };
   }, [active, numPages]);
 
-  // PDF text search: walks every rendered page's text layer and collects
-  // match positions as normalised rects. Delegates the initial search after
-  // PDF load to onRenderSuccess so it never runs before text layers exist
-  // in the DOM; subsequent queries (re-typing) run immediately.
-  function runSearch(query: string) {
+  const refreshVisibleSearchHighlights = useCallback((queryOverride?: string) => {
+    const query = queryOverride ?? pdfSearchQuery?.trim();
+    if (!query) {
+      return;
+    }
+
     const lowerQuery = query.toLowerCase();
-    const allMatches: PdfSearchMatch[] = [];
-    for (let i = 0; i < numPages; i += 1) {
-      const pageEl = pageRefs.current[i];
-      if (!pageEl) continue;
-      const pageMatches = findInPageTextLayer(pageEl, i, lowerQuery);
-      allMatches.push(...pageMatches);
-    }
+    const visibleMatches = virtualPageIndexes.flatMap((pageIndex) => {
+      const pageElement = pageRefs.current[pageIndex];
+      return pageElement ? findInPageTextLayer(pageElement, pageIndex, lowerQuery) : [];
+    });
+    setFindMatches((current) => areSearchMatchesEqual(current, visibleMatches) ? current : visibleMatches);
+  }, [pdfSearchQuery, virtualPageIndexes]);
 
-    setFindMatches(allMatches);
-    findMatchesRef.current = allMatches;
-    const activeIdx = allMatches.length > 0 ? 0 : -1;
-    setActiveMatchIndex(activeIdx);
-    onPdfSearchUpdate?.({ totalMatches: allMatches.length, activeMatchIndex: activeIdx });
-
-    if (allMatches.length > 0) {
-      scrollToFindMatch(allMatches[0]);
-    }
-  }
-
+  // Search the PDF text model so virtualized, unmounted pages remain searchable.
+  // DOM ranges are only measured for the small set of pages currently mounted.
   useEffect(() => {
     const query = pdfSearchQuery?.trim();
-    if (!query || !active) {
+    if (!query || !active || !pdfDocument) {
       setFindMatches([]);
+      setSearchTargets([]);
       setActiveMatchIndex(-1);
-      findMatchesRef.current = [];
+      searchTargetsRef.current = [];
       onPdfSearchUpdate?.({ totalMatches: 0, activeMatchIndex: -1 });
-      pendingSearchRef.current = null;
       return undefined;
     }
 
-    // PDF hasn't loaded yet — defer the search until pages are rendered.
-    if (numPages === 0) {
-      pendingSearchRef.current = query;
-      return undefined;
-    }
+    let cancelled = false;
+    void findInPdfText(pdfDocument, query, () => cancelled).then((targets) => {
+      if (cancelled) {
+        return;
+      }
 
-    // If all pages have already rendered (subsequent queries after the
-    // initial load), search immediately.  Otherwise store the query and
-    // let onRenderSuccess trigger it.
-    if (pagesRenderedRef.current.size === numPages) {
-      runSearch(query);
-    } else {
-      pendingSearchRef.current = query;
-    }
-  }, [pdfSearchQuery, numPages, active, onPdfSearchUpdate]);
+      setSearchTargets(targets);
+      searchTargetsRef.current = targets;
+      const activeIndex = targets.length > 0 ? 0 : -1;
+      setActiveMatchIndex(activeIndex);
+      onPdfSearchUpdate?.({ totalMatches: targets.length, activeMatchIndex: activeIndex });
+      if (targets[0]) {
+        scrollToPage(targets[0].pageIndex, "smooth");
+      }
+      requestAnimationFrame(() => refreshVisibleSearchHighlights(query));
+    }).catch(() => {
+      if (cancelled) {
+        return;
+      }
+      setFindMatches([]);
+      setSearchTargets([]);
+      searchTargetsRef.current = [];
+      setActiveMatchIndex(-1);
+      onPdfSearchUpdate?.({ totalMatches: 0, activeMatchIndex: -1 });
+    });
 
-  function scrollToFindMatch(match: PdfSearchMatch) {
-    const pageEl = pageRefs.current[match.pageIndex];
-    if (!pageEl) return;
-    pageEl.scrollIntoView({ block: "center", behavior: "smooth" });
-  }
+    return () => {
+      cancelled = true;
+    };
+  }, [pdfDocument, pdfSearchQuery, active, onPdfSearchUpdate, refreshVisibleSearchHighlights]);
 
   function goToNextFindMatch() {
-    const matches = findMatchesRef.current;
-    if (matches.length === 0) return;
-    const next = activeMatchIndex < 0 || activeMatchIndex >= matches.length - 1 ? 0 : activeMatchIndex + 1;
+    const targets = searchTargetsRef.current;
+    if (targets.length === 0) return;
+    const next = activeMatchIndex < 0 || activeMatchIndex >= targets.length - 1 ? 0 : activeMatchIndex + 1;
     setActiveMatchIndex(next);
-    onPdfSearchUpdate?.({ totalMatches: matches.length, activeMatchIndex: next });
-    scrollToFindMatch(matches[next]);
+    onPdfSearchUpdate?.({ totalMatches: targets.length, activeMatchIndex: next });
+    scrollToPage(targets[next].pageIndex, "smooth");
   }
 
   function goToPrevFindMatch() {
-    const matches = findMatchesRef.current;
-    if (matches.length === 0) return;
-    const prev = activeMatchIndex <= 0 ? matches.length - 1 : activeMatchIndex - 1;
+    const targets = searchTargetsRef.current;
+    if (targets.length === 0) return;
+    const prev = activeMatchIndex <= 0 ? targets.length - 1 : activeMatchIndex - 1;
     setActiveMatchIndex(prev);
-    onPdfSearchUpdate?.({ totalMatches: matches.length, activeMatchIndex: prev });
-    scrollToFindMatch(matches[prev]);
+    onPdfSearchUpdate?.({ totalMatches: targets.length, activeMatchIndex: prev });
+    scrollToPage(targets[prev].pageIndex, "smooth");
   }
 
   // Expose the navigation functions so App.tsx (via the toolbar) can drive them.
@@ -599,8 +651,7 @@ function PdfReaderComponent({
   }
 
   function handleFitWidth() {
-    setHasExplicitZoom(false);
-    setZoom(1);
+    commitZoom(1, false);
   }
 
   function handlePromptPageJump() {
@@ -626,18 +677,61 @@ function PdfReaderComponent({
     }
 
     const clampedPage = Math.min(Math.max(nextPage, 1), numPages);
-    pageRefs.current[clampedPage - 1]?.scrollIntoView({ block: "start", behavior: "smooth" });
+    scrollToPage(clampedPage - 1, "smooth");
   }
 
   function handleReaderScroll() {
+    const scrollTop = scrollRef.current?.scrollTop ?? 0;
+    updatePageRange(scrollTop);
     if (restoringScrollRef.current) {
       return;
     }
 
     onViewStateChange?.({
-      scrollTop: scrollRef.current?.scrollTop ?? 0,
+      scrollTop,
       zoom: hasExplicitZoom ? zoom : undefined
     });
+  }
+
+  function updatePageRange(scrollTop: number) {
+    const nextRange = findPdfPageRange(pageMetrics, scrollTop, viewportHeight, virtualPageOverscan);
+    setPageRange((current) => current.start === nextRange.start && current.end === nextRange.end ? current : nextRange);
+  }
+
+  function scrollToPage(pageIndex: number, behavior: ScrollBehavior = "auto") {
+    const element = scrollRef.current;
+    if (!element) {
+      return;
+    }
+    const top = pageOffset(pageMetrics, pageIndex);
+    element.scrollTo({ top, behavior });
+    updatePageRange(top);
+  }
+
+  function scheduleZoom(nextZoom: number) {
+    pendingZoomRef.current = clamp(nextZoom, minZoom, maxZoom);
+    setHasExplicitZoom(true);
+    if (zoomCommitTimerRef.current !== undefined) {
+      window.clearTimeout(zoomCommitTimerRef.current);
+    }
+    zoomCommitTimerRef.current = window.setTimeout(commitPendingZoom, zoomCommitDelayMs);
+  }
+
+  function commitPendingZoom() {
+    if (pendingZoomRef.current === undefined) {
+      return;
+    }
+    commitZoom(pendingZoomRef.current, true);
+  }
+
+  function commitZoom(nextZoom: number, explicit: boolean) {
+    if (zoomCommitTimerRef.current !== undefined) {
+      window.clearTimeout(zoomCommitTimerRef.current);
+      zoomCommitTimerRef.current = undefined;
+    }
+    pendingZoomRef.current = undefined;
+    setHasExplicitZoom(explicit);
+    setZoom(clamp(nextZoom, minZoom, maxZoom));
   }
 
   function restorePendingScroll() {
@@ -650,12 +744,14 @@ function PdfReaderComponent({
       if (scrollRef.current) {
         scrollRef.current.scrollTop = scrollTop;
       }
+      updatePageRange(scrollTop);
 
       requestAnimationFrame(() => {
         const nextScrollTop = pendingScrollRestoreRef.current ?? scrollTop;
         if (scrollRef.current) {
           scrollRef.current.scrollTop = nextScrollTop;
         }
+        updatePageRange(nextScrollTop);
         pendingScrollRestoreRef.current = undefined;
         restoringScrollRef.current = false;
       });
@@ -735,70 +831,87 @@ function PdfReaderComponent({
             file={documentFile}
             loading={<div className="pdf-status">Loading PDF...</div>}
             error={<div className="pdf-status">Failed to load PDF.{loadError ? <span>{loadError}</span> : null}</div>}
-            onLoadSuccess={({ numPages: nextNumPages }) => setNumPages(nextNumPages)}
+            onLoadSuccess={(document) => {
+              setPdfDocument(document);
+              setNumPages(document.numPages);
+            }}
             onLoadError={(error) => setLoadError(error.message)}
           >
-            {Array.from({ length: numPages }, (_, index) => (
-              <div
-                className="page-shell"
-                data-page-index={index}
-                key={index}
-                ref={(element) => {
-                  pageRefs.current[index] = element;
-                }}
-              >
-                <Page
-                  pageNumber={index + 1}
-                  width={pageWidth * zoom}
-                  renderAnnotationLayer
-                  renderTextLayer
-                  onRenderSuccess={() => {
-                    restorePendingScroll();
-                    pagesRenderedRef.current.add(index);
-                    const pending = pendingSearchRef.current;
-                    if (pending && pagesRenderedRef.current.size === numPages && active) {
-                      pendingSearchRef.current = null;
-                      runSearch(pending);
-                    }
+            <div className="pdf-page-list" style={{ height: pageMetrics.totalHeight }}>
+              {virtualPageIndexes.map((index) => (
+                <div
+                  className="page-shell virtualized"
+                  data-page-index={index}
+                  key={index}
+                  ref={(element) => {
+                    pageRefs.current[index] = element;
                   }}
-                />
-                <AnnotationOverlay
-                  annotations={visibleAnnotations.filter((annotation) => annotation.pageIndex === index)}
-                  onMoveAnnotation={(annotation, position) => onCreateAnnotation(moveNoteMarker(annotation, position))}
-                  onOpenAnnotationMenu={(annotation, event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    setContextMenu({
-                      kind: "existing",
-                      x: event.clientX,
-                      y: event.clientY,
-                      annotation,
-                      mode: "actions",
-                      noteText: annotation.comment ?? ""
-                    });
+                  style={{
+                    top: pageMetrics.offsets[index],
+                    minHeight: pageMetrics.heights[index]
                   }}
-                />
-                {findMatches
-                  .filter((match) => match.pageIndex === index)
-                  .map((match) => (
-                    <span
-                      key={match.key}
-                      className={
-                        match === findMatches[activeMatchIndex]
-                          ? "search-highlight-rect active"
-                          : "search-highlight-rect"
+                >
+                  <Page
+                    pageNumber={index + 1}
+                    width={renderedPageWidth}
+                    devicePixelRatio={Math.min(window.devicePixelRatio || 1, maxPdfDevicePixelRatio)}
+                    renderAnnotationLayer
+                    renderTextLayer
+                    onLoadSuccess={(page) => {
+                      const ratio = page.originalHeight / page.originalWidth;
+                      if (!Number.isFinite(ratio) || ratio <= 0) {
+                        return;
                       }
-                      aria-hidden
-                      style={{
-                        left: `${match.rect.x * 100}%`,
-                        top: `${match.rect.y * 100}%`,
-                        width: `${match.rect.width * 100}%`,
-                        height: `${match.rect.height * 100}%`
-                      }}
-                    />
-                  ))}
-              </div>
-            ))}
+                      setPageAspectRatios((current) => current[index] === ratio
+                        ? current
+                        : { ...current, [index]: ratio }
+                      );
+                    }}
+                    onRenderSuccess={restorePendingScroll}
+                    // react-pdf reruns its text-layer layout effect when this
+                    // callback changes. Keep it stable so updating highlights
+                    // cannot recursively render the application root.
+                    onRenderTextLayerSuccess={refreshVisibleSearchHighlights}
+                  />
+                  <AnnotationOverlay
+                    annotations={visibleAnnotations.filter((annotation) => annotation.pageIndex === index)}
+                    onMoveAnnotation={(annotation, position) => onCreateAnnotation(moveNoteMarker(annotation, position))}
+                    onOpenAnnotationMenu={(annotation, event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setContextMenu({
+                        kind: "existing",
+                        x: event.clientX,
+                        y: event.clientY,
+                        annotation,
+                        mode: "actions",
+                        noteText: annotation.comment ?? ""
+                      });
+                    }}
+                  />
+                  {findMatches
+                    .filter((match) => match.pageIndex === index)
+                    .map((match) => {
+                      const activeTarget = searchTargets[activeMatchIndex];
+                      const isActive = activeTarget?.pageIndex === match.pageIndex
+                        && activeTarget.pageMatchIndex === match.matchIndex;
+                      return (
+                        <span
+                          key={match.key}
+                          className={isActive ? "search-highlight-rect active" : "search-highlight-rect"}
+                          aria-hidden
+                          style={{
+                            left: `${match.rect.x * 100}%`,
+                            top: `${match.rect.y * 100}%`,
+                            width: `${match.rect.width * 100}%`,
+                            height: `${match.rect.height * 100}%`
+                          }}
+                        />
+                      );
+                    })}
+                </div>
+              ))}
+            </div>
           </Document>
         </div>
         {contextMenu && (
@@ -1459,6 +1572,19 @@ function isEditableShortcutTarget(target: EventTarget | null) {
   }
 
   return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+}
+
+function areSearchMatchesEqual(current: PdfSearchMatch[], next: PdfSearchMatch[]) {
+  return current.length === next.length && current.every((match, index) => {
+    const nextMatch = next[index];
+    return nextMatch !== undefined
+      && match.key === nextMatch.key
+      && match.matchIndex === nextMatch.matchIndex
+      && match.rect.x === nextMatch.rect.x
+      && match.rect.y === nextMatch.rect.y
+      && match.rect.width === nextMatch.rect.width
+      && match.rect.height === nextMatch.rect.height;
+  });
 }
 
 function clamp(value: number, min: number, max: number) {
