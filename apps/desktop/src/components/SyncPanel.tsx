@@ -11,6 +11,7 @@ type SyncPanelProps = {
   paper?: Paper;
   fileAsset?: FileAsset;
   fileData?: Uint8Array;
+  onRequestFileData: () => Promise<Uint8Array | undefined>;
   hasLocalPdf: boolean;
   annotations: Annotation[];
   fileStorageSettings: FileStorageSettings;
@@ -25,6 +26,7 @@ export function SyncPanel({
   paper,
   fileAsset,
   fileData,
+  onRequestFileData,
   hasLocalPdf,
   annotations,
   fileStorageSettings,
@@ -56,6 +58,7 @@ export function SyncPanel({
           paper={paper}
           fileAsset={fileAsset}
           fileData={fileData}
+          onRequestFileData={onRequestFileData}
           hasLocalPdf={hasLocalPdf}
           fileStorageSettings={fileStorageSettings}
           onUpdatePaper={onUpdatePaper}
@@ -74,6 +77,7 @@ function DetailsTab({
   paper,
   fileAsset,
   fileData,
+  onRequestFileData,
   hasLocalPdf,
   fileStorageSettings,
   onUpdatePaper,
@@ -84,6 +88,7 @@ function DetailsTab({
   paper?: Paper;
   fileAsset?: FileAsset;
   fileData?: Uint8Array;
+  onRequestFileData: () => Promise<Uint8Array | undefined>;
   hasLocalPdf: boolean;
   fileStorageSettings: FileStorageSettings;
   onUpdatePaper: (paper: Paper) => void;
@@ -237,16 +242,16 @@ function DetailsTab({
   }
 
   async function handlePdfMetadataExtract() {
-    if (!fileData) {
-      setPdfMetadataStatus("No local PDF file available.");
-      return;
-    }
-
     setPdfMetadataBusy(true);
     setPdfMetadataStatus(undefined);
     try {
+      const bytes = fileData ?? await onRequestFileData();
+      if (!bytes) {
+        setPdfMetadataStatus("No local PDF file available.");
+        return;
+      }
       const { extractPdfMetadataPatch } = await import("../lib/pdfMetadata");
-      const result = await extractPdfMetadataPatch(fileData, fileAsset?.fileName);
+      const result = await extractPdfMetadataPatch(bytes, fileAsset?.fileName);
       if (result.fields.length === 0) {
         setPdfMetadataStatus("No usable PDF metadata found.");
         return;
@@ -266,7 +271,7 @@ function DetailsTab({
       <div className="details-title-row">
         <h3>Details</h3>
         <div className="details-title-actions">
-          <button type="button" onClick={handlePdfMetadataExtract} disabled={pdfMetadataBusy || !fileData}>
+          <button type="button" onClick={handlePdfMetadataExtract} disabled={pdfMetadataBusy || !hasLocalPdf}>
             <FileSearch size={15} />
             {pdfMetadataBusy ? "Extracting..." : "Extract PDF"}
           </button>

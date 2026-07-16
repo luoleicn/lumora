@@ -3,6 +3,7 @@ import {
   buildPdfPageMetrics,
   defaultPdfPageAspectRatio,
   findPdfPageRange,
+  listMountedPdfPageIndexes,
   pageOffset
 } from "./pdfVirtualization";
 
@@ -35,5 +36,11 @@ describe("PDF page virtualization", () => {
     expect(findPdfPageRange(metrics, 380, 100, 1)).toEqual({ start: 2, end: 3 });
     expect(pageOffset(metrics, -2)).toBe(0);
     expect(pageOffset(metrics, 99)).toBe(300);
+  });
+
+  it("releases every mounted page while a warm reader tab is inactive", () => {
+    expect(listMountedPdfPageIndexes(20, { start: 4, end: 7 }, false)).toEqual([]);
+    expect(listMountedPdfPageIndexes(20, { start: 4, end: 7 }, true)).toEqual([4, 5, 6, 7]);
+    expect(listMountedPdfPageIndexes(3, { start: -2, end: 10 }, true)).toEqual([0, 1, 2]);
   });
 });

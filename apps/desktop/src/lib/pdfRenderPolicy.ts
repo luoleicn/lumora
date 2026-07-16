@@ -27,9 +27,12 @@ const modernWebKitPolicy: PdfRenderPolicy = {
 
 const legacyWebKitPolicy: PdfRenderPolicy = {
   tier: "legacy-webkit",
-  maxDevicePixelRatio: 1.5,
-  maxCanvasPixels: 6_000_000,
-  overscanPages: 1,
+  // Intel Retina Macs still need a 2x backing store at normal reading widths.
+  // Save work by mounting only visible pages and cap unusually large zoomed
+  // canvases instead of globally softening every page to 1.5x.
+  maxDevicePixelRatio: 2,
+  maxCanvasPixels: 8_000_000,
+  overscanPages: 0,
   debounceZoom: true
 };
 
@@ -73,11 +76,11 @@ let detectedPolicyPromise: Promise<PdfRenderPolicy> | undefined;
  * may still be running its graphics stack on the CPU.
  */
 export function buildPdfRenderPolicy(environment: PdfRenderEnvironment): PdfRenderPolicy {
-  if (environment.isLegacyWebKit) {
-    return legacyWebKitPolicy;
-  }
   if (isLinux(environment.platform, environment.userAgent)) {
     return linuxPolicies[environment.linuxGraphicsTier ?? "unknown"];
+  }
+  if (environment.isLegacyWebKit) {
+    return legacyWebKitPolicy;
   }
   return modernWebKitPolicy;
 }
@@ -111,7 +114,7 @@ export async function resolvePdfRenderPolicy(
   environment: PdfRenderEnvironment,
   probe: () => Promise<LinuxGraphicsTier>
 ): Promise<PdfRenderPolicy> {
-  if (environment.isLegacyWebKit || !isLinux(environment.platform, environment.userAgent)) {
+  if (!isLinux(environment.platform, environment.userAgent)) {
     return buildPdfRenderPolicy(environment);
   }
 

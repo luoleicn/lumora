@@ -106,7 +106,6 @@ import {
   type MendeleySettings
 } from "./lib/mendeleyClient";
 import { AppUpdater, initialAppUpdateState, type AppUpdateState } from "./lib/appUpdater";
-import { isLinuxNativePdfPlatform } from "./lib/nativePdfRenderer";
 
 const workspaceLayoutKey = "lumora:workspace-layout";
 const collapseThreshold = 82;
@@ -154,7 +153,6 @@ type WorkspaceTab =
   | { id: string; kind: "paper"; paperId: string; title: string };
 
 const documentsTab: WorkspaceTab = { id: "documents", kind: "documents", title: "Documents" };
-const useNativePdfFilePaths = isLinuxNativePdfPlatform();
 
 function isPdfFile(fileAsset: FileAsset) {
   return fileAsset.mime === "application/pdf" || /\.pdf$/i.test(fileAsset.fileName);
@@ -790,9 +788,15 @@ export default function App() {
       && !fileAsset.deletedAt
       && isLocalPdfFile(fileAsset)
       && (Boolean(fileDataById[fileAsset.id]?.length)
-        || Boolean(useNativePdfFilePaths && fileStorageSettings.directory && fileAsset.localPath))
+        || Boolean(fileStorageSettings.directory && fileAsset.localPath))
     )
     : false;
+  async function requestSelectedFileData() {
+    if (!selectedFile) {
+      return undefined;
+    }
+    return selectedFileData ?? readFileBytes(selectedFile, fileStorageSettings);
+  }
   const activeWorkspaceTab = workspaceTabs.find((tab) => tab.id === activeWorkspaceTabId) ?? documentsTab;
   const searchMode = activeWorkspaceTab.kind === "paper" ? "pdf" as const : "library" as const;
 
@@ -823,10 +827,10 @@ export default function App() {
       const fileAsset =
         library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt && isLocalPdfFile(item))
         ?? library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt && isPdfFile(item));
-      const opensNatively = useNativePdfFilePaths
-        && Boolean(fileStorageSettings.directory)
-        && Boolean(fileAsset?.localPath);
-      return fileAsset && !opensNatively ? [fileAsset.id] : [];
+      const opensFromStoragePath = Boolean(
+        fileStorageSettings.directory && fileAsset?.localPath
+      );
+      return fileAsset && !opensFromStoragePath ? [fileAsset.id] : [];
     });
 
     // The Details panel (Extract PDF, metadata preview) needs bytes for the
@@ -836,7 +840,7 @@ export default function App() {
         .filter((item) => item.paperId === selectedPaperId
           && !item.deletedAt
           && isPdfFile(item)
-          && !(useNativePdfFilePaths && fileStorageSettings.directory && item.localPath))
+          && !(fileStorageSettings.directory && item.localPath))
         .map((item) => item.id)
       : [];
     for (const selectedFileId of selectedFileIds) {
@@ -849,9 +853,10 @@ export default function App() {
   }, [fileStorageSettings.directory, library.fileAssets, library.papers, selectedPaperId, workspaceTabs]);
 
   // PDF bytes are large and each retained Uint8Array prevents the corresponding
-  // document from being reclaimed. Keep the files owned by open tabs warm so a
-  // tab switch never rebuilds its PDF.js document, while closing a tab still
-  // releases bytes that are no longer needed by the Details panel.
+  // document from being reclaimed. Disk-backed readers now open their native
+  // path directly (Poppler on Linux, PDF.js ranges elsewhere), so this cache is
+  // reserved for legacy IndexedDB PDFs. Details loads disk bytes only when its
+  // explicit metadata extraction action needs them.
   useEffect(() => {
     const requiredFileIds = new Set(openPaperFileIds);
     setFileDataById((current) => {
@@ -2009,6 +2014,7 @@ export default function App() {
               paper={selectedPaper}
               fileAsset={selectedFile}
               fileData={selectedFileData}
+              onRequestFileData={requestSelectedFileData}
               hasLocalPdf={selectedHasLocalPdf}
               annotations={selectedAnnotations}
               fileStorageSettings={fileStorageSettings}

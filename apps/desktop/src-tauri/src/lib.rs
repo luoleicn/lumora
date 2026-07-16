@@ -1722,6 +1722,62 @@ async fn read_stored_pdf(dir: String, file_name: String) -> Result<tauri::ipc::R
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+const MAX_STORED_PDF_RANGE_BYTES: u64 = 2 * 1024 * 1024;
+
+#[tauri::command]
+async fn read_stored_pdf_range(
+    dir: String,
+    file_name: String,
+    begin: u64,
+    end: u64,
+) -> Result<tauri::ipc::Response, String> {
+    let path = resolve_stored_file_path(&dir, &file_name)?;
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        read_stored_pdf_range_bytes(&path, begin, end)
+    })
+    .await
+    .map_err(|error| format!("Failed to join PDF range read task: {error}"))??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+fn read_stored_pdf_range_bytes(
+    path: &std::path::Path,
+    begin: u64,
+    end: u64,
+) -> Result<Vec<u8>, String> {
+    if end <= begin {
+        return Err("Invalid PDF byte range.".to_string());
+    }
+    if end - begin > MAX_STORED_PDF_RANGE_BYTES {
+        return Err(format!(
+            "PDF byte range exceeds the {} byte limit.",
+            MAX_STORED_PDF_RANGE_BYTES
+        ));
+    }
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("Failed to stat {}: {error}", path.display()))?
+        .len();
+    if begin >= file_len {
+        return Err(format!(
+            "PDF byte range starts beyond end of file: {begin} >= {file_len}."
+        ));
+    }
+
+    let bounded_end = end.min(file_len);
+    let byte_count = usize::try_from(bounded_end - begin)
+        .map_err(|_| "PDF byte range is too large for this platform.".to_string())?;
+    let mut bytes = vec![0; byte_count];
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(begin))
+        .map_err(|error| format!("Failed to seek {}: {error}", path.display()))?;
+    std::io::Read::read_exact(&mut file, &mut bytes)
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    Ok(bytes)
+}
+
 #[tauri::command]
 async fn stored_pdf_metadata(dir: String, file_name: String) -> Result<StoredFileMetadata, String> {
     validate_stored_file_name(&file_name)?;
@@ -2225,6 +2281,7 @@ pub fn run() {
             store_pdf,
             list_stored_pdfs,
             read_stored_pdf,
+            read_stored_pdf_range,
             stored_pdf_metadata,
             delete_stored_pdf,
             move_stored_pdf,
@@ -2720,8 +2777,9 @@ mod tests {
     use super::{
         build_fts_column_query, cjk_segment, classify_linux_graphics_capability,
         configure_library_connection, ensure_search_index, index_paper_body, init_library_schema,
-        normalize_arxiv_id, resolve_stored_file_path, search_library_rows,
-        sync_search_index_for_change, validate_proxy_settings, ProxySettings, SEARCH_RESULT_LIMIT,
+        normalize_arxiv_id, read_stored_pdf_range_bytes, resolve_stored_file_path,
+        search_library_rows, sync_search_index_for_change, validate_proxy_settings, ProxySettings,
+        SEARCH_RESULT_LIMIT,
     };
 
     #[test]
@@ -2740,6 +2798,30 @@ mod tests {
         );
         assert!(resolve_stored_file_path(directory.to_str().unwrap(), "../paper.pdf").is_err());
         assert!(resolve_stored_file_path(directory.to_str().unwrap(), "missing.pdf").is_err());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reads_bounded_stored_pdf_ranges() {
+        let directory = std::env::temp_dir().join(format!(
+            "lumora-pdf-range-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let file_path = directory.join("paper.pdf");
+        std::fs::write(&file_path, b"%PDF-1.4-range-data").unwrap();
+
+        assert_eq!(
+            read_stored_pdf_range_bytes(&file_path, 5, 10).unwrap(),
+            b"1.4-r"
+        );
+        assert_eq!(
+            read_stored_pdf_range_bytes(&file_path, 15, 100).unwrap(),
+            b"data"
+        );
+        assert!(read_stored_pdf_range_bytes(&file_path, 4, 4).is_err());
+        assert!(read_stored_pdf_range_bytes(&file_path, 100, 101).is_err());
 
         std::fs::remove_dir_all(directory).unwrap();
     }

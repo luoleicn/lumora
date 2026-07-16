@@ -26,6 +26,7 @@ import {
   buildPdfPageMetrics,
   defaultPdfPageAspectRatio,
   findPdfPageRange,
+  listMountedPdfPageIndexes,
   pageOffset,
   type PdfPageRange
 } from "../lib/pdfVirtualization";
@@ -35,6 +36,8 @@ import {
   resolvePdfDevicePixelRatio,
   type PdfRenderPolicy
 } from "../lib/pdfRenderPolicy";
+import { getStoredPdfMetadata, readPdfFromDisk } from "../lib/fileStorage";
+import { createLocalPdfRangeTransport, localPdfRangeChunkSize } from "../lib/pdfRangeTransport";
 import { isLegacyWebKit } from "../lib/webkitPolyfills";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
@@ -156,8 +159,10 @@ function PdfReaderComponent({
   const onViewStateChangeRef = useRef(onViewStateChange);
   const [pdfRenderPolicy, setPdfRenderPolicy] = useState<PdfRenderPolicy>(() => activePdfRenderPolicy);
   const nativePdfEnabled = shouldUseNativePdfRenderer(pdfRenderPolicy);
-  const nativePdfFileName = fileAsset?.localPath;
-  const hasNativePdfPath = nativePdfEnabled && Boolean(fileStorageDirectory && nativePdfFileName);
+  const storedPdfFileName = fileAsset?.localPath;
+  const hasStoredPdfPath = Boolean(fileStorageDirectory && storedPdfFileName);
+  const hasNativePdfPath = nativePdfEnabled && hasStoredPdfPath;
+  const hasPdfJsRangePath = !nativePdfEnabled && hasStoredPdfPath;
   const [nativeRenderer, setNativeRenderer] = useState<NativePdfRendererState>(() => (
     nativePdfEnabled ? { status: "loading" } : { status: "disabled" }
   ));
@@ -177,27 +182,60 @@ function PdfReaderComponent({
   const [pageJumpOpen, setPageJumpOpen] = useState(false);
   const [pageJumpValue, setPageJumpValue] = useState("");
   const [loadError, setLoadError] = useState<string>();
+  const [storedPdfSize, setStoredPdfSize] = useState<number>();
+  const [rangeFallbackFileData, setRangeFallbackFileData] = useState<Uint8Array>();
   const [findMatches, setFindMatches] = useState<PdfSearchMatch[]>([]);
   const [searchTargets, setSearchTargets] = useState<PdfSearchTarget[]>([]);
   const [activeMatchIndex, setActiveMatchIndex] = useState(-1);
   const searchTargetsRef = useRef<PdfSearchTarget[]>([]);
+  const effectiveFileData = fileData ?? rangeFallbackFileData;
   const documentFile = useMemo(
-    () => (!useNativePageRenderer && fileData ? { data: fileData.slice() } : undefined),
-    [fileData, useNativePageRenderer]
+    () => {
+      if (useNativePageRenderer) {
+        return undefined;
+      }
+      if (effectiveFileData) {
+        return { data: effectiveFileData.slice() };
+      }
+      if (!hasPdfJsRangePath || !fileStorageDirectory || !storedPdfFileName || !storedPdfSize) {
+        return undefined;
+      }
+
+      return {
+        range: createLocalPdfRangeTransport(pdfjs.PDFDataRangeTransport, {
+          directory: fileStorageDirectory,
+          fileName: storedPdfFileName,
+          size: storedPdfSize
+        }, () => {
+          // A file can be replaced or moved between metadata and range reads.
+          // Fall back to the original full-file path instead of leaving PDF.js
+          // waiting forever for a failed custom range request.
+          void readPdfFromDisk(fileStorageDirectory, storedPdfFileName)
+            .then(setRangeFallbackFileData)
+            .catch((reason) => setLoadError(reason instanceof Error ? reason.message : String(reason)));
+        })
+      };
+    },
+    [effectiveFileData, fileStorageDirectory, hasPdfJsRangePath, storedPdfFileName, storedPdfSize, useNativePageRenderer]
   );
+  const documentOptions = useMemo(() => {
+    const usesRangeTransport = Boolean(documentFile && "range" in documentFile);
+    return usesRangeTransport ? {
+      disableAutoFetch: true,
+      disableStream: true,
+      rangeChunkSize: localPdfRangeChunkSize
+    } : undefined;
+  }, [documentFile]);
   const renderedPageWidth = pageWidth * zoom;
   const pageMetrics = useMemo(
     () => buildPdfPageMetrics(numPages, renderedPageWidth, pageAspectRatios),
     [numPages, pageAspectRatios, renderedPageWidth]
   );
   const virtualPageIndexes = useMemo(() => {
-    if (pageRange.end < pageRange.start || numPages === 0) {
-      return [];
-    }
-    const start = Math.min(Math.max(pageRange.start, 0), numPages - 1);
-    const end = Math.min(Math.max(pageRange.end, start), numPages - 1);
-    return Array.from({ length: end - start + 1 }, (_, offset) => start + offset);
-  }, [numPages, pageRange]);
+    // Keep the parsed PDF document warm for fast tab switching, but release
+    // hidden canvases, text layers and native page images immediately.
+    return listMountedPdfPageIndexes(numPages, pageRange, active);
+  }, [active, numPages, pageRange]);
 
   const visibleAnnotations = useMemo(
     () => annotations.filter((annotation) =>
@@ -220,6 +258,35 @@ function PdfReaderComponent({
   }, []);
 
   useEffect(() => {
+    if (!hasPdfJsRangePath || !fileStorageDirectory || !storedPdfFileName) {
+      setStoredPdfSize(undefined);
+      setRangeFallbackFileData(undefined);
+      return;
+    }
+
+    let cancelled = false;
+    setStoredPdfSize(undefined);
+    setRangeFallbackFileData(undefined);
+    void getStoredPdfMetadata(fileStorageDirectory, storedPdfFileName)
+      .then((metadata) => {
+        if (!cancelled) {
+          if (metadata.size <= 0) {
+            throw new Error("The stored PDF is empty.");
+          }
+          setStoredPdfSize(metadata.size);
+        }
+      })
+      .catch((reason) => {
+        if (!cancelled) {
+          setLoadError(reason instanceof Error ? reason.message : String(reason));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [fileStorageDirectory, hasPdfJsRangePath, storedPdfFileName]);
+
+  useEffect(() => {
     if (!nativePdfEnabled || (!hasNativePdfPath && !fileData)) {
       setNativeRenderer({ status: "disabled" });
       return;
@@ -228,7 +295,7 @@ function PdfReaderComponent({
     let cancelled = false;
     setNativeRenderer({ status: "loading" });
     const openDocument = hasNativePdfPath
-      ? openNativePdfPath(fileStorageDirectory!, nativePdfFileName!)
+      ? openNativePdfPath(fileStorageDirectory!, storedPdfFileName!)
       : openNativePdfDocument(fileData!);
     void openDocument.then((document) => {
       if (cancelled) {
@@ -250,7 +317,7 @@ function PdfReaderComponent({
     return () => {
       cancelled = true;
     };
-  }, [fileData, fileStorageDirectory, hasNativePdfPath, nativePdfEnabled, nativePdfFileName, paper?.id]);
+  }, [fileData, fileStorageDirectory, hasNativePdfPath, nativePdfEnabled, storedPdfFileName, paper?.id]);
 
   useLayoutEffect(() => {
     const element = scrollRef.current;
@@ -267,7 +334,7 @@ function PdfReaderComponent({
     const observer = new ResizeObserver(resize);
     observer.observe(element);
     return () => observer.disconnect();
-  }, [fileData, nativePdfFileName, paper?.id]);
+  }, [fileData, storedPdfFileName, paper?.id]);
 
   useEffect(() => {
     if (!active) {
@@ -320,7 +387,7 @@ function PdfReaderComponent({
       window.clearTimeout(viewStateCommitTimerRef.current);
       viewStateCommitTimerRef.current = undefined;
     }
-  }, [fileData, paper?.id]);
+  }, [fileData, fileStorageDirectory, paper?.id, storedPdfFileName]);
 
   useEffect(() => {
     onViewStateChangeRef.current = onViewStateChange;
@@ -337,7 +404,7 @@ function PdfReaderComponent({
   }, [hasExplicitZoom, zoom]);
 
   useEffect(() => {
-    if (!fileData || numPages === 0) {
+    if ((!effectiveFileData && !hasStoredPdfPath) || numPages === 0) {
       return;
     }
 
@@ -346,7 +413,7 @@ function PdfReaderComponent({
     const frame = restorePendingScroll();
 
     return () => cancelAnimationFrame(frame);
-  }, [fileData, numPages, paper?.id]);
+  }, [effectiveFileData, hasStoredPdfPath, numPages, paper?.id]);
 
   useEffect(() => {
     pageRefs.current = pageRefs.current.slice(0, numPages);
@@ -940,7 +1007,7 @@ function PdfReaderComponent({
     );
   }
 
-  if (!fileData && !hasNativePdfPath) {
+  if (!fileData && !hasStoredPdfPath) {
     return (
       <section className="reader-empty">
         <div>
@@ -1035,9 +1102,10 @@ function PdfReaderComponent({
                 </div>
               ))}
             </div>
-          ) : nativePdfEnabled ? null : (
+          ) : nativePdfEnabled ? null : documentFile ? (
             <Document
               file={documentFile}
+              options={documentOptions}
               loading={<div className="pdf-status">Loading PDF...</div>}
               error={<div className="pdf-status">Failed to load PDF.{loadError ? <span>{loadError}</span> : null}</div>}
               onLoadSuccess={(document) => {
@@ -1124,6 +1192,10 @@ function PdfReaderComponent({
                 ))}
               </div>
             </Document>
+          ) : (
+            <div className="pdf-status">
+              {loadError ? <>Failed to prepare PDF.<span>{loadError}</span></> : "Preparing PDF..."}
+            </div>
           )}
         </div>
         {contextMenu && (
@@ -1203,7 +1275,10 @@ function arePdfReaderPropsEqual(previous: PdfReaderProps, next: PdfReaderProps) 
   return previous.paper?.id === next.paper?.id
     && previous.paper?.title === next.paper?.title
     && previous.fileAsset?.id === next.fileAsset?.id
+    && previous.fileAsset?.localPath === next.fileAsset?.localPath
+    && previous.fileAsset?.size === next.fileAsset?.size
     && previous.fileData === next.fileData
+    && previous.fileStorageDirectory === next.fileStorageDirectory
     && previous.active === next.active
     && previous.pdfSearchQuery === next.pdfSearchQuery
     && annotationsEqual(previous.annotations, next.annotations);

@@ -67,6 +67,21 @@ export function pageOffset(metrics: PdfPageMetrics, pageIndex: number): number {
   return metrics.offsets[clampedIndex] ?? 0;
 }
 
+/** Materialize only the mounted page window; inactive readers keep their PDF
+ * document session but deliberately own no canvases or text-layer DOM. */
+export function listMountedPdfPageIndexes(
+  numPages: number,
+  range: PdfPageRange,
+  active = true
+): number[] {
+  if (!active || numPages <= 0 || range.end < range.start) {
+    return [];
+  }
+  const start = Math.min(Math.max(range.start, 0), numPages - 1);
+  const end = Math.min(Math.max(range.end, start), numPages - 1);
+  return Array.from({ length: end - start + 1 }, (_, offset) => start + offset);
+}
+
 function findFirstPageEndingAfter(metrics: PdfPageMetrics, value: number): number {
   let low = 0;
   let high = metrics.offsets.length - 1;
