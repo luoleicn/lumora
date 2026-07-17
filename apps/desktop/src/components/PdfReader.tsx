@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Document, Page, pdfjs } from "react-pdf";
@@ -90,6 +90,13 @@ export type PdfSearchState = {
   activeMatchIndex: number;
 };
 
+/** Find-in-document navigation, registered by the active reader so the app
+ * toolbar can drive next/previous from outside the component tree. */
+export type PdfSearchNavHandle = {
+  goToNextFindMatch: () => void;
+  goToPrevFindMatch: () => void;
+};
+
 type PdfReaderProps = {
   paper?: Paper;
   fileAsset?: FileAsset;
@@ -103,6 +110,8 @@ type PdfReaderProps = {
   onDeleteAnnotation: (annotation: Annotation) => void;
   pdfSearchQuery?: string;
   onPdfSearchUpdate?: (state: PdfSearchState) => void;
+  /** Stable ref shared by all readers; only the active one registers into it. */
+  searchNavRef?: MutableRefObject<PdfSearchNavHandle | null>;
 };
 
 type WebKitGestureEvent = Event & {
@@ -144,7 +153,8 @@ function PdfReaderComponent({
   onCreateAnnotation,
   onDeleteAnnotation,
   pdfSearchQuery,
-  onPdfSearchUpdate
+  onPdfSearchUpdate,
+  searchNavRef
 }: PdfReaderProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const pageJumpInputRef = useRef<HTMLInputElement>(null);
@@ -674,19 +684,27 @@ function PdfReaderComponent({
     scrollToPage(targets[prev].pageIndex, "smooth");
   }
 
-  // Expose the navigation functions so App.tsx (via the toolbar) can drive them.
-  // We update the refs on every render so the parent always sees the latest.
-  const navRef = useRef({ goToNextFindMatch, goToPrevFindMatch });
-  navRef.current = { goToNextFindMatch, goToPrevFindMatch };
-
-  // Store nav in a DOM data attribute so the parent can retrieve it imperatively
-  // without threading callbacks through the memo comparison.
-  const readerBodyRef = useRef<HTMLDivElement>(null);
+  // Register find navigation with the app toolbar. Only the active reader
+  // registers, so the toolbar always drives the tab the user is looking at.
+  // The handle delegates through a per-render ref: registration only re-runs
+  // when `active` flips, yet always calls the latest closures.
+  const findNavRef = useRef({ goToNextFindMatch, goToPrevFindMatch });
+  findNavRef.current = { goToNextFindMatch, goToPrevFindMatch };
   useEffect(() => {
-    const el = readerBodyRef.current;
-    if (!el) return;
-    (el as HTMLDivElement & { __pdfSearchNav?: typeof navRef.current }).__pdfSearchNav = navRef.current;
-  });
+    if (!active || !searchNavRef) {
+      return undefined;
+    }
+    const handle: PdfSearchNavHandle = {
+      goToNextFindMatch: () => findNavRef.current.goToNextFindMatch(),
+      goToPrevFindMatch: () => findNavRef.current.goToPrevFindMatch()
+    };
+    searchNavRef.current = handle;
+    return () => {
+      if (searchNavRef.current === handle) {
+        searchNavRef.current = null;
+      }
+    };
+  }, [active, searchNavRef]);
 
   function handleContextMenu(event: React.MouseEvent) {
     if (!active) {
@@ -1024,7 +1042,7 @@ function PdfReaderComponent({
       data-pdf-render-tier={pdfRenderPolicy.tier}
       data-pdf-renderer={nativePdfEnabled ? `native-${nativeRenderer.status}` : "pdfjs"}
     >
-      <div className="reader-body" ref={readerBodyRef}>
+      <div className="reader-body">
         <div
           ref={scrollRef}
           className="pdf-scroll"

@@ -1,15 +1,3 @@
-// PdfReader stores its find-navigation callbacks on the reader-body DOM element
-// so the parent can drive next/prev from toolbar buttons without threading refs
-// through the React memo comparison.
-declare global {
-  interface HTMLDivElement {
-    __pdfSearchNav?: {
-      goToNextFindMatch: () => void;
-      goToPrevFindMatch: () => void;
-    };
-  }
-}
-
 import { useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
@@ -18,13 +6,13 @@ import { FileText, X } from "lucide-react";
 import { AppToolbar } from "./components/AppToolbar";
 import { ArxivDownloadToast } from "./components/ArxivDownloadToast";
 import { CollectionModal, DeleteCollectionModal, RenameCollectionModal } from "./components/CollectionModal";
-import { LibrarySidebar, type LibrarySyncActivity } from "./components/LibrarySidebar";
+import { LibrarySidebar } from "./components/LibrarySidebar";
 import { ManualReferenceModal, type ManualReferenceDraft } from "./components/ManualReferenceModal";
 import { ShortcutsHelpModal } from "./components/ShortcutsHelpModal";
 import { AboutModal } from "./components/AboutModal";
 import { NotebookPanel } from "./components/NotebookPanel";
 import { PaperList } from "./components/PaperList";
-import { PdfReader, type PdfReaderViewState } from "./components/PdfReader";
+import { PdfReader, type PdfReaderViewState, type PdfSearchNavHandle } from "./components/PdfReader";
 import { SyncPanel } from "./components/SyncPanel";
 import { SyncSettingsModal } from "./components/SyncSettingsModal";
 import { createId } from "./lib/id";
@@ -41,13 +29,11 @@ import {
   permanentlyDeleteAllFromTrash
 } from "./lib/libraryActions";
 import {
-  loadLibraryState,
   deleteFileBlob,
   markAnnotationDeleted,
-  saveLibraryState,
   upsertById
 } from "./lib/localStore";
-import { deletePersistedEntities, enqueueLibraryPersist, importStateToDb, loadLibraryFromDb } from "./lib/libraryDb";
+import { deletePersistedEntities } from "./lib/libraryDb";
 import {
   buildPdfFileName,
   bindPdfToPaper,
@@ -79,33 +65,13 @@ import {
   type PaperSearchMeta,
   type SearchHit
 } from "./lib/searchIndex";
-import { downloadMissingArxivFiles, formatFileSize, type ArxivDownloadProgress } from "./lib/arxivFiles";
+import { formatFileSize } from "./lib/arxivFiles";
 import { defaultProxySettings, loadProxySettings, saveProxySettings, type ProxySettings } from "./lib/proxySettings";
-import {
-  defaultSyncSettings,
-  loadAutoSyncSettings,
-  loadSyncConfig,
-  saveAutoSyncSettings,
-  saveSyncConfig,
-  syncLibrary,
-  testSyncConnection,
-  type AutoSyncSettings,
-  type SyncSettings
-} from "./lib/syncClient";
-import {
-  connectMendeley,
-  disconnectMendeley,
-  getMendeleyConnection,
-  loadMendeleySettings,
-  mergeBackgroundSyncState,
-  saveMendeleySettings,
-  syncWithMendeley,
-  MendeleySyncCancelledError,
-  type MendeleyConnection,
-  type MendeleySyncProgress,
-  type MendeleySettings
-} from "./lib/mendeleyClient";
 import { AppUpdater, initialAppUpdateState, type AppUpdateState } from "./lib/appUpdater";
+import { useLibraryStore } from "./hooks/useLibraryStore";
+import { useCloudSync } from "./hooks/useCloudSync";
+import { useMendeleySync } from "./hooks/useMendeleySync";
+import { useArxivDownloads } from "./hooks/useArxivDownloads";
 
 const workspaceLayoutKey = "lumora:workspace-layout";
 const collapseThreshold = 82;
@@ -195,15 +161,24 @@ export default function App() {
   const bindPdfPaperIdRef = useRef<string | undefined>(undefined);
   const importTargetCollectionIdRef = useRef<string | undefined>(undefined);
   const pdfRenameInFlightRef = useRef(false);
-  const mendeleyCancelRequestedRef = useRef(false);
-  const cloudSyncCancelRequestedRef = useRef(false);
-  const arxivDownloadInFlightRef = useRef(false);
-  const cloudSyncInFlightRef = useRef(false);
-  const libraryRef = useRef<LibraryState | undefined>(undefined);
-  const lastPersistedLibraryRef = useRef<LibraryState | undefined>(undefined);
-  const libraryLoadedRef = useRef(false);
-  const localStorageFallbackRef = useRef(false);
-  const [library, setLibrary] = useState<LibraryState>(() => loadLibraryState());
+  // Filled by whichever PdfReader is active; the toolbar drives find next/prev
+  // through it without re-rendering the memoized readers.
+  const pdfSearchNavRef = useRef<PdfSearchNavHandle | null>(null);
+  const [status, setStatus] = useState<string>();
+  const [fileStorageSettings, setFileStorageSettings] = useState<FileStorageSettings>(() => loadFileStorageSettings());
+  const [syncSettingsOpen, setSyncSettingsOpen] = useState(false);
+  const libraryStore = useLibraryStore({
+    onError: setStatus,
+    reconcile: (state) => reconcileFileStorage(state, fileStorageSettings)
+  });
+  const { library, setLibrary, libraryRef, loadedRef: libraryLoadedRef, adoptFromDb } = libraryStore;
+  const cloudSync = useCloudSync({
+    store: libraryStore,
+    onStatus: setStatus,
+    onRequireConfiguration: () => setSyncSettingsOpen(true)
+  });
+  const mendeleySync = useMendeleySync({ store: libraryStore, fileStorageSettings, onStatus: setStatus });
+  const arxivDownloads = useArxivDownloads({ store: libraryStore, fileStorageSettings, onStatus: setStatus });
   const [selectedCollectionId, setSelectedCollectionId] = useState("all");
   const [selectedAuthor, setSelectedAuthor] = useState<string>();
   const [selectedTag, setSelectedTag] = useState<string>();
@@ -217,13 +192,6 @@ export default function App() {
   const [pdfSearchState, setPdfSearchState] = useState({ totalMatches: 0, activeMatchIndex: -1 });
   const backfillRunningRef = useRef(false);
   const [fileDataById, setFileDataById] = useState<Record<string, Uint8Array>>({});
-  const [settings, setSettings] = useState<SyncSettings>(defaultSyncSettings);
-  const [syncSettingsOpen, setSyncSettingsOpen] = useState(false);
-  // Kept separate from the global `busy` so the background periodic sync never
-  // leaves the Sync Settings modal stuck showing "Working…".
-  const [syncSettingsBusy, setSyncSettingsBusy] = useState(false);
-  const [autoSyncSettings, setAutoSyncSettings] = useState<AutoSyncSettings>(() => loadAutoSyncSettings());
-  const [fileStorageSettings, setFileStorageSettings] = useState<FileStorageSettings>(() => loadFileStorageSettings());
   const [fileStorageModalOpen, setFileStorageModalOpen] = useState(false);
   const [mendeleySyncOpen, setMendeleySyncOpen] = useState(false);
   const [proxySettingsOpen, setProxySettingsOpen] = useState(false);
@@ -232,14 +200,6 @@ export default function App() {
   const [proxySettingsLoaded, setProxySettingsLoaded] = useState(false);
   const [proxySettingsBusy, setProxySettingsBusy] = useState(false);
   const [proxySettingsError, setProxySettingsError] = useState<string>();
-  const [mendeleySettings, setMendeleySettings] = useState<MendeleySettings>(() => loadMendeleySettings());
-  const [mendeleyConnection, setMendeleyConnection] = useState<MendeleyConnection>();
-  const [mendeleySyncBusy, setMendeleySyncBusy] = useState(false);
-  const [arxivDownloadBusy, setArxivDownloadBusy] = useState(false);
-  const [arxivBatchProgress, setArxivBatchProgress] = useState<ArxivDownloadProgress>();
-  const arxivBatchToastDismissedRef = useRef(false);
-  const [mendeleySyncActivity, setMendeleySyncActivity] = useState<LibrarySyncActivity>();
-  const [cloudSyncActivity, setCloudSyncActivity] = useState<LibrarySyncActivity>();
   const [fileStorageBusy, setFileStorageBusy] = useState(false);
   const [workspaceLayout, setWorkspaceLayout] = useState<WorkspaceLayout>(() => loadWorkspaceLayout());
   const [resizeDrag, setResizeDrag] = useState<ResizeDrag>();
@@ -251,14 +211,8 @@ export default function App() {
   const [collectionModalOpen, setCollectionModalOpen] = useState(false);
   const [deleteCollectionId, setDeleteCollectionId] = useState<string | undefined>();
   const [renameCollectionId, setRenameCollectionId] = useState<string | undefined>();
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState<string>();
   const [appUpdateState, setAppUpdateState] = useState<AppUpdateState>(initialAppUpdateState);
   const collectionPaperCounts = useMemo(() => getCollectionPaperCounts(library), [library]);
-
-  useEffect(() => {
-    libraryRef.current = library;
-  }, [library]);
 
   useEffect(() => {
     void loadProxySettings()
@@ -276,116 +230,6 @@ export default function App() {
     void appUpdaterRef.current!.checkForUpdates("startup", proxySettings);
   }, [proxySettings, proxySettingsLoaded]);
 
-  // Startup: SQLite is the source of truth. When it is empty this is a first
-  // run on the new storage layer, so the legacy localStorage state (already in
-  // React state) is imported once; localStorage is kept untouched as a backup
-  // but never written again.
-  useEffect(() => {
-    let cancelled = false;
-
-    void (async () => {
-      try {
-        const { state: dbState, empty } = await loadLibraryFromDb();
-        if (cancelled) {
-          return;
-        }
-
-        if (!empty) {
-          lastPersistedLibraryRef.current = dbState;
-          libraryLoadedRef.current = true;
-          setLibrary(dbState);
-          // Reconcile records against the storage folder: drain any leftover
-          // IndexedDB blobs to disk, re-link PDFs that lost their localPath, and
-          // clear stale local flags. reconcileFileStorage persists its own
-          // changes, so advance the baseline to avoid a redundant full re-diff.
-          const reconciled = await reconcileFileStorage(dbState, fileStorageSettings);
-          if (cancelled || reconciled === dbState) {
-            return;
-          }
-          lastPersistedLibraryRef.current = reconciled;
-          setLibrary(reconciled);
-          return;
-        }
-
-        const legacyState = libraryRef.current ?? library;
-        await importStateToDb(legacyState);
-        if (cancelled) {
-          return;
-        }
-        lastPersistedLibraryRef.current = legacyState;
-        libraryLoadedRef.current = true;
-      } catch (error) {
-        // Without a working database, fall back to the legacy localStorage
-        // persistence for this session rather than silently losing edits.
-        localStorageFallbackRef.current = true;
-        setStatus(`Library database unavailable, falling back to browser storage: ${error}`);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    if (!libraryLoadedRef.current) {
-      if (localStorageFallbackRef.current) {
-        saveLibraryState(library);
-      }
-      return;
-    }
-
-    const previous = lastPersistedLibraryRef.current;
-    if (!previous || previous === library) {
-      return;
-    }
-
-    lastPersistedLibraryRef.current = library;
-    void enqueueLibraryPersist(previous, library, (error) => {
-      setStatus(`Failed to save library: ${error}`);
-    });
-  }, [library]);
-
-  useEffect(() => {
-    void loadSyncConfig().then(setSettings).catch((error) => setStatus(`Failed to load Qiniu settings: ${error}`));
-  }, []);
-
-  // Live progress emitted from the Rust cloud-sync command so the user can see
-  // which stage a long background sync is at instead of a single opaque spinner.
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    void listen<string>("qiniu-sync-stage", (event) => {
-      if (cloudSyncInFlightRef.current) {
-        setCloudSyncActivity((current) => current ? { ...current, message: event.payload } : current);
-      }
-    }).then((next) => {
-      unlisten = next;
-    });
-    return () => unlisten?.();
-  }, []);
-
-  // Cloud-sync activity card in the sidebar persists until the user explicitly
-  // dismisses it: clicking X while the sync is running cancels and dismisses;
-  // clicking X after completion simply closes the card.
-
-  useEffect(() => {
-    saveAutoSyncSettings(autoSyncSettings);
-  }, [autoSyncSettings]);
-
-  // Object-storage sync is intentionally periodic rather than edit-debounced:
-  // one run after startup, then once per configured interval while the app
-  // remains open. The user can disable it or change the interval in Sync Settings.
-  useEffect(() => {
-    if (!settings.configured || !autoSyncSettings.enabled) return;
-    const initial = window.setTimeout(() => void handleSync(), 1_000);
-    const timer = window.setInterval(() => void handleSync(), autoSyncSettings.intervalMinutes * 60 * 1_000);
-    return () => {
-      window.clearTimeout(initial);
-      window.clearInterval(timer);
-    };
-  }, [settings.configured, settings.bucket, settings.accessKey, autoSyncSettings.enabled, autoSyncSettings.intervalMinutes]);
-
   useEffect(() => {
     localStorage.setItem(workspaceLayoutKey, JSON.stringify(workspaceLayout));
   }, [workspaceLayout]);
@@ -395,15 +239,12 @@ export default function App() {
   }, [fileStorageSettings]);
 
   useEffect(() => {
-    saveMendeleySettings(mendeleySettings);
-  }, [mendeleySettings]);
-
-  useEffect(() => {
     if (!mendeleySyncOpen) {
       return;
     }
 
-    void getMendeleyConnection().then(setMendeleyConnection).catch(() => setMendeleyConnection(undefined));
+    void mendeleySync.refreshConnection();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mendeleySyncOpen]);
 
   useEffect(() => {
@@ -507,7 +348,7 @@ export default function App() {
       } else if (event.payload === "show-duplicate-documents") {
         setDuplicateDocumentsOpen(true);
       } else if (event.payload === "download-arxiv-files") {
-        void handleDownloadArxivFiles();
+        void arxivDownloads.download();
       } else if (event.payload === "refresh-library") {
         void handleRefreshLibrary();
       } else if (event.payload === "focus-toolbar-search") {
@@ -1286,13 +1127,11 @@ export default function App() {
 
   async function handleRefreshLibrary() {
     try {
-      const { state: dbState, empty } = await loadLibraryFromDb();
-      if (empty) {
+      const refreshed = await adoptFromDb();
+      if (!refreshed) {
         setStatus("Library is empty — nothing to refresh.");
         return;
       }
-      setLibrary(dbState);
-      lastPersistedLibraryRef.current = dbState;
       // Force re-reading file bytes for currently open papers so icons and
       // download states reflect the actual files on disk.
       setFileDataById({});
@@ -1530,65 +1369,6 @@ export default function App() {
     }
   }
 
-  async function handleDownloadArxivFiles(
-    paperId?: string,
-    detailProgress?: (progress: ArxivDownloadProgress) => void
-  ): Promise<string> {
-    if (arxivDownloadInFlightRef.current) {
-      const message = "arXiv file download is already running.";
-      setStatus(message);
-      return message;
-    }
-    arxivDownloadInFlightRef.current = true;
-    setArxivDownloadBusy(true);
-    arxivBatchToastDismissedRef.current = false;
-    const isBatch = !paperId;
-    const startingState = libraryRef.current ?? library;
-    const startingFiles = new Map(startingState.fileAssets.map((file) => [file.id, file]));
-    try {
-      const result = await downloadMissingArxivFiles(startingState, fileStorageSettings, {
-        paperIds: paperId ? [paperId] : undefined,
-        onProgress: (progress) => {
-          detailProgress?.(progress);
-          if (isBatch && !arxivBatchToastDismissedRef.current) {
-            setArxivBatchProgress(progress.total > 0 ? progress : undefined);
-          }
-          const position = Math.min(progress.total, progress.done + (progress.phase === "downloading" ? 1 : 0));
-          const byteProgress = progress.downloadedBytes !== undefined
-            ? ` — ${formatFileSize(progress.downloadedBytes)}${progress.totalBytes ? ` / ${formatFileSize(progress.totalBytes)}` : ""}`
-            : "";
-          setStatus(progress.total === 0
-            ? "No missing arXiv PDFs found."
-            : `${progress.phase === "checking" ? "Checking" : progress.phase === "waiting" ? "Waiting for arXiv" : "Downloading arXiv PDF"} `
-              + `(${position}/${progress.total})${progress.arxivId ? `: ${progress.arxivId}` : ""}${byteProgress}`);
-        },
-        onStateUpdate: (partialState) => {
-          const downloadedFiles = partialState.fileAssets.filter((file) => {
-            const before = startingFiles.get(file.id);
-            return !before || before.sha256 !== file.sha256 || before.downloadState !== file.downloadState || before.localPath !== file.localPath;
-          });
-          setLibrary((current) => ({
-            ...current,
-            fileAssets: downloadedFiles.reduce((items, file) => upsertById(items, file), current.fileAssets)
-          }));
-        }
-      });
-      const message =
-        `arXiv files: ${result.downloaded} downloaded, ${result.alreadyPresent} already present`
-        + (result.failed.length ? `, ${result.failed.length} failed (${result.failed.map((item) => item.arxivId).join(", ")}).` : ".");
-      setStatus(message);
-      return message;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setStatus(message);
-      return message;
-    } finally {
-      arxivDownloadInFlightRef.current = false;
-      setArxivDownloadBusy(false);
-      setArxivBatchProgress(undefined);
-    }
-  }
-
   async function handleSaveProxySettings(settings: ProxySettings) {
     setProxySettingsBusy(true);
     setProxySettingsError(undefined);
@@ -1665,206 +1445,6 @@ export default function App() {
     }
   }
 
-  async function handleSaveSyncSettings(nextSettings: SyncSettings) {
-    setSyncSettingsBusy(true);
-    setStatus(undefined);
-    try {
-      const saved = await saveSyncConfig(nextSettings);
-      setSettings({ ...saved, secretKey: undefined });
-      await testSyncConnection();
-      setStatus("Qiniu private bucket configured.");
-    } catch (error) {
-      setStatus(formatActionError(error));
-    } finally {
-      setSyncSettingsBusy(false);
-    }
-  }
-
-  // Cloud sync runs in the background: it never sets the global `busy`, so the
-  // user can keep working while a live progress indicator tracks each stage.
-  async function handleSync() {
-    if (cloudSyncInFlightRef.current) return;
-    if (!settings.configured) {
-      setSyncSettingsOpen(true);
-      return;
-    }
-    const syncStartedAt = new Date().toISOString();
-    const baseState = libraryRef.current ?? library;
-    cloudSyncInFlightRef.current = true;
-    cloudSyncCancelRequestedRef.current = false;
-    setCloudSyncActivity({ state: "running", message: "Starting sync…", completed: 0, total: 5 });
-    try {
-      const result = await syncLibrary(
-        settings,
-        baseState,
-        (message, completed = 0, total = 5) =>
-          setCloudSyncActivity({ state: "running", message, completed, total })
-      );
-      if (cloudSyncCancelRequestedRef.current) return;
-      // syncLibrary reloads its result from SQLite, so every entity has a new
-      // object identity even when its content did not change. Treat that state
-      // as the persisted baseline before publishing it to React; otherwise the
-      // reference-based persistence diff marks the entire library local again.
-      // Merge on top any edits made while the background sync was in flight.
-      lastPersistedLibraryRef.current = result.state;
-      setLibrary((current) => mergeBackgroundSyncState(baseState, result.state, current, syncStartedAt));
-      setCloudSyncActivity({
-        state: "success",
-        message: `${result.summary.uploadedChanges} changes uploaded, ${result.summary.downloadedChanges} downloaded · `
-          + `${formatFileSize(result.summary.uploadedBytes)} PUT, ${formatFileSize(result.summary.downloadedBytes)} GET · `
-          + `${result.summary.requestCount} requests (`
-          + `${result.summary.putRequests} PUT/${result.summary.getRequests} GET/`
-          + `${result.summary.headRequests} HEAD/${result.summary.deleteRequests} DELETE)`,
-        completed: 5,
-        total: 5
-      });
-    } catch (error) {
-      if (cloudSyncCancelRequestedRef.current) return;
-      // Metadata (papers, collections, membership) is committed to the DB during
-      // the pull phase, before file blobs are fetched. When a later stage throws,
-      // the returned state never reaches setLibrary, leaving the sidebar stale
-      // until a manual refresh. Reload from the DB so everything that did land is
-      // reflected immediately; keep the original sync error if the reload fails.
-      try {
-        const { state: dbState, empty } = await loadLibraryFromDb();
-        if (!empty) {
-          setLibrary(dbState);
-          lastPersistedLibraryRef.current = dbState;
-        }
-      } catch {
-        // Ignore — surface the original sync failure below.
-      }
-      setCloudSyncActivity({ state: "error", message: formatActionError(error), completed: 0, total: 5 });
-    } finally {
-      cloudSyncInFlightRef.current = false;
-    }
-  }
-
-  async function handleMendeleyConnect() {
-    setBusy(true);
-    setStatus("Waiting for Mendeley authorization in the browser...");
-    try {
-      const connection = await connectMendeley(mendeleySettings);
-      setMendeleyConnection(connection);
-      setStatus(connection.displayName ? `Connected to Mendeley as ${connection.displayName}.` : "Connected to Mendeley.");
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleMendeleyDisconnect() {
-    await runBusy("Disconnected from Mendeley.", async () => {
-      await disconnectMendeley();
-      setMendeleyConnection({ connected: false });
-    });
-  }
-
-  async function handleMendeleySync() {
-    if (mendeleySyncBusy) {
-      return;
-    }
-    const syncStartedAt = new Date().toISOString();
-    const baseState = libraryRef.current ?? library;
-    let mergeBaseState = baseState;
-    mendeleyCancelRequestedRef.current = false;
-    setMendeleySyncBusy(true);
-    setMendeleySyncActivity({ state: "running", message: "Starting Mendeley sync…", completed: 0, total: 8 });
-    setStatus("Syncing with Mendeley...");
-    try {
-      const { state: nextState, summary } = await syncWithMendeley(
-        baseState,
-        mendeleySettings,
-        fileStorageSettings,
-        (progress: MendeleySyncProgress) => {
-          setMendeleySyncActivity({
-            state: "running",
-            message: progress.message,
-            completed: progress.completed,
-            total: progress.total
-          });
-        },
-        {
-          isCancelled: () => mendeleyCancelRequestedRef.current,
-          onStateUpdate: (partialState) => {
-            const previousMergeBase = mergeBaseState;
-            mergeBaseState = partialState;
-            setLibrary((current) => mergeBackgroundSyncState(previousMergeBase, partialState, current, syncStartedAt));
-          }
-        }
-      );
-      setLibrary((current) => mergeBackgroundSyncState(mergeBaseState, nextState, current, syncStartedAt));
-      const completionMessage =
-        `Mendeley sync complete: ${summary.pulled} pulled, ${summary.pushed} pushed, `
-        + `${summary.folders} folders, ${summary.folderLinks} folder links, ${summary.files} files, `
-        + `${summary.annotations} annotations; ${summary.deletedLocally} deleted locally, `
-        + `${summary.deletedRemotely} deleted remotely.`
-        + (summary.unavailableResources.length
-          ? ` Mendeley did not expose: ${summary.unavailableResources.join(", ")}.`
-          : "");
-      setStatus(completionMessage);
-      setMendeleySyncActivity({
-        state: "success",
-        message: `${summary.pulled} papers, ${summary.folders} folders, ${summary.files} files, ${summary.annotations} annotations`,
-        completed: 8,
-        total: 8
-      });
-    } catch (error) {
-      if (error instanceof MendeleySyncCancelledError) {
-        setStatus("Mendeley sync cancelled.");
-        setMendeleySyncActivity((current) => ({
-          state: "cancelled",
-          message: "Sync cancelled",
-          completed: current?.completed ?? 0,
-          total: current?.total ?? 8
-        }));
-        return;
-      }
-      const message = error instanceof Error ? error.message : String(error);
-      setStatus(message);
-      setMendeleySyncActivity({ state: "error", message, completed: 0, total: 8 });
-    } finally {
-      setMendeleySyncBusy(false);
-    }
-  }
-
-  function handleCancelMendeleySync() {
-    if (!mendeleySyncBusy) return;
-    mendeleyCancelRequestedRef.current = true;
-    setMendeleySyncActivity((current) => current ? {
-      ...current,
-      message: "Cancelling after the current request…"
-    } : current);
-  }
-
-  // When the cloud sync is still running, clicking X requests cancellation and
-  // dismisses the card immediately — the backend finishes in the background but
-  // the result is silently discarded.
-  function handleCancelCloudSync() {
-    cloudSyncCancelRequestedRef.current = true;
-    setCloudSyncActivity(undefined);
-  }
-
-  // When the cloud sync has already settled (success / error), clicking X
-  // simply removes the card.
-  function handleDismissCloudSync() {
-    setCloudSyncActivity(undefined);
-  }
-
-  async function runBusy(successMessage: string, task: () => Promise<void>) {
-    setBusy(true);
-    setStatus(undefined);
-    try {
-      await task();
-      setStatus(successMessage);
-    } catch (error) {
-      setStatus(formatActionError(error));
-    } finally {
-      setBusy(false);
-    }
-  }
-
   function handleStartResize(event: React.PointerEvent, left: MainPanelKey, right: MainPanelKey) {
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -1899,14 +1479,8 @@ export default function App() {
         onSearchChange={searchMode === "library" ? setSearch : setPdfSearchQuery}
         pdfSearchTotalMatches={pdfSearchState.totalMatches}
         pdfSearchActiveMatchIndex={pdfSearchState.activeMatchIndex}
-        onPdfSearchNext={() => {
-          const el = document.querySelector<HTMLDivElement>(".reader-body");
-          el?.__pdfSearchNav?.goToNextFindMatch();
-        }}
-        onPdfSearchPrev={() => {
-          const el = document.querySelector<HTMLDivElement>(".reader-body");
-          el?.__pdfSearchNav?.goToPrevFindMatch();
-        }}
+        onPdfSearchNext={() => pdfSearchNavRef.current?.goToNextFindMatch()}
+        onPdfSearchPrev={() => pdfSearchNavRef.current?.goToPrevFindMatch()}
         onPdfSearchClose={() => {
           setPdfSearchQuery("");
           setPdfSearchState({ totalMatches: 0, activeMatchIndex: -1 });
@@ -1943,13 +1517,13 @@ export default function App() {
               onAddPaperToCollection={handleAddPaperToCollection}
               onAddPdfToCollection={handleAddPdfToCollection}
               onEmptyTrash={() => void handleEmptyTrash()}
-              onSync={handleSync}
-              syncBusy={cloudSyncActivity?.state === "running"}
-              cloudSyncActivity={cloudSyncActivity}
-              mendeleySyncActivity={mendeleySyncActivity}
-              onCancelMendeleySync={handleCancelMendeleySync}
-              onCancelCloudSync={handleCancelCloudSync}
-              onDismissCloudSync={handleDismissCloudSync}
+              onSync={cloudSync.sync}
+              syncBusy={cloudSync.activity?.state === "running"}
+              cloudSyncActivity={cloudSync.activity}
+              mendeleySyncActivity={mendeleySync.activity}
+              onCancelMendeleySync={mendeleySync.cancelSync}
+              onCancelCloudSync={cloudSync.cancelSync}
+              onDismissCloudSync={cloudSync.dismissActivity}
             />
           )}
 
@@ -1987,6 +1561,7 @@ export default function App() {
                         pdfViewStates={pdfViewStates}
                         pdfSearchQuery={tabActive && tab.kind === "paper" ? pdfSearchQuery : undefined}
                         onPdfSearchUpdate={tabActive ? setPdfSearchState : undefined}
+                        pdfSearchNavRef={pdfSearchNavRef}
                         onSelectPaper={handleSelectPaper}
                         onOpenPaper={handleOpenPaperTab}
                         onUpdatePaper={handleUpdatePaper}
@@ -2010,7 +1585,7 @@ export default function App() {
 
           {panel === "sync" && (
             <SyncPanel
-              settings={settings}
+              settings={cloudSync.settings}
               paper={selectedPaper}
               fileAsset={selectedFile}
               fileData={selectedFileData}
@@ -2019,8 +1594,8 @@ export default function App() {
               annotations={selectedAnnotations}
               fileStorageSettings={fileStorageSettings}
               onUpdatePaper={handleUpdatePaper}
-              arxivDownloadBusy={arxivDownloadBusy}
-              onDownloadArxiv={(paperId, onProgress) => handleDownloadArxivFiles(paperId, onProgress)}
+              arxivDownloadBusy={arxivDownloads.downloadBusy}
+              onDownloadArxiv={(paperId, onProgress) => arxivDownloads.download(paperId, onProgress)}
               onDeleteAnnotation={handleDeleteAnnotation}
             />
           )}
@@ -2061,13 +1636,10 @@ export default function App() {
       />
       </section>
 
-      {arxivBatchProgress && (
+      {arxivDownloads.batchProgress && (
         <ArxivDownloadToast
-          progress={arxivBatchProgress}
-          onDismiss={() => {
-            arxivBatchToastDismissedRef.current = true;
-            setArxivBatchProgress(undefined);
-          }}
+          progress={arxivDownloads.batchProgress}
+          onDismiss={arxivDownloads.dismissBatchToast}
         />
       )}
 
@@ -2087,15 +1659,15 @@ export default function App() {
       />
       <SyncSettingsModal
         open={syncSettingsOpen}
-        settings={settings}
-        autoSync={autoSyncSettings}
-        busy={syncSettingsBusy}
-        syncing={cloudSyncActivity?.state === "running"}
-        status={cloudSyncActivity?.state === "running" ? cloudSyncActivity.message : status}
+        settings={cloudSync.settings}
+        autoSync={cloudSync.autoSyncSettings}
+        busy={cloudSync.settingsBusy}
+        syncing={cloudSync.activity?.state === "running"}
+        status={cloudSync.activity?.state === "running" ? cloudSync.activity.message : status}
         onClose={() => setSyncSettingsOpen(false)}
-        onSave={(nextSettings) => void handleSaveSyncSettings(nextSettings)}
-        onSync={() => void handleSync()}
-        onAutoSyncChange={setAutoSyncSettings}
+        onSave={(nextSettings) => void cloudSync.saveSettings(nextSettings)}
+        onSync={() => void cloudSync.sync()}
+        onAutoSyncChange={cloudSync.setAutoSyncSettings}
       />
       <FileStorageSettingsModal
         open={fileStorageModalOpen}
@@ -2108,15 +1680,15 @@ export default function App() {
       />
       <MendeleySyncModal
         open={mendeleySyncOpen}
-        settings={mendeleySettings}
-        connection={mendeleyConnection}
-        busy={busy}
-        syncing={mendeleySyncBusy}
+        settings={mendeleySync.settings}
+        connection={mendeleySync.connection}
+        busy={mendeleySync.connectionBusy}
+        syncing={mendeleySync.syncBusy}
         status={status}
-        onSettingsChange={setMendeleySettings}
-        onConnect={() => void handleMendeleyConnect()}
-        onDisconnect={() => void handleMendeleyDisconnect()}
-        onSync={() => void handleMendeleySync()}
+        onSettingsChange={mendeleySync.setSettings}
+        onConnect={() => void mendeleySync.connect()}
+        onDisconnect={() => void mendeleySync.disconnect()}
+        onSync={() => void mendeleySync.sync()}
         onClose={() => setMendeleySyncOpen(false)}
       />
       <ProxySettingsModal
@@ -2163,19 +1735,6 @@ export default function App() {
       />
     </main>
   );
-}
-
-function formatActionError(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  if (typeof error === "string") return error;
-  if (error && typeof error === "object") {
-    try {
-      return JSON.stringify(error);
-    } catch {
-      // Fall through to the generic string conversion.
-    }
-  }
-  return String(error || "Action failed.");
 }
 
 function PanelFragment({
@@ -2289,6 +1848,7 @@ function WorkspaceTabContent({
   pdfViewStates,
   pdfSearchQuery,
   onPdfSearchUpdate,
+  pdfSearchNavRef,
   onSelectPaper,
   onOpenPaper,
   onUpdatePaper,
@@ -2316,6 +1876,7 @@ function WorkspaceTabContent({
   pdfViewStates: Record<string, PdfReaderViewState>;
   pdfSearchQuery?: string;
   onPdfSearchUpdate?: (state: { totalMatches: number; activeMatchIndex: number }) => void;
+  pdfSearchNavRef?: React.MutableRefObject<PdfSearchNavHandle | null>;
   onSelectPaper: (paperId: string) => void;
   onOpenPaper: (paperId: string) => void;
   onUpdatePaper: (paper: Paper) => void;
@@ -2388,6 +1949,7 @@ function WorkspaceTabContent({
       onDeleteAnnotation={onDeleteAnnotation}
       pdfSearchQuery={pdfSearchQuery}
       onPdfSearchUpdate={onPdfSearchUpdate}
+      searchNavRef={pdfSearchNavRef}
     />
   );
 }
