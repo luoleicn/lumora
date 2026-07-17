@@ -38,3 +38,12 @@ uuid = { version = "1", features = ["v4"] }
 objc2-web-kit = { version = "0.3", default-features = false, features = ["WKWebView", "objc2-core-foundation"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSEvent", "block2"] }
 block2 = "0.6"
+
+# Standard Tauri release tuning: thin LTO + single codegen unit for speed and
+# size without fat-LTO build times; abort-on-panic and symbol stripping shrink
+# the shipped binary further.
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = true

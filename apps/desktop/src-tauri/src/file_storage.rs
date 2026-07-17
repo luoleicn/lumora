@@ -73,22 +73,29 @@ fn resolve_collision_free_path(dir: &std::path::Path, file_name: &str, current_p
 
 // Raw-body command: the PDF bytes come through the invoke body, so the directory
 // and file name have to travel as (ASCII-only, hence percent-encoded) headers.
+// Async + spawn_blocking: a synchronous command would write the whole PDF on
+// the main thread and freeze the UI for large imports.
 #[tauri::command]
-pub(crate) fn store_pdf(request: tauri::ipc::Request<'_>) -> Result<String, String> {
-    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+pub(crate) async fn store_pdf(request: tauri::ipc::Request<'_>) -> Result<String, String> {
+    let tauri::ipc::InvokeBody::Raw(raw) = request.body() else {
         return Err("Expected a binary PDF payload.".to_string());
     };
+    let bytes = raw.to_vec();
 
     let dir = decode_command_header(request.headers(), STORE_PDF_DIR_HEADER)?;
     let file_name = decode_command_header(request.headers(), STORE_PDF_FILE_NAME_HEADER)?;
     validate_stored_file_name(&file_name)?;
 
-    let dir = std::path::PathBuf::from(dir);
-    std::fs::create_dir_all(&dir).map_err(|error| format!("Failed to create storage folder: {error}"))?;
-    let target = resolve_collision_free_path(&dir, &file_name, None);
-    std::fs::write(&target, bytes).map_err(|error| format!("Failed to write PDF: {error}"))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).map_err(|error| format!("Failed to create storage folder: {error}"))?;
+        let target = resolve_collision_free_path(&dir, &file_name, None);
+        std::fs::write(&target, &bytes).map_err(|error| format!("Failed to write PDF: {error}"))?;
 
-    Ok(target.file_name().and_then(|name| name.to_str()).unwrap_or(&file_name).to_string())
+        Ok(target.file_name().and_then(|name| name.to_str()).unwrap_or(&file_name).to_string())
+    })
+    .await
+    .map_err(|error| format!("PDF store task failed: {error}"))?
 }
 
 // Lists the PDF file names currently in the storage folder so the front end can
@@ -97,30 +104,38 @@ pub(crate) fn store_pdf(request: tauri::ipc::Request<'_>) -> Result<String, Stri
 // not an error: it just means nothing is stored yet.
 #[tauri::command]
 pub(crate) async fn list_stored_pdfs(dir: String) -> Result<Vec<String>, String> {
-    let path = std::path::Path::new(&dir);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let entries = std::fs::read_dir(path).map_err(|error| format!("Failed to read storage folder: {error}"))?;
-    let mut names = Vec::new();
-    for entry in entries.flatten() {
-        if !entry.file_type().map(|file_type| file_type.is_file()).unwrap_or(false) {
-            continue;
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = std::path::Path::new(&dir);
+        if !path.exists() {
+            return Ok(Vec::new());
         }
-        if let Some(name) = entry.file_name().to_str() {
-            if name.to_ascii_lowercase().ends_with(".pdf") {
-                names.push(name.to_string());
+        let entries = std::fs::read_dir(path).map_err(|error| format!("Failed to read storage folder: {error}"))?;
+        let mut names = Vec::new();
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|file_type| file_type.is_file()).unwrap_or(false) {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                if name.to_ascii_lowercase().ends_with(".pdf") {
+                    names.push(name.to_string());
+                }
             }
         }
-    }
-    Ok(names)
+        Ok(names)
+    })
+    .await
+    .map_err(|error| format!("Storage listing task failed: {error}"))?
 }
 
 #[tauri::command]
 pub(crate) async fn read_stored_pdf(dir: String, file_name: String) -> Result<tauri::ipc::Response, String> {
     validate_stored_file_name(&file_name)?;
-    let path = std::path::Path::new(&dir).join(&file_name);
-    let bytes = std::fs::read(&path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        let path = std::path::Path::new(&dir).join(&file_name);
+        std::fs::read(&path).map_err(|error| format!("Failed to read {}: {error}", path.display()))
+    })
+    .await
+    .map_err(|error| format!("PDF read task failed: {error}"))??;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -208,30 +223,36 @@ pub(crate) async fn delete_stored_pdf(dir: String, file_name: String) -> Result<
     std::fs::remove_file(&path).map_err(|error| format!("Failed to delete {}: {error}", path.display()))
 }
 
+// spawn_blocking keeps the retry sleep for cloud-synced folders off the async
+// runtime's worker threads.
 #[tauri::command]
 pub(crate) async fn move_stored_pdf(dir: String, file_name: String, new_dir: String, new_file_name: String) -> Result<String, String> {
     validate_stored_file_name(&file_name)?;
     validate_stored_file_name(&new_file_name)?;
 
-    let old_path = std::path::Path::new(&dir).join(&file_name);
-    if !old_path.exists() {
-        return Err(format!("File not found: {}", old_path.display()));
-    }
-
-    let target_dir = std::path::PathBuf::from(&new_dir);
-    std::fs::create_dir_all(&target_dir).map_err(|error| format!("Failed to create storage folder: {error}"))?;
-    let target = resolve_collision_free_path(&target_dir, &new_file_name, Some(&old_path));
-
-    if target != old_path {
-        // Cloud-synced folders (Google Drive etc.) can transiently hold files;
-        // retry once before surfacing the failure.
-        if std::fs::rename(&old_path, &target).is_err() {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            std::fs::rename(&old_path, &target).map_err(|error| format!("Failed to move PDF: {error}"))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let old_path = std::path::Path::new(&dir).join(&file_name);
+        if !old_path.exists() {
+            return Err(format!("File not found: {}", old_path.display()));
         }
-    }
 
-    Ok(target.file_name().and_then(|name| name.to_str()).unwrap_or(&new_file_name).to_string())
+        let target_dir = std::path::PathBuf::from(&new_dir);
+        std::fs::create_dir_all(&target_dir).map_err(|error| format!("Failed to create storage folder: {error}"))?;
+        let target = resolve_collision_free_path(&target_dir, &new_file_name, Some(&old_path));
+
+        if target != old_path {
+            // Cloud-synced folders (Google Drive etc.) can transiently hold files;
+            // retry once before surfacing the failure.
+            if std::fs::rename(&old_path, &target).is_err() {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::fs::rename(&old_path, &target).map_err(|error| format!("Failed to move PDF: {error}"))?;
+            }
+        }
+
+        Ok(target.file_name().and_then(|name| name.to_str()).unwrap_or(&new_file_name).to_string())
+    })
+    .await
+    .map_err(|error| format!("PDF move task failed: {error}"))?
 }
 
 #[cfg(test)]

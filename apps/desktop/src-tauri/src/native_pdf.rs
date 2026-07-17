@@ -26,26 +26,34 @@ pub(crate) struct NativePdfSearchTarget {
     key: String,
 }
 
+// Async + spawn_blocking: opening a document reads, hashes and snapshots the
+// whole file — as a synchronous command that all ran on the main thread and
+// froze the window for large PDFs.
 #[tauri::command]
-pub(crate) fn native_pdf_open_path(
+pub(crate) async fn native_pdf_open_path(
     dir: String,
     file_name: String,
 ) -> Result<NativePdfDocumentInfo, String> {
-    validate_file_name(&file_name)?;
-    let path = std::path::Path::new(&dir).join(&file_name);
-    let bytes = std::fs::read(&path)
-        .map_err(|error| format!("Failed to open native PDF {}: {error}", path.display()))?;
-    open_pdf_bytes(&bytes)
+    tauri::async_runtime::spawn_blocking(move || {
+        validate_file_name(&file_name)?;
+        let path = std::path::Path::new(&dir).join(&file_name);
+        let bytes = std::fs::read(&path)
+            .map_err(|error| format!("Failed to open native PDF {}: {error}", path.display()))?;
+        open_pdf_bytes(&bytes)
+    })
+    .await
+    .map_err(|error| format!("Native PDF open task failed: {error}"))?
 }
 
 #[tauri::command]
-pub(crate) fn native_pdf_stage_chunk(request: tauri::ipc::Request<'_>) -> Result<(), String> {
-    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+pub(crate) async fn native_pdf_stage_chunk(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let tauri::ipc::InvokeBody::Raw(raw) = request.body() else {
         return Err("Expected a binary PDF chunk.".to_string());
     };
-    if bytes.len() > 2 * 1024 * 1024 {
+    if raw.len() > 2 * 1024 * 1024 {
         return Err("Native PDF upload chunk is too large.".to_string());
     }
+    let bytes = raw.to_vec();
     let upload_id = decode_header(request.headers(), UPLOAD_ID_HEADER)?;
     validate_upload_id(&upload_id)?;
     let reset = request
@@ -53,47 +61,55 @@ pub(crate) fn native_pdf_stage_chunk(request: tauri::ipc::Request<'_>) -> Result
         .get(UPLOAD_RESET_HEADER)
         .and_then(|value| value.to_str().ok())
         == Some("1");
-    let cache_dir = cache_dir();
-    std::fs::create_dir_all(&cache_dir)
-        .map_err(|error| format!("Failed to create native PDF cache: {error}"))?;
-    let path = cache_dir.join(format!("upload-{upload_id}.tmp"));
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).write(true);
-    if reset {
-        options.truncate(true);
-    } else {
-        options.append(true);
-    }
-    let mut file = options
-        .open(&path)
-        .map_err(|error| format!("Failed to stage native PDF chunk: {error}"))?;
-    std::io::Write::write_all(&mut file, bytes)
-        .map_err(|error| format!("Failed to write native PDF chunk: {error}"))?;
-    if file
-        .metadata()
-        .is_ok_and(|metadata| metadata.len() > 1024 * 1024 * 1024)
-    {
-        let _ = std::fs::remove_file(path);
-        return Err("Native PDF exceeds the 1 GiB safety limit.".to_string());
-    }
-    Ok(())
+    tauri::async_runtime::spawn_blocking(move || {
+        let cache_dir = cache_dir();
+        std::fs::create_dir_all(&cache_dir)
+            .map_err(|error| format!("Failed to create native PDF cache: {error}"))?;
+        let path = cache_dir.join(format!("upload-{upload_id}.tmp"));
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).write(true);
+        if reset {
+            options.truncate(true);
+        } else {
+            options.append(true);
+        }
+        let mut file = options
+            .open(&path)
+            .map_err(|error| format!("Failed to stage native PDF chunk: {error}"))?;
+        std::io::Write::write_all(&mut file, &bytes)
+            .map_err(|error| format!("Failed to write native PDF chunk: {error}"))?;
+        if file
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() > 1024 * 1024 * 1024)
+        {
+            let _ = std::fs::remove_file(path);
+            return Err("Native PDF exceeds the 1 GiB safety limit.".to_string());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("Native PDF staging task failed: {error}"))?
 }
 
 #[tauri::command]
-pub(crate) fn native_pdf_open_upload(
+pub(crate) async fn native_pdf_open_upload(
     upload_id: String,
 ) -> Result<NativePdfDocumentInfo, String> {
     validate_upload_id(&upload_id)?;
-    let path = cache_dir().join(format!("upload-{upload_id}.tmp"));
-    let bytes = std::fs::read(&path)
-        .map_err(|error| format!("Failed to finalize native PDF upload: {error}"))?;
-    let result = if bytes.starts_with(b"%PDF-") {
-        open_pdf_bytes(&bytes)
-    } else {
-        Err("Native renderer received invalid PDF data.".to_string())
-    };
-    let _ = std::fs::remove_file(path);
-    result
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = cache_dir().join(format!("upload-{upload_id}.tmp"));
+        let bytes = std::fs::read(&path)
+            .map_err(|error| format!("Failed to finalize native PDF upload: {error}"))?;
+        let result = if bytes.starts_with(b"%PDF-") {
+            open_pdf_bytes(&bytes)
+        } else {
+            Err("Native renderer received invalid PDF data.".to_string())
+        };
+        let _ = std::fs::remove_file(path);
+        result
+    })
+    .await
+    .map_err(|error| format!("Native PDF finalize task failed: {error}"))?
 }
 
 #[tauri::command]

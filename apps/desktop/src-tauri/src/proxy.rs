@@ -1,9 +1,15 @@
 // Network proxy settings (persisted in the library meta table) and the
 // proxy-aware reqwest client factory used by every outbound integration.
 
+use std::sync::Mutex;
 use tauri::{AppHandle, Runtime};
 
 const PROXY_SETTINGS_META_KEY: &str = "networkProxySettings";
+
+// One client per proxy configuration: paginated integrations (Mendeley, arXiv)
+// issue many sequential requests, and rebuilding the client each time threw
+// away the connection pool and paid a fresh TLS handshake per request.
+static CACHED_NETWORK_CLIENT: Mutex<Option<(String, reqwest::Client)>> = Mutex::new(None);
 
 #[derive(Clone, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,7 +43,16 @@ fn load_proxy_settings<R: Runtime>(app: &AppHandle<R>) -> Result<ProxySettings, 
 pub(crate) fn network_client<R: Runtime>(app: &AppHandle<R>) -> Result<reqwest::Client, String> {
     let settings = load_proxy_settings(app)?;
     validate_proxy_settings(&settings)?;
-    let mut builder = reqwest::Client::builder();
+    let cache_key = serde_json::to_string(&settings).map_err(|error| error.to_string())?;
+    if let Ok(cached) = CACHED_NETWORK_CLIENT.lock() {
+        if let Some((key, client)) = cached.as_ref() {
+            if *key == cache_key {
+                return Ok(client.clone());
+            }
+        }
+    }
+
+    let mut builder = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(15));
     if settings.enabled {
         let mut proxy = reqwest::Proxy::all(settings.url.trim())
             .map_err(|error| format!("Invalid proxy URL: {error}"))?;
@@ -46,7 +61,13 @@ pub(crate) fn network_client<R: Runtime>(app: &AppHandle<R>) -> Result<reqwest::
         }
         builder = builder.proxy(proxy);
     }
-    builder.build().map_err(|error| format!("Failed to configure network client: {error}"))
+    let client = builder
+        .build()
+        .map_err(|error| format!("Failed to configure network client: {error}"))?;
+    if let Ok(mut cached) = CACHED_NETWORK_CLIENT.lock() {
+        *cached = Some((cache_key, client.clone()));
+    }
+    Ok(client)
 }
 
 #[tauri::command]

@@ -865,7 +865,7 @@ fn seal_batch<R: Runtime>(app: &AppHandle<R>, device: &str) -> Result<Option<(u6
             params![device, seq as i64, body, max_local_seq],
         )
         .map_err(|error| error.to_string())?;
-    Ok(Some((seq, gzip_json(&batch)?, rows)))
+    Ok(Some((seq, body, rows)))
 }
 
 fn version_is_newer(
@@ -1637,7 +1637,10 @@ pub async fn qiniu_sync_library<R: Runtime>(app: AppHandle<R>) -> Result<SyncSum
     summary.downloaded_changes += apply_deferred_inbox(&app)?;
     // Publish an empty/new device once, refresh when its semantic state changes,
     // and periodically republish so an externally deleted head self-heals.
-    let latest = next_batch_seq(&crate::db::open_library_db(&app)?).saturating_sub(1);
+    let latest = {
+        let connection = crate::db::open_library_db(&app)?;
+        next_batch_seq(&connection).saturating_sub(1)
+    };
     let state = current_device_state(&app, &device, latest)?;
     if device_state_needs_publish(&app, &target, &state)? {
         upload_device_state(&app, &config, &secret, &counters, &target, &state).await?;

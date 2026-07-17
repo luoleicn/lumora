@@ -200,6 +200,46 @@ describe("syncLibrary arXiv boundary", () => {
     expect(invokeMock.mock.calls.some(([command]) => command === "qiniu_upload_blob")).toBe(false);
   });
 
+  it("verifies disk-backed downloads with a metadata stat and never reads bytes when nothing is missing", async () => {
+    const sha256 = "9".repeat(64);
+    const initial: LibraryState = {
+      papers: [{ id: "paper-a", title: "A", authors: [], createdAt: now, updatedAt: now }],
+      fileAssets: [{
+        id: "file-a", paperId: "paper-a", sha256, size: 4,
+        mime: "application/pdf", fileName: "a.pdf", localPath: "a.pdf", downloadState: "local",
+        contentRef: { kind: "object", sha256 }, createdAt: now, updatedAt: now
+      }],
+      collections: [], paperCollections: [], annotations: []
+    };
+    localStorage.setItem("lumora:qiniu-verified-local-files-v1", JSON.stringify({
+      "file-a": {
+        sha256,
+        storage: "disk",
+        path: "a.pdf",
+        size: 4,
+        modifiedMs: 123,
+        cloudTarget: JSON.stringify(["ak", "bucket", "", "domain", "lumora/v1"]),
+        cloudVerifiedAt: Date.now()
+      }
+    }));
+    getStoredPdfMetadataMock.mockResolvedValue({ size: 4, modifiedMs: 123 });
+    loadLibraryFromDbMock.mockResolvedValue({ state: initial, empty: false });
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "qiniu_sync_library") return Promise.resolve(summary());
+      return Promise.resolve(undefined);
+    });
+
+    await syncLibrary(
+      { accessKey: "ak", bucket: "bucket", region: "", privateDomain: "domain", prefix: "lumora/v1", configured: true },
+      initial
+    );
+
+    // The steady-state sync must be byte-free: presence comes from the stat.
+    expect(readFileBytesMock).not.toHaveBeenCalled();
+    expect(storePdfToDiskMock).not.toHaveBeenCalled();
+    expect(invokeMock.mock.calls.some(([command]) => command === "qiniu_download_blob")).toBe(false);
+  });
+
   it("re-verifies stale cloud state with a single blob listing instead of per-file stats", async () => {
     const shaA = "d".repeat(64);
     const shaB = "e".repeat(64);

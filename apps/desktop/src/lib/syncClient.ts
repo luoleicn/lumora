@@ -452,10 +452,26 @@ export async function syncLibrary(
 
   for (const [sha256, indices] of indicesBySha256) {
     const missingIndices: number[] = [];
+    const presentIndices: number[] = [];
     let sharedBytes: Uint8Array | undefined;
     for (const index of indices) {
-      const localBytes = await readFileBytes(downloadedFiles[index], storage);
+      const file = downloadedFiles[index];
+      // Disk-backed files are presence-checked with a metadata stat, so the
+      // steady-state sync (library fully local) never reads PDF bytes. Bytes
+      // are only read further down once a copy is actually missing.
+      if (file.localPath && storage.directory) {
+        const metadata = await getStoredPdfMetadata(storage.directory, file.localPath).catch(() => undefined);
+        if (metadata && metadata.size > 0) {
+          presentIndices.push(index);
+        } else {
+          missingIndices.push(index);
+        }
+        continue;
+      }
+      // Legacy IndexedDB blobs have no stat path; reading is the presence check.
+      const localBytes = await readFileBytes(file, storage);
       if (localBytes?.length) {
+        presentIndices.push(index);
         sharedBytes ??= localBytes;
       } else {
         missingIndices.push(index);
@@ -463,10 +479,23 @@ export async function syncLibrary(
     }
     if (missingIndices.length === 0) continue;
 
+    // A missing copy can be filled from a local sibling with the same content
+    // hash; verify any candidate's bytes before trusting them.
     if (sharedBytes) {
       const localBuffer = new Uint8Array(sharedBytes).buffer as ArrayBuffer;
       const localSha256 = await sha256Hex(localBuffer);
       if (localSha256 !== sha256) sharedBytes = undefined;
+    }
+    if (!sharedBytes) {
+      for (const index of presentIndices) {
+        const localBytes = await readFileBytes(downloadedFiles[index], storage);
+        if (!localBytes?.length) continue;
+        const localBuffer = new Uint8Array(localBytes).buffer as ArrayBuffer;
+        if (await sha256Hex(localBuffer) === sha256) {
+          sharedBytes = localBytes;
+          break;
+        }
+      }
     }
 
     if (!sharedBytes) {

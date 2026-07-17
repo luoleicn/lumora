@@ -10,7 +10,7 @@ pub(crate) struct YoudaoTranslation {
 }
 
 #[tauri::command]
-pub(crate) async fn translate_with_youdao(query: String) -> Result<YoudaoTranslation, String> {
+pub(crate) async fn translate_with_youdao(app: tauri::AppHandle, query: String) -> Result<YoudaoTranslation, String> {
     let query = query.split_whitespace().collect::<Vec<_>>().join(" ");
     if query.is_empty() {
         return Err("No text selected.".to_string());
@@ -27,7 +27,9 @@ pub(crate) async fn translate_with_youdao(query: String) -> Result<YoudaoTransla
         .append_pair("le", "en")
         .append_pair("q", &query);
 
-    let response = reqwest::Client::new()
+    // The shared proxy-aware client: dictionary lookups now reuse its
+    // connection pool and honor the user's proxy settings.
+    let response = crate::proxy::network_client(&app)?
         .get(url)
         .header("accept", "application/json")
         .send()

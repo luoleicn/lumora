@@ -65,6 +65,10 @@ export async function deletePersistedEntities(entities: Array<{ entityType: Sync
   if (entities.length === 0) {
     return;
   }
+  // A debounced upsert may still hold a state in which these entities exist;
+  // flushing first keeps the write order (upsert, then delete) that the
+  // pre-debounce code guaranteed, so deleted rows can never be resurrected.
+  await flushLibraryPersist();
   await invoke("db_delete_entities", { entities });
 }
 
@@ -121,20 +125,79 @@ export async function importStateToDb(state: LibraryState): Promise<void> {
   }
 }
 
-// Serializes writes so rapid successive state changes land in order; each queued
-// job diffs against the state that the previous job persisted.
+// Serializes writes so rapid successive state changes land in order. On top of
+// the queue sits a debounce: consecutive states that chain onto the pending
+// pair (the new `previous` is exactly the pending `next`) are coalesced, so a
+// typing burst persists as one diff previous→latest instead of one SQLite
+// write (and one FTS row update) per keystroke. A state that does not chain —
+// e.g. a sync adopted a fresh baseline via markPersisted — flushes the pending
+// write first so a diff never straddles a baseline reset.
 let writeQueue: Promise<void> = Promise.resolve();
 
+const persistDebounceMs = 250;
+
+type PendingPersist = {
+  previous: LibraryState;
+  next: LibraryState;
+  onError?: (error: unknown) => void;
+};
+
+let pendingPersist: PendingPersist | undefined;
+let pendingPersistTimer: ReturnType<typeof setTimeout> | undefined;
+
 export function enqueueLibraryPersist(previous: LibraryState, next: LibraryState, onError?: (error: unknown) => void) {
+  if (pendingPersist && pendingPersist.next === previous) {
+    pendingPersist.next = next;
+    pendingPersist.onError = onError ?? pendingPersist.onError;
+  } else {
+    void flushLibraryPersist();
+    pendingPersist = { previous, next, onError };
+  }
+  if (pendingPersistTimer !== undefined) {
+    clearTimeout(pendingPersistTimer);
+  }
+  pendingPersistTimer = setTimeout(() => {
+    void flushLibraryPersist();
+  }, persistDebounceMs);
+  return writeQueue;
+}
+
+/**
+ * Push the pending debounced write into the queue immediately. The returned
+ * promise resolves once every write queued so far has been persisted.
+ */
+export function flushLibraryPersist(): Promise<void> {
+  if (pendingPersistTimer !== undefined) {
+    clearTimeout(pendingPersistTimer);
+    pendingPersistTimer = undefined;
+  }
+  const pending = pendingPersist;
+  if (!pending) {
+    return writeQueue;
+  }
+  pendingPersist = undefined;
   writeQueue = writeQueue.then(async () => {
     try {
-      await persistEntities(diffLibraryStates(previous, next));
-      if (previous.lastSyncCursor !== next.lastSyncCursor && next.lastSyncCursor !== undefined) {
-        await persistSyncCursor(next.lastSyncCursor);
+      await persistEntities(diffLibraryStates(pending.previous, pending.next));
+      if (pending.previous.lastSyncCursor !== pending.next.lastSyncCursor && pending.next.lastSyncCursor !== undefined) {
+        await persistSyncCursor(pending.next.lastSyncCursor);
       }
     } catch (error) {
-      onError?.(error);
+      pending.onError?.(error);
     }
   });
   return writeQueue;
+}
+
+// The debounce window must not survive the page: flush when the app hides or
+// unloads so at most an in-flight IPC call is at risk, not a whole edit burst.
+if (typeof window !== "undefined") {
+  window.addEventListener("beforeunload", () => {
+    void flushLibraryPersist();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      void flushLibraryPersist();
+    }
+  });
 }

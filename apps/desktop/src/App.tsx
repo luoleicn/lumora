@@ -21,7 +21,6 @@ import {
   deleteCollectionAndReassignPapers,
   deletePaperFromLibrary,
   getCollectionAndDescendantIds,
-  getCollectionPaperCount,
   removePaperFromCollectionTree,
   renameCollection,
   restorePaperFromTrash,
@@ -322,38 +321,46 @@ export default function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [activeWorkspaceTabId, workspaceTabs]);
 
+  // The handler reads the latest closures through a ref so the Tauri event
+  // subscription is registered exactly once — re-subscribing on every tab or
+  // settings change cost an unlisten/listen IPC round trip each time.
+  const workspaceCommandRef = useRef<(command: string) => void>(() => {});
+  workspaceCommandRef.current = (command: string) => {
+    if (command === "close-active-tab") {
+      handleCloseActiveWorkspaceTab();
+    } else if (command === "show-shortcuts-help") {
+      setShortcutsHelpOpen(true);
+    } else if (command === "show-about") {
+      setAboutOpen(true);
+    } else if (command === "check-for-updates") {
+      void appUpdaterRef.current!.checkForUpdates("manual", proxySettings);
+    } else if (command === "show-file-storage-settings") {
+      setFileStorageModalOpen(true);
+    } else if (command === "show-mendeley-sync") {
+      setMendeleySyncOpen(true);
+    } else if (command === "show-proxy-settings") {
+      setProxySettingsError(undefined);
+      setProxySettingsOpen(true);
+    } else if (command === "show-sync-settings") {
+      setStatus(undefined);
+      setSyncSettingsOpen(true);
+    } else if (command === "show-duplicate-documents") {
+      setDuplicateDocumentsOpen(true);
+    } else if (command === "download-arxiv-files") {
+      void arxivDownloads.download();
+    } else if (command === "refresh-library") {
+      void handleRefreshLibrary();
+    } else if (command === "focus-toolbar-search") {
+      focusToolbarSearch();
+    }
+  };
+
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let disposed = false;
 
     void listen<string>(workspaceCommandEvent, (event) => {
-      if (event.payload === "close-active-tab") {
-        handleCloseActiveWorkspaceTab();
-      } else if (event.payload === "show-shortcuts-help") {
-        setShortcutsHelpOpen(true);
-      } else if (event.payload === "show-about") {
-        setAboutOpen(true);
-      } else if (event.payload === "check-for-updates") {
-        void appUpdaterRef.current!.checkForUpdates("manual", proxySettings);
-      } else if (event.payload === "show-file-storage-settings") {
-        setFileStorageModalOpen(true);
-      } else if (event.payload === "show-mendeley-sync") {
-        setMendeleySyncOpen(true);
-      } else if (event.payload === "show-proxy-settings") {
-        setProxySettingsError(undefined);
-        setProxySettingsOpen(true);
-      } else if (event.payload === "show-sync-settings") {
-        setStatus(undefined);
-        setSyncSettingsOpen(true);
-      } else if (event.payload === "show-duplicate-documents") {
-        setDuplicateDocumentsOpen(true);
-      } else if (event.payload === "download-arxiv-files") {
-        void arxivDownloads.download();
-      } else if (event.payload === "refresh-library") {
-        void handleRefreshLibrary();
-      } else if (event.payload === "focus-toolbar-search") {
-        focusToolbarSearch();
-      }
+      workspaceCommandRef.current(event.payload);
     }).then((nextUnlisten) => {
       if (disposed) {
         nextUnlisten();
@@ -366,7 +373,7 @@ export default function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [activeWorkspaceTabId, workspaceTabs, fileStorageSettings, proxySettings]);
+  }, []);
 
   useEffect(() => {
     if (!resizeDrag) {
@@ -442,6 +449,17 @@ export default function App() {
         .map((item) => item.paperId)
     );
     const isTrash = selectedCollectionId === "trash";
+    const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    // One pass per lookup table so the per-paper filters below stay O(1)
+    // instead of rescanning fileAssets/paperCollections for every paper.
+    const paperIdsWithLocalPdf = new Set(
+      library.fileAssets
+        .filter((fileAsset) => !fileAsset.deletedAt && isLocalPdfFile(fileAsset))
+        .map((fileAsset) => fileAsset.paperId)
+    );
+    const paperIdsInAnyCollection = new Set(
+      library.paperCollections.filter((item) => !item.deletedAt).map((item) => item.paperId)
+    );
 
     return library.papers
       .filter((paper) => isTrash ? Boolean(paper.deletedAt) : !paper.deletedAt)
@@ -449,20 +467,16 @@ export default function App() {
         switch (selectedCollectionId) {
           case "all":
             return true;
-          case "recently_added": {
-            const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+          case "recently_added":
             return paper.createdAt >= weekAgo;
-          }
           case "no_arxiv":
             return !paper.arxiv;
           case "no_pdf":
-            return !library.fileAssets.some(
-              (fileAsset) => fileAsset.paperId === paper.id && !fileAsset.deletedAt && isLocalPdfFile(fileAsset)
-            );
+            return !paperIdsWithLocalPdf.has(paper.id);
           case "favorites":
             return Boolean(paper.favorite);
           case "unsorted":
-            return !library.paperCollections.some((item) => item.paperId === paper.id && !item.deletedAt);
+            return !paperIdsInAnyCollection.has(paper.id);
           case "trash":
             return true;
           default:
@@ -764,10 +778,13 @@ export default function App() {
       return "";
     }
 
+    const papersById = new Map(
+      library.papers.filter((paper) => !paper.deletedAt).map((paper) => [paper.id, paper])
+    );
     return library.fileAssets
       .filter((fileAsset) => !fileAsset.deletedAt && fileAsset.localPath)
       .map((fileAsset) => {
-        const paper = library.papers.find((item) => item.id === fileAsset.paperId && !item.deletedAt);
+        const paper = papersById.get(fileAsset.paperId);
         return paper
           ? `${fileAsset.id}:${fileAsset.localPath}:${buildPdfFileName(paper, fileStorageSettings.nameTemplate)}`
           : "";
@@ -1308,9 +1325,19 @@ export default function App() {
   }
 
   function handleUpdatePaper(paper: Paper) {
-    setWorkspaceTabs((current) => current.map((tab) =>
-      tab.kind === "paper" && tab.paperId === paper.id ? { ...tab, title: paper.title } : tab
-    ));
+    // Bail out with the original array when no tab title actually changes, so
+    // per-keystroke metadata edits don't re-render the tab bar.
+    setWorkspaceTabs((current) => {
+      let changed = false;
+      const next = current.map((tab) => {
+        if (tab.kind === "paper" && tab.paperId === paper.id && tab.title !== paper.title) {
+          changed = true;
+          return { ...tab, title: paper.title };
+        }
+        return tab;
+      });
+      return changed ? next : current;
+    });
     setLibrary((current) => ({
       ...current,
       papers: upsertById(current.papers, {
@@ -2000,9 +2027,64 @@ function loadWorkspaceLayout(): WorkspaceLayout {
   }
 }
 
+// Single-pass version of the per-collection count: the naive form rebuilt the
+// active-paper set and rescanned every membership row once per collection,
+// which is O(collections × (papers + memberships)) on every library change.
+// Here the lookup tables are built once and each collection only unions the
+// member lists of its subtree.
 function getCollectionPaperCounts(state: LibraryState) {
   const activeCollections = state.collections.filter((collection) => !collection.deletedAt);
+  const activePaperIds = new Set(
+    state.papers.filter((paper) => !paper.deletedAt).map((paper) => paper.id)
+  );
+
+  const directMemberIdsByCollection = new Map<string, string[]>();
+  for (const item of state.paperCollections) {
+    if (item.deletedAt || !activePaperIds.has(item.paperId)) {
+      continue;
+    }
+    const members = directMemberIdsByCollection.get(item.collectionId);
+    if (members) {
+      members.push(item.paperId);
+    } else {
+      directMemberIdsByCollection.set(item.collectionId, [item.paperId]);
+    }
+  }
+
+  const childIdsByParent = new Map<string, string[]>();
+  for (const collection of activeCollections) {
+    if (!collection.parentId) {
+      continue;
+    }
+    const children = childIdsByParent.get(collection.parentId);
+    if (children) {
+      children.push(collection.id);
+    } else {
+      childIdsByParent.set(collection.parentId, [collection.id]);
+    }
+  }
+
   return Object.fromEntries(
-    activeCollections.map((collection) => [collection.id, getCollectionPaperCount(state, activeCollections, collection.id)])
+    activeCollections.map((collection) => {
+      // Walk the subtree iteratively; the visited set also guards against
+      // accidental parentId cycles.
+      const subtree = [collection.id];
+      const visited = new Set(subtree);
+      for (let cursor = 0; cursor < subtree.length; cursor += 1) {
+        for (const childId of childIdsByParent.get(subtree[cursor]) ?? []) {
+          if (!visited.has(childId)) {
+            visited.add(childId);
+            subtree.push(childId);
+          }
+        }
+      }
+      const countedPaperIds = new Set<string>();
+      for (const collectionId of subtree) {
+        for (const paperId of directMemberIdsByCollection.get(collectionId) ?? []) {
+          countedPaperIds.add(paperId);
+        }
+      }
+      return [collection.id, countedPaperIds.size];
+    })
   );
 }

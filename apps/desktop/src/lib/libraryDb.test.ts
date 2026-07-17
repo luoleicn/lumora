@@ -1,6 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LibraryState, Paper } from "@lumora/shared";
-import { diffLibraryStates } from "./libraryDb";
+
+const invokeMock = vi.fn();
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
+
+import { deletePersistedEntities, diffLibraryStates, enqueueLibraryPersist, flushLibraryPersist } from "./libraryDb";
 
 const now = "2026-07-10T00:00:00.000Z";
 
@@ -67,5 +71,78 @@ describe("diffLibraryStates", () => {
     const next = { ...current, papers: [...current.papers] };
 
     expect(diffLibraryStates(current, next)).toEqual([]);
+  });
+});
+
+type UpsertPayload = { changes: Array<{ id: string; data: string }> };
+
+describe("enqueueLibraryPersist debouncing", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    invokeMock.mockReset().mockResolvedValue(undefined);
+  });
+
+  afterEach(async () => {
+    await flushLibraryPersist();
+    vi.useRealTimers();
+  });
+
+  it("coalesces a chained burst of states into a single upsert", async () => {
+    const base = state();
+    const step1 = { ...base, papers: [{ ...base.papers[0], title: "ab" }, base.papers[1]] };
+    const step2 = { ...step1, papers: [{ ...step1.papers[0], title: "abc" }, step1.papers[1]] };
+
+    enqueueLibraryPersist(base, step1);
+    enqueueLibraryPersist(step1, step2);
+    await vi.advanceTimersByTimeAsync(250);
+    await flushLibraryPersist();
+
+    const upserts = invokeMock.mock.calls.filter(([command]) => command === "db_upsert_entities");
+    expect(upserts).toHaveLength(1);
+    const payload = upserts[0][1] as UpsertPayload;
+    expect(payload.changes).toHaveLength(1);
+    expect(JSON.parse(payload.changes[0].data).title).toBe("abc");
+  });
+
+  it("does not write before the debounce window elapses", async () => {
+    const base = state();
+    const edited = { ...base, papers: [{ ...base.papers[0], title: "edited" }, base.papers[1]] };
+
+    enqueueLibraryPersist(base, edited);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(50);
+    await flushLibraryPersist();
+    expect(invokeMock.mock.calls.filter(([command]) => command === "db_upsert_entities")).toHaveLength(1);
+  });
+
+  it("flushes the pending write before a state that does not chain onto it", async () => {
+    const base = state();
+    const edited = { ...base, papers: [{ ...base.papers[0], title: "edited" }, base.papers[1]] };
+    // A cloud sync adopts a fresh baseline: same papers, new object identities.
+    const syncBaseline = state();
+    const afterSync = { ...syncBaseline, papers: [{ ...syncBaseline.papers[0], title: "from-sync" }, syncBaseline.papers[1]] };
+
+    enqueueLibraryPersist(base, edited);
+    enqueueLibraryPersist(syncBaseline, afterSync);
+    await vi.advanceTimersByTimeAsync(250);
+    await flushLibraryPersist();
+
+    const upserts = invokeMock.mock.calls.filter(([command]) => command === "db_upsert_entities");
+    expect(upserts).toHaveLength(2);
+    expect(JSON.parse((upserts[0][1] as UpsertPayload).changes[0].data).title).toBe("edited");
+    expect(JSON.parse((upserts[1][1] as UpsertPayload).changes[0].data).title).toBe("from-sync");
+  });
+
+  it("orders a pending upsert before a permanent delete", async () => {
+    const base = state();
+    const edited = { ...base, papers: [{ ...base.papers[0], title: "edited" }, base.papers[1]] };
+    enqueueLibraryPersist(base, edited);
+
+    await deletePersistedEntities([{ entityType: "paper", id: "paper-a" }]);
+
+    const commands = invokeMock.mock.calls.map(([command]) => command);
+    expect(commands).toEqual(["db_upsert_entities", "db_delete_entities"]);
   });
 });
