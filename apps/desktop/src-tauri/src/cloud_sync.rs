@@ -647,33 +647,23 @@ async fn upload_bytes(
         }
         return Err(UploadError::fatal(message));
     }
-
-    // Qiniu Kodo is strongly consistent, so a freshly uploaded object must be
-    // immediately stat-able. When it is not, the PUT was accepted upstream but
-    // nothing actually landed in the bucket — surface that instead of reporting
-    // success, which would otherwise mark the file as synced while other devices
-    // can never download it.
-    let (put_time, _, stored_size) = stat_object(config, secret, counters, key).await.map_err(|error| {
-        UploadError::fatal(format!(
-            "Qiniu accepted the upload of {key} but the object is missing afterwards ({error}). \
-             Verify the bucket name and that its region matches this account."
-        ))
-    })?;
-    if stored_size != bytes.len() as u64 {
-        return Err(UploadError::file(format!(
-            "Qiniu stored {stored_size} bytes for {key} but {} were uploaded.",
-            bytes.len()
-        )));
-    }
-    Ok(put_time)
+    // The PUT response carries the server clock (`Date`), which is the same
+    // second-granularity source a later HEAD would report as `Last-Modified`.
+    // Deriving put_time from it avoids a verification HEAD per upload; endpoint
+    // or bucket misconfiguration is still caught by the connection test, which
+    // round-trips upload → stat → download explicitly.
+    Ok(put_time_from_response(&response))
 }
 
-async fn download_bytes(
+/// GET an object, returning its bytes together with the put_time derived from
+/// the response's `Last-Modified` header — so callers that need the version
+/// timestamp don't have to issue a separate HEAD first.
+async fn download_object(
     config: &QiniuSyncConfig,
     secret: &str,
     counters: &NetworkCounters,
     key: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, u64), String> {
     let response = s3_send(config, secret, counters, reqwest::Method::GET, S3Resource::Object(key), &[], None).await?;
     if !response.status().is_success() {
         let status = response.status();
@@ -685,9 +675,19 @@ async fn download_bytes(
              Settings → Cloud Sync are correct for this bucket."
         ));
     }
+    let put_time = put_time_from_response(&response);
     let bytes = response.bytes().await.map_err(|error| error.to_string())?;
     counters.record_download(bytes.len());
-    Ok(bytes.to_vec())
+    Ok((bytes.to_vec(), put_time))
+}
+
+async fn download_bytes(
+    config: &QiniuSyncConfig,
+    secret: &str,
+    counters: &NetworkCounters,
+    key: &str,
+) -> Result<Vec<u8>, String> {
+    Ok(download_object(config, secret, counters, key).await?.0)
 }
 
 /// Reads the object size from the `Content-Length` header. reqwest's
@@ -706,9 +706,10 @@ fn content_length_header(response: &reqwest::Response) -> Option<u64> {
 /// the same units — this keeps the last-write-wins ordering key comparable with
 /// version rows written by the previous Qiniu-native implementation.
 fn put_time_from_response(response: &reqwest::Response) -> u64 {
-    let system_time = response
-        .headers()
+    let headers = response.headers();
+    let system_time = headers
         .get(reqwest::header::LAST_MODIFIED)
+        .or_else(|| headers.get(reqwest::header::DATE))
         .and_then(|value| value.to_str().ok())
         .and_then(|value| httpdate::parse_http_date(value).ok())
         .unwrap_or_else(SystemTime::now);
@@ -1229,16 +1230,18 @@ fn device_head_needs_fetch(etag: &str, cached: Option<&(String, u64)>, current: 
     etag.is_empty() || !cached.is_some_and(|(cached_etag, latest)| cached_etag == etag && current >= *latest)
 }
 
-async fn list_device_objects(
+/// Runs a paginated ListObjectsV2 under `prefix` and returns the raw XML of
+/// every page. Callers extract the fields they care about.
+async fn list_object_pages(
     config: &QiniuSyncConfig,
     secret: &str,
     counters: &NetworkCounters,
-) -> Result<Vec<ListedDeviceObject>, String> {
-    let prefix = format!("{PREFIX}/devices/");
-    let mut objects = Vec::new();
+    prefix: &str,
+) -> Result<Vec<String>, String> {
+    let mut pages = Vec::new();
     let mut continuation: Option<String> = None;
     loop {
-        let mut query: Vec<(&str, &str)> = vec![("list-type", "2"), ("prefix", prefix.as_str())];
+        let mut query: Vec<(&str, &str)> = vec![("list-type", "2"), ("prefix", prefix)];
         if let Some(token) = continuation.as_deref() {
             query.push(("continuation-token", token));
         }
@@ -1247,17 +1250,46 @@ async fn list_device_objects(
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             counters.record_download(body.len());
-            return Err(format!("Qiniu device list failed: {status}. Body: {body}"));
+            return Err(format!("Qiniu list of {prefix} failed: {status}. Body: {body}"));
         }
         let xml = response.text().await.map_err(|error| error.to_string())?;
         counters.record_download(xml.len());
-        objects.extend(extract_listed_device_objects(&xml, &prefix));
-        match extract_xml_values(&xml, "NextContinuationToken").into_iter().next() {
+        let next = extract_xml_values(&xml, "NextContinuationToken").into_iter().next();
+        pages.push(xml);
+        match next {
             Some(token) if !token.is_empty() => continuation = Some(token),
             _ => break,
         }
     }
+    Ok(pages)
+}
+
+async fn list_device_objects(
+    config: &QiniuSyncConfig,
+    secret: &str,
+    counters: &NetworkCounters,
+) -> Result<Vec<ListedDeviceObject>, String> {
+    let prefix = format!("{PREFIX}/devices/");
+    let mut objects = Vec::new();
+    for xml in list_object_pages(config, secret, counters, &prefix).await? {
+        objects.extend(extract_listed_device_objects(&xml, &prefix));
+    }
     Ok(objects)
+}
+
+fn extract_listed_blob_sizes(xml: &str, prefix: &str) -> Vec<(String, u64)> {
+    extract_xml_values(xml, "Contents")
+        .into_iter()
+        .filter_map(|contents| {
+            let key = extract_xml_values(&contents, "Key").into_iter().next()?;
+            let sha256 = key.strip_prefix(prefix)?;
+            if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            let size = extract_xml_values(&contents, "Size").into_iter().next()?.trim().parse().ok()?;
+            Some((sha256.to_ascii_lowercase(), size))
+        })
+        .collect()
 }
 
 async fn pull_remote<R: Runtime>(
@@ -1309,8 +1341,10 @@ async fn pull_remote<R: Runtime>(
         }
         for seq in (current + 1)..=state.latest_batch_seq {
             let batch_key = format!("{PREFIX}/changes/{}/{seq:020}.json.gz", state.device_id);
-            let (put_time, _, _) = stat_object(config, secret, counters, &batch_key).await?;
-            let batch: CloudBatch = ungzip_json(&download_bytes(config, secret, counters, &batch_key).await?)?;
+            // A single GET provides both the body and the Last-Modified-derived
+            // put_time; a separate stat HEAD per batch would double the request bill.
+            let (bytes, put_time) = download_object(config, secret, counters, &batch_key).await?;
+            let batch: CloudBatch = ungzip_json(&bytes)?;
             if batch.protocol_version != PROTOCOL_VERSION || batch.device_id != state.device_id || batch.batch_seq != seq {
                 return Err(format!("Invalid cloud batch {batch_key}"));
             }
@@ -1526,11 +1560,33 @@ pub async fn qiniu_delete_blob<R: Runtime>(app: AppHandle<R>, sha256: String) ->
     let secret = load_secret(&config)?;
     let counters = NetworkCounters::default();
     let key = format!("{PREFIX}/blobs/sha256/{}", sha256.trim().to_ascii_lowercase());
-    if stat_object_if_exists(&config, &secret, &counters, &key).await?.is_none() {
-        return Ok(counters.snapshot());
-    }
+    // DELETE is idempotent (404 counts as success), so no existence HEAD first.
     delete_object(&config, &secret, &counters, &key).await?;
     Ok(counters.snapshot())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QiniuBlobList {
+    /// sha256 (lowercase hex) → object size in bytes.
+    pub sizes: HashMap<String, u64>,
+    pub stats: NetworkStats,
+}
+
+/// Lists every content-addressed blob in one paginated ListObjectsV2 sweep
+/// (up to 1000 keys per request), so the pre-sync existence check costs one GET
+/// instead of one HEAD per file.
+#[tauri::command]
+pub async fn qiniu_list_blobs<R: Runtime>(app: AppHandle<R>) -> Result<QiniuBlobList, String> {
+    let config = load_config(&app)?;
+    let secret = load_secret(&config)?;
+    let counters = NetworkCounters::default();
+    let prefix = format!("{PREFIX}/blobs/sha256/");
+    let mut sizes = HashMap::new();
+    for xml in list_object_pages(&config, &secret, &counters, &prefix).await? {
+        sizes.extend(extract_listed_blob_sizes(&xml, &prefix));
+    }
+    Ok(QiniuBlobList { sizes, stats: counters.snapshot() })
 }
 
 #[tauri::command]
@@ -1569,8 +1625,9 @@ pub async fn qiniu_sync_library<R: Runtime>(app: AppHandle<R>) -> Result<SyncSum
                 .await
                 .map_err(|error| error.to_string())?,
         };
-        let state = current_device_state(&app, &device, seq)?;
-        upload_device_state(&app, &config, &secret, &counters, &target, &state).await?;
+        // The device state is published once after the whole sync (below); the
+        // needs-publish check sees the advanced batch_seq and always fires then.
+        // Publishing per batch here would cost an extra PUT per iteration.
         confirm_local_batch(&app, &device, seq, put_time, &rows)?;
         summary.uploaded_changes += rows.len();
     }
@@ -1791,6 +1848,22 @@ mod tests {
         assert!(device_head_needs_fetch("etag-new", Some(&cached), 4));
         assert!(device_head_needs_fetch("etag-remote", Some(&cached), 3));
         assert!(device_head_needs_fetch("", Some(&cached), 4));
+    }
+
+    #[test]
+    fn blob_list_extracts_hashes_and_sizes() {
+        let sha_a = "a".repeat(64);
+        let sha_b = "B".repeat(64);
+        let xml = format!(
+            "<ListBucketResult>\
+              <Contents><Key>lumora/v1/blobs/sha256/{sha_a}</Key><Size>42</Size></Contents>\
+              <Contents><Key>lumora/v1/blobs/sha256/{sha_b}</Key><Size>7</Size></Contents>\
+              <Contents><Key>lumora/v1/blobs/sha256/not-a-hash</Key><Size>1</Size></Contents>\
+              <Contents><Key>lumora/v1/devices/d.json</Key><Size>2</Size></Contents>\
+            </ListBucketResult>"
+        );
+        let blobs = extract_listed_blob_sizes(&xml, "lumora/v1/blobs/sha256/");
+        assert_eq!(blobs, vec![(sha_a, 42), (sha_b.to_ascii_lowercase(), 7)]);
     }
 
     #[test]

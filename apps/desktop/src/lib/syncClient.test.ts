@@ -196,7 +196,114 @@ describe("syncLibrary arXiv boundary", () => {
     );
 
     expect(invokeMock.mock.calls.some(([command]) => command === "qiniu_object_exists")).toBe(false);
+    expect(invokeMock.mock.calls.some(([command]) => command === "qiniu_list_blobs")).toBe(false);
     expect(invokeMock.mock.calls.some(([command]) => command === "qiniu_upload_blob")).toBe(false);
+  });
+
+  it("re-verifies stale cloud state with a single blob listing instead of per-file stats", async () => {
+    const shaA = "d".repeat(64);
+    const shaB = "e".repeat(64);
+    const initial: LibraryState = {
+      papers: [{ id: "paper-a", title: "A", authors: [], createdAt: now, updatedAt: now }],
+      fileAssets: [
+        {
+          id: "file-a", paperId: "paper-a", sha256: shaA, size: 4,
+          mime: "application/pdf", fileName: "a.pdf", localPath: "a.pdf", downloadState: "local",
+          contentRef: { kind: "object", sha256: shaA }, createdAt: now, updatedAt: now
+        },
+        {
+          id: "file-b", paperId: "paper-a", sha256: shaB, size: 7,
+          mime: "application/pdf", fileName: "b.pdf", localPath: "b.pdf", downloadState: "local",
+          contentRef: { kind: "object", sha256: shaB }, createdAt: now, updatedAt: now
+        }
+      ],
+      collections: [], paperCollections: [], annotations: []
+    };
+    const staleVerifiedAt = Date.now() - 25 * 60 * 60 * 1_000;
+    localStorage.setItem("lumora:qiniu-verified-local-files-v1", JSON.stringify({
+      "file-a": {
+        sha256: shaA, storage: "disk", path: "a.pdf", size: 4, modifiedMs: 123,
+        cloudTarget: JSON.stringify(["ak", "bucket", "", "domain", "lumora/v1"]),
+        cloudVerifiedAt: staleVerifiedAt
+      },
+      "file-b": {
+        sha256: shaB, storage: "disk", path: "b.pdf", size: 7, modifiedMs: 456,
+        cloudTarget: JSON.stringify(["ak", "bucket", "", "domain", "lumora/v1"]),
+        cloudVerifiedAt: staleVerifiedAt
+      }
+    }));
+    getStoredPdfMetadataMock.mockImplementation(async (_dir: string, path: string) =>
+      path === "a.pdf" ? { size: 4, modifiedMs: 123 } : { size: 7, modifiedMs: 456 });
+    readFileBytesMock.mockResolvedValue(new Uint8Array([1, 2, 3, 4]));
+    loadLibraryFromDbMock.mockResolvedValue({ state: initial, empty: false });
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "qiniu_sync_library") return Promise.resolve(summary());
+      if (command === "qiniu_list_blobs") return Promise.resolve({
+        sizes: { [shaA]: 4, [shaB]: 7 },
+        stats: {
+          requestCount: 1, putRequests: 0, getRequests: 1, headRequests: 0,
+          deleteRequests: 0, uploadedBytes: 0, downloadedBytes: 512
+        }
+      });
+      if (command === "qiniu_download_blob") return Promise.resolve(new Uint8Array([1, 2, 3, 4]).buffer);
+      return Promise.resolve(undefined);
+    });
+
+    const result = await syncLibrary(
+      { accessKey: "ak", bucket: "bucket", region: "", privateDomain: "domain", prefix: "lumora/v1", configured: true },
+      initial
+    );
+
+    expect(invokeMock.mock.calls.filter(([command]) => command === "qiniu_list_blobs")).toHaveLength(1);
+    expect(invokeMock.mock.calls.some(([command]) => command === "qiniu_object_exists")).toBe(false);
+    expect(invokeMock.mock.calls.some(([command]) => command === "qiniu_upload_blob")).toBe(false);
+    expect(result.summary.headRequests).toBe(0);
+    expect(localStorage.getItem("lumora:qiniu-blob-count-v1")).toBe("2");
+  });
+
+  it("prefers a single HEAD over listing the whole bucket when only one hash is pending", async () => {
+    const sha256 = "f".repeat(64);
+    const initial: LibraryState = {
+      papers: [{ id: "paper-a", title: "A", authors: [], createdAt: now, updatedAt: now }],
+      fileAssets: [{
+        id: "file-a", paperId: "paper-a", sha256, size: 4,
+        mime: "application/pdf", fileName: "a.pdf", localPath: "a.pdf", downloadState: "local",
+        contentRef: { kind: "object", sha256 }, createdAt: now, updatedAt: now
+      }],
+      collections: [], paperCollections: [], annotations: []
+    };
+    localStorage.setItem("lumora:qiniu-verified-local-files-v1", JSON.stringify({
+      "file-a": {
+        sha256, storage: "disk", path: "a.pdf", size: 4, modifiedMs: 123,
+        cloudTarget: JSON.stringify(["ak", "bucket", "", "domain", "lumora/v1"]),
+        cloudVerifiedAt: Date.now() - 25 * 60 * 60 * 1_000
+      }
+    }));
+    getStoredPdfMetadataMock.mockResolvedValue({ size: 4, modifiedMs: 123 });
+    readFileBytesMock.mockResolvedValue(new Uint8Array([1, 2, 3, 4]));
+    loadLibraryFromDbMock.mockResolvedValue({ state: initial, empty: false });
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "qiniu_sync_library") return Promise.resolve(summary());
+      if (command === "qiniu_object_exists") return Promise.resolve({
+        exists: true, size: 4,
+        stats: {
+          requestCount: 1, putRequests: 0, getRequests: 0, headRequests: 1,
+          deleteRequests: 0, uploadedBytes: 0, downloadedBytes: 0
+        }
+      });
+      if (command === "qiniu_download_blob") return Promise.resolve(new Uint8Array([1, 2, 3, 4]).buffer);
+      return Promise.resolve(undefined);
+    });
+
+    const result = await syncLibrary(
+      { accessKey: "ak", bucket: "bucket", region: "", privateDomain: "domain", prefix: "lumora/v1", configured: true },
+      initial
+    );
+
+    expect(invokeMock).toHaveBeenCalledWith("qiniu_object_exists", { sha256 });
+    expect(invokeMock.mock.calls.some(([command]) => command === "qiniu_list_blobs")).toBe(false);
+    expect(invokeMock.mock.calls.some(([command]) => command === "qiniu_upload_blob")).toBe(false);
+    expect(result.summary.headRequests).toBe(1);
   });
 
   it("records a file-specific upload failure and still syncs metadata", async () => {

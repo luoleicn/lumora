@@ -37,7 +37,9 @@ export const defaultAutoSyncSettings: AutoSyncSettings = {
 
 type QiniuNetworkStats = Pick<CloudSyncSummary,
   "requestCount" | "putRequests" | "getRequests" | "headRequests" | "deleteRequests" | "uploadedBytes" | "downloadedBytes">;
+type QiniuBlobList = { sizes: Record<string, number>; stats: QiniuNetworkStats };
 type QiniuObjectStat = { exists: boolean; size?: number; stats: QiniuNetworkStats };
+type CloudObjectStat = { exists: boolean; size?: number };
 type QiniuBlobUploadResult = {
   uploaded: boolean;
   stats: QiniuNetworkStats;
@@ -54,8 +56,19 @@ type VerifiedLocalFile = {
 };
 
 const verifiedLocalFilesKey = "lumora:qiniu-verified-local-files-v1";
+const cloudBlobCountKey = "lumora:qiniu-blob-count-v1";
 const cloudVerificationTtlMs = 24 * 60 * 60 * 1_000;
+const blobListPageSize = 1_000;
 const sha256Pattern = /^[a-f0-9]{64}$/i;
+
+// How many GETs a full blob LIST would cost, judged from the blob count seen
+// on the previous LIST (ListObjectsV2 returns at most 1000 keys per request).
+// Unknown counts assume a single page.
+function estimatedBlobListPages(): number {
+  const count = Number(localStorage.getItem(cloudBlobCountKey));
+  if (!Number.isFinite(count) || count <= 0) return 1;
+  return Math.max(1, Math.ceil(count / blobListPageSize));
+}
 
 function emptyNetworkStats(): QiniuNetworkStats {
   return {
@@ -201,17 +214,36 @@ export async function syncLibrary(
 
   // A successful content hash is cached against device-local file metadata.
   // Only an unchanged local file may use its recorded SHA for the cheap cloud
-  // Stat path; otherwise the full file is read and hashed below.
+  // existence path; otherwise the full file is read and hashed below.
   const verifiedLocalFiles = loadVerifiedLocalFiles();
-  const preflight = new Map<string, QiniuObjectStat>();
-  const statPromises = new Map<string, Promise<QiniuObjectStat>>();
+  const preflight = new Map<string, CloudObjectStat>();
   const ensuredCloudHashes = new Set<string>();
+  // One paginated LIST answers every blob existence question in this sync
+  // (~1 GET per 1000 objects). Fetched lazily so a sync where nothing needs a
+  // cloud check stays at zero requests; the observed blob count is remembered
+  // to price future LISTs against per-hash HEADs.
+  let cloudBlobSizesPromise: Promise<Record<string, number>> | undefined;
+  const fetchCloudBlobSizes = () => {
+    cloudBlobSizesPromise ??= invoke<QiniuBlobList>("qiniu_list_blobs").then((list) => {
+      addNetworkStats(preSyncNetworkStats, list.stats);
+      try {
+        localStorage.setItem(cloudBlobCountKey, String(Object.keys(list.sizes).length));
+      } catch {
+        // The count only tunes the HEAD-vs-LIST choice; losing it is harmless.
+      }
+      return list.sizes;
+    });
+    return cloudBlobSizesPromise;
+  };
   const ordinaryFiles = prepared.fileAssets.filter((file) => {
     if (file.deletedAt) return false;
     const paper = paperById.get(file.paperId);
     const arxivId = paper?.arxiv ? normalizeArxivId(paper.arxiv) : undefined;
     return !(arxivId && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName)));
   });
+  // Phase 1: purely local verification — work out which files still need the
+  // cloud asked about them, without touching the network.
+  const cloudCheckCandidates: { fileId: string; fileSize: number; sha256: string; verified: VerifiedLocalFile }[] = [];
   await mapWithConcurrency(ordinaryFiles, 6, async (file) => {
     const sha256 = file.sha256.trim().toLowerCase();
     if (!sha256Pattern.test(sha256)
@@ -234,31 +266,48 @@ export async function syncLibrary(
 
     if (verified.cloudTarget === cloudTarget
       && (verified.cloudVerifiedAt ?? 0) >= cloudVerificationCutoff) {
-      preflight.set(file.id, { exists: true, size: file.size, stats: emptyNetworkStats() });
+      preflight.set(file.id, { exists: true, size: file.size });
       return;
     }
 
-    let request = statPromises.get(sha256);
-    if (!request) {
-      request = invoke<QiniuObjectStat>("qiniu_object_exists", { sha256 }).then((stat) => {
-        addNetworkStats(preSyncNetworkStats, stat.stats);
-        return stat;
-      });
-      statPromises.set(sha256, request);
-    }
-    const stat = await request;
-    if (stat.exists && stat.size !== file.size) {
-      throw new Error(`Cloud blob ${sha256} has size ${stat.size ?? "unknown"}, expected ${file.size}; refusing to trust it.`);
-    }
-    if (stat.exists) {
-      verifiedLocalFiles[file.id] = {
-        ...verified,
-        cloudTarget,
-        cloudVerifiedAt: Date.now()
-      };
-    }
-    preflight.set(file.id, stat);
+    cloudCheckCandidates.push({ fileId: file.id, fileSize: file.size, sha256, verified });
   });
+
+  // Phase 2: answer the pending existence questions with whichever costs fewer
+  // billed requests — one HEAD per unique hash, or one paginated LIST of all
+  // blobs, whose page count is estimated from the previous LIST's blob count.
+  const pendingShas = [...new Set(cloudCheckCandidates.map((candidate) => candidate.sha256))];
+  if (pendingShas.length > 0) {
+    const statBySha = new Map<string, CloudObjectStat>();
+    if (pendingShas.length <= estimatedBlobListPages()) {
+      await mapWithConcurrency(pendingShas, 6, async (sha256) => {
+        const stat = await invoke<QiniuObjectStat>("qiniu_object_exists", { sha256 });
+        addNetworkStats(preSyncNetworkStats, stat.stats);
+        statBySha.set(sha256, { exists: stat.exists, size: stat.size });
+      });
+    } else {
+      const cloudSizes = await fetchCloudBlobSizes();
+      for (const sha256 of pendingShas) {
+        statBySha.set(sha256, Object.prototype.hasOwnProperty.call(cloudSizes, sha256)
+          ? { exists: true, size: cloudSizes[sha256] }
+          : { exists: false });
+      }
+    }
+    for (const candidate of cloudCheckCandidates) {
+      const stat = statBySha.get(candidate.sha256) ?? { exists: false };
+      if (stat.exists && stat.size !== candidate.fileSize) {
+        throw new Error(`Cloud blob ${candidate.sha256} has size ${stat.size ?? "unknown"}, expected ${candidate.fileSize}; refusing to trust it.`);
+      }
+      if (stat.exists) {
+        verifiedLocalFiles[candidate.fileId] = {
+          ...candidate.verified,
+          cloudTarget,
+          cloudVerifiedAt: Date.now()
+        };
+      }
+      preflight.set(candidate.fileId, stat);
+    }
+  }
   saveVerifiedLocalFiles(verifiedLocalFiles);
 
   for (const file of prepared.fileAssets) {
@@ -317,7 +366,12 @@ export async function syncLibrary(
         saveVerifiedLocalFiles(verifiedLocalFiles);
       }
       try {
-        const uploadResult: QiniuBlobUploadResult = ensuredCloudHashes.has(sha256)
+        // The pre-sync LIST (when it ran) also answers for hashes healed during
+        // upload, e.g. Mendeley imports whose real content already lives in the
+        // cloud under a different recorded sha — no per-file existence HEAD.
+        const listedSizes = cloudBlobSizesPromise ? await cloudBlobSizesPromise : undefined;
+        const alreadyInCloud = ensuredCloudHashes.has(sha256) || listedSizes?.[sha256] === bytes.length;
+        const uploadResult: QiniuBlobUploadResult = alreadyInCloud
           ? { uploaded: false, stats: emptyNetworkStats() }
           : await invoke<QiniuBlobUploadResult>("qiniu_upload_blob", buffer, {
             headers: { "x-lumora-sha256": sha256 }

@@ -2308,6 +2308,7 @@ pub fn run() {
             cloud_sync::qiniu_disconnect_sync,
             cloud_sync::qiniu_upload_blob,
             cloud_sync::qiniu_object_exists,
+            cloud_sync::qiniu_list_blobs,
             cloud_sync::qiniu_download_blob,
             cloud_sync::qiniu_delete_blob,
             cloud_sync::qiniu_sync_library,
