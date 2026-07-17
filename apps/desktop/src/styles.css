@@ -2628,6 +2628,9 @@ button:disabled {
 
 .duplicate-documents-body {
   display: grid;
+  /* max-content rows keep each group at natural height; without this the
+     grid splits the modal height evenly and overflow:hidden clips rows. */
+  grid-auto-rows: max-content;
   gap: 14px;
   overflow: auto;
   padding: 16px;
