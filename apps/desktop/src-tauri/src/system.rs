@@ -75,6 +75,7 @@ pub(crate) fn linux_graphics_capability() -> LinuxGraphicsCapability {
     LinuxGraphicsCapability { tier: "unknown" }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn classify_linux_graphics_capability(
     vendors: &[String],
     has_render_node: bool,
