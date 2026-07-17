@@ -95,7 +95,7 @@ export function normalizeNativePdfPixelWidth(pixelWidth: number): number {
   if (!Number.isFinite(pixelWidth)) {
     return 1024;
   }
-  return Math.min(4096, Math.max(256, Math.round(pixelWidth)));
+  return Math.min(8192, Math.max(256, Math.round(pixelWidth)));
 }
 
 function schedulePageRender<T>(task: () => Promise<T>): Promise<T> {

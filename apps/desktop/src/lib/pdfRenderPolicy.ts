@@ -39,8 +39,11 @@ const legacyWebKitPolicy: PdfRenderPolicy = {
 const linuxPolicies: Record<LinuxGraphicsTier, PdfRenderPolicy> = {
   discrete: {
     tier: "linux-discrete",
-    maxDevicePixelRatio: 1.75,
-    maxCanvasPixels: 8_000_000,
+    // Pages are rasterized by Poppler outside WebKitGTK, so a discrete GPU
+    // machine can afford the same backing-store budget as modern macOS.
+    // Fractional caps below the display DPR blur HiDPI text on upscale.
+    maxDevicePixelRatio: 2,
+    maxCanvasPixels: 16_000_000,
     overscanPages: 1,
     debounceZoom: true
   },

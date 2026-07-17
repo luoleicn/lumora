@@ -22,7 +22,7 @@ describe("native PDF renderer", () => {
   it("bounds sidecar image width independently of CSS zoom", () => {
     expect(normalizeNativePdfPixelWidth(1200.4)).toBe(1200);
     expect(normalizeNativePdfPixelWidth(100)).toBe(256);
-    expect(normalizeNativePdfPixelWidth(9000)).toBe(4096);
+    expect(normalizeNativePdfPixelWidth(9000)).toBe(8192);
     expect(normalizeNativePdfPixelWidth(Number.NaN)).toBe(1024);
   });
 

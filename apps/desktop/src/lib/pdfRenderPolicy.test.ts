@@ -42,8 +42,8 @@ describe("PDF render policy", () => {
       linuxGraphicsTier: "discrete"
     })).toEqual({
       tier: "linux-discrete",
-      maxDevicePixelRatio: 1.75,
-      maxCanvasPixels: 8_000_000,
+      maxDevicePixelRatio: 2,
+      maxCanvasPixels: 16_000_000,
       overscanPages: 1,
       debounceZoom: true
     });

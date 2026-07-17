@@ -105,7 +105,7 @@ pub(crate) async fn native_pdf_render_page(
     let bytes = tauri::async_runtime::spawn_blocking(move || {
         let pdf_path = session_path(&session_id)?;
         validate_page_number(page_number)?;
-        let pixel_width = pixel_width.clamp(256, 4096);
+        let pixel_width = pixel_width.clamp(256, 8192);
         let page = page_number.to_string();
         let width = pixel_width.to_string();
         let output = std::process::Command::new("pdftocairo")
