@@ -502,7 +502,7 @@ fn keyring_entry(access_key: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYRING_SERVICE, access_key).map_err(|error| error.to_string())
 }
 
-pub(super) fn init_sync_schema(connection: &rusqlite::Connection) -> Result<(), String> {
+pub(crate) fn init_sync_schema(connection: &rusqlite::Connection) -> Result<(), String> {
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS sync_cursors (
@@ -569,8 +569,8 @@ pub(super) fn init_sync_schema(connection: &rusqlite::Connection) -> Result<(), 
 }
 
 fn load_config<R: Runtime>(app: &AppHandle<R>) -> Result<QiniuSyncConfig, String> {
-    let connection = super::open_library_db(app)?;
-    let raw = super::get_meta_value(&connection, CONFIG_META_KEY)
+    let connection = crate::db::open_library_db(app)?;
+    let raw = crate::db::get_meta_value(&connection, CONFIG_META_KEY)
         .ok_or_else(|| "Qiniu sync is not configured.".to_string())?;
     serde_json::from_str(&raw).map_err(|error| format!("Invalid Qiniu configuration: {error}"))
 }
@@ -766,16 +766,16 @@ fn classify_stat_status(status: reqwest::StatusCode) -> Result<bool, reqwest::St
 }
 
 fn device_id(connection: &rusqlite::Connection) -> Result<String, String> {
-    if let Some(id) = super::get_meta_value(connection, DEVICE_META_KEY) {
+    if let Some(id) = crate::db::get_meta_value(connection, DEVICE_META_KEY) {
         return Ok(id);
     }
     let id = uuid::Uuid::new_v4().to_string();
-    super::set_meta_value(connection, DEVICE_META_KEY, &id)?;
+    crate::db::set_meta_value(connection, DEVICE_META_KEY, &id)?;
     Ok(id)
 }
 
 fn next_batch_seq(connection: &rusqlite::Connection) -> u64 {
-    super::get_meta_value(connection, NEXT_BATCH_META_KEY)
+    crate::db::get_meta_value(connection, NEXT_BATCH_META_KEY)
         .and_then(|value| value.parse().ok())
         .unwrap_or(1)
 }
@@ -803,7 +803,7 @@ fn collect_local_rows(connection: &rusqlite::Connection) -> Result<Vec<LocalRow>
 }
 
 fn seal_batch<R: Runtime>(app: &AppHandle<R>, device: &str) -> Result<Option<(u64, Vec<u8>, Vec<LocalRow>)>, String> {
-    let connection = super::open_library_db(app)?;
+    let connection = crate::db::open_library_db(app)?;
     let seq = next_batch_seq(&connection);
     let existing_batch: Option<(Vec<u8>, i64)> = connection
         .query_row(
@@ -900,7 +900,7 @@ fn apply_change(
         .optional()
         .map_err(|error| error.to_string())?
         .unwrap_or(0);
-    if dirty > 0 && device != super::get_meta_value(transaction, DEVICE_META_KEY).as_deref().unwrap_or("") {
+    if dirty > 0 && device != crate::db::get_meta_value(transaction, DEVICE_META_KEY).as_deref().unwrap_or("") {
         transaction
             .execute(
                 "INSERT OR REPLACE INTO sync_inbox(device_id,batch_seq,op_index,put_time,change_json)
@@ -963,7 +963,7 @@ fn apply_change(
             params![change.entity, id, put_time as i64, device, batch_seq as i64, op_index as i64],
         )
         .map_err(|error| error.to_string())?;
-    if let Err(error) = super::sync_search_index_for_change(transaction, &change.entity, id, &data, deleted_at) {
+    if let Err(error) = crate::search::sync_search_index_for_change(transaction, &change.entity, id, &data, deleted_at) {
         eprintln!("Search index update failed after cloud sync: {error}");
     }
     Ok(true)
@@ -976,7 +976,7 @@ fn confirm_local_batch<R: Runtime>(
     put_time: u64,
     rows: &[LocalRow],
 ) -> Result<(), String> {
-    let mut connection = super::open_library_db(app)?;
+    let mut connection = crate::db::open_library_db(app)?;
     let transaction = connection.transaction().map_err(|error| error.to_string())?;
     let batch: CloudBatch = transaction
         .query_row(
@@ -1012,7 +1012,7 @@ fn confirm_local_batch<R: Runtime>(
             params![device, seq as i64, put_time as i64],
         )
         .map_err(|error| error.to_string())?;
-    super::set_meta_value(&transaction, NEXT_BATCH_META_KEY, &(seq + 1).to_string())?;
+    crate::db::set_meta_value(&transaction, NEXT_BATCH_META_KEY, &(seq + 1).to_string())?;
     transaction
         .execute(
             "INSERT INTO sync_cursors(device_id,batch_seq) VALUES (?1,?2)
@@ -1024,7 +1024,7 @@ fn confirm_local_batch<R: Runtime>(
 }
 
 fn apply_deferred_inbox<R: Runtime>(app: &AppHandle<R>) -> Result<usize, String> {
-    let mut connection = super::open_library_db(app)?;
+    let mut connection = crate::db::open_library_db(app)?;
     let pending = {
         let mut statement = connection
             .prepare("SELECT device_id,batch_seq,op_index,put_time,change_json FROM sync_inbox ORDER BY put_time,device_id,batch_seq,op_index")
@@ -1078,7 +1078,7 @@ fn current_device_state<R: Runtime>(
     latest: u64,
 ) -> Result<DeviceState, String> {
     let seen = {
-        let connection = super::open_library_db(app)?;
+        let connection = crate::db::open_library_db(app)?;
         let mut seen = HashMap::new();
         let mut statement = connection.prepare("SELECT device_id,batch_seq FROM sync_cursors").map_err(|e| e.to_string())?;
         let rows = statement
@@ -1106,8 +1106,8 @@ fn device_state_needs_publish<R: Runtime>(
     target: &str,
     state: &DeviceState,
 ) -> Result<bool, String> {
-    let connection = super::open_library_db(app)?;
-    let Some(raw) = super::get_meta_value(&connection, PUBLISHED_DEVICE_STATE_META_KEY) else {
+    let connection = crate::db::open_library_db(app)?;
+    let Some(raw) = crate::db::get_meta_value(&connection, PUBLISHED_DEVICE_STATE_META_KEY) else {
         return Ok(true);
     };
     let Ok(published) = serde_json::from_str::<PublishedDeviceState>(&raw) else {
@@ -1154,8 +1154,8 @@ async fn upload_device_state<R: Runtime>(
         seen: state.seen.clone(),
         published_at_ms: now_millis(),
     };
-    let connection = super::open_library_db(app)?;
-    super::set_meta_value(
+    let connection = crate::db::open_library_db(app)?;
+    crate::db::set_meta_value(
         &connection,
         PUBLISHED_DEVICE_STATE_META_KEY,
         &serde_json::to_string(&published).map_err(|error| error.to_string())?,
@@ -1311,7 +1311,7 @@ async fn pull_remote<R: Runtime>(
             continue;
         }
         let (current, cached_head) = {
-            let connection = super::open_library_db(app)?;
+            let connection = crate::db::open_library_db(app)?;
             let current = connection
                 .query_row("SELECT batch_seq FROM sync_cursors WHERE device_id=?1", [listed_device], |row| row.get::<_, i64>(0))
                 .optional()
@@ -1348,7 +1348,7 @@ async fn pull_remote<R: Runtime>(
             if batch.protocol_version != PROTOCOL_VERSION || batch.device_id != state.device_id || batch.batch_seq != seq {
                 return Err(format!("Invalid cloud batch {batch_key}"));
             }
-            let mut connection = super::open_library_db(app)?;
+            let mut connection = crate::db::open_library_db(app)?;
             let transaction = connection.transaction().map_err(|error| error.to_string())?;
             for (index, change) in batch.changes.iter().enumerate() {
                 if apply_change(&transaction, change, put_time, &state.device_id, seq, index)? {
@@ -1364,7 +1364,7 @@ async fn pull_remote<R: Runtime>(
                 .map_err(|error| error.to_string())?;
             transaction.commit().map_err(|error| error.to_string())?;
         }
-        let connection = super::open_library_db(app)?;
+        let connection = crate::db::open_library_db(app)?;
         connection
             .execute(
                 "INSERT INTO sync_device_heads(target,device_id,etag,latest_batch_seq) VALUES (?1,?2,?3,?4)
@@ -1378,8 +1378,8 @@ async fn pull_remote<R: Runtime>(
 
 #[tauri::command]
 pub async fn qiniu_sync_config<R: Runtime>(app: AppHandle<R>) -> Result<Option<QiniuSyncConfig>, String> {
-    let connection = super::open_library_db(&app)?;
-    super::get_meta_value(&connection, CONFIG_META_KEY)
+    let connection = crate::db::open_library_db(&app)?;
+    crate::db::get_meta_value(&connection, CONFIG_META_KEY)
         .map(|raw| serde_json::from_str(&raw).map_err(|error| error.to_string()))
         .transpose()
 }
@@ -1409,18 +1409,18 @@ pub async fn qiniu_save_sync_config<R: Runtime>(
     keyring_entry(request.access_key.trim())?
         .set_password(&request.secret_key)
         .map_err(|error| format!("Failed to store Qiniu Secret Key in the system keychain: {error}"))?;
-    let mut connection = super::open_library_db(&app)?;
+    let mut connection = crate::db::open_library_db(&app)?;
     let target = format!("{}:{}", config.access_key, config.bucket);
-    if super::get_meta_value(&connection, SEEDED_TARGET_META_KEY).as_deref() != Some(&target) {
+    if crate::db::get_meta_value(&connection, SEEDED_TARGET_META_KEY).as_deref() != Some(&target) {
         let transaction = connection.transaction().map_err(|error| error.to_string())?;
         let max_seq: i64 = transaction
             .query_row("SELECT COALESCE(MAX(local_seq),0) FROM entities", [], |row| row.get(0))
             .map_err(|error| error.to_string())?;
         transaction.execute("UPDATE entities SET local_seq=?1", [max_seq + 1]).map_err(|e| e.to_string())?;
-        super::set_meta_value(&transaction, SEEDED_TARGET_META_KEY, &target)?;
+        crate::db::set_meta_value(&transaction, SEEDED_TARGET_META_KEY, &target)?;
         transaction.commit().map_err(|error| error.to_string())?;
     }
-    super::set_meta_value(&connection, CONFIG_META_KEY, &serde_json::to_string(&config).unwrap())?;
+    crate::db::set_meta_value(&connection, CONFIG_META_KEY, &serde_json::to_string(&config).unwrap())?;
     Ok(config)
 }
 
@@ -1451,8 +1451,8 @@ pub async fn qiniu_test_sync_connection<R: Runtime>(app: AppHandle<R>) -> Result
 
 #[tauri::command]
 pub async fn qiniu_disconnect_sync<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    let connection = super::open_library_db(&app)?;
-    if let Some(raw) = super::get_meta_value(&connection, CONFIG_META_KEY) {
+    let connection = crate::db::open_library_db(&app)?;
+    if let Some(raw) = crate::db::get_meta_value(&connection, CONFIG_META_KEY) {
         if let Ok(config) = serde_json::from_str::<QiniuSyncConfig>(&raw) {
             let _ = keyring_entry(&config.access_key).and_then(|entry| entry.delete_credential().map_err(|e| e.to_string()));
         }
@@ -1595,15 +1595,15 @@ pub async fn qiniu_sync_library<R: Runtime>(app: AppHandle<R>) -> Result<SyncSum
     let secret = load_secret(&config)?;
     let counters = NetworkCounters::default();
     let device = {
-        let connection = super::open_library_db(&app)?;
+        let connection = crate::db::open_library_db(&app)?;
         device_id(&connection)?
     };
     // The protocol marker is immutable. Verify it once per configured target,
     // then avoid a redundant HEAD during every hourly steady-state sync.
     let target = sync_target_id(&config);
     let protocol_verified = {
-        let connection = super::open_library_db(&app)?;
-        super::get_meta_value(&connection, PROTOCOL_VERIFIED_TARGET_META_KEY).as_deref() == Some(&target)
+        let connection = crate::db::open_library_db(&app)?;
+        crate::db::get_meta_value(&connection, PROTOCOL_VERIFIED_TARGET_META_KEY).as_deref() == Some(&target)
     };
     if !protocol_verified {
         let protocol_key = format!("{PREFIX}/protocol.json");
@@ -1612,8 +1612,8 @@ pub async fn qiniu_sync_library<R: Runtime>(app: AppHandle<R>) -> Result<SyncSum
                 .await
                 .map_err(|error| error.to_string())?;
         }
-        let connection = super::open_library_db(&app)?;
-        super::set_meta_value(&connection, PROTOCOL_VERIFIED_TARGET_META_KEY, &target)?;
+        let connection = crate::db::open_library_db(&app)?;
+        crate::db::set_meta_value(&connection, PROTOCOL_VERIFIED_TARGET_META_KEY, &target)?;
     }
     let mut summary = SyncSummary::default();
     let _ = app.emit("qiniu-sync-stage", "Uploading local changes to Qiniu…");
@@ -1637,14 +1637,14 @@ pub async fn qiniu_sync_library<R: Runtime>(app: AppHandle<R>) -> Result<SyncSum
     summary.downloaded_changes += apply_deferred_inbox(&app)?;
     // Publish an empty/new device once, refresh when its semantic state changes,
     // and periodically republish so an externally deleted head self-heals.
-    let latest = next_batch_seq(&super::open_library_db(&app)?).saturating_sub(1);
+    let latest = next_batch_seq(&crate::db::open_library_db(&app)?).saturating_sub(1);
     let state = current_device_state(&app, &device, latest)?;
     if device_state_needs_publish(&app, &target, &state)? {
         upload_device_state(&app, &config, &secret, &counters, &target, &state).await?;
     }
     let last_synced_at = now_iso();
-    let connection = super::open_library_db(&app)?;
-    super::set_meta_value(&connection, LAST_SYNC_META_KEY, &last_synced_at)?;
+    let connection = crate::db::open_library_db(&app)?;
+    crate::db::set_meta_value(&connection, LAST_SYNC_META_KEY, &last_synced_at)?;
     summary.pending_changes = connection
         .query_row("SELECT COUNT(*) FROM entities WHERE local_seq>0", [], |row| row.get::<_, i64>(0))
         .map_err(|error| error.to_string())? as usize;
