@@ -4,11 +4,11 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{Read, Write},
     sync::{
         atomic::{AtomicU64, Ordering},
-        OnceLock,
+        Mutex, OnceLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -32,6 +32,32 @@ const DEVICE_STATE_REPUBLISH_INTERVAL_MS: u64 = 24 * 60 * 60 * 1_000;
 // responds must fail fast rather than hang the whole sync forever, which would
 // leave the UI stuck and block manual re-syncs.
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+/// Hashes confirmed to exist in the bucket during one frontend sync run:
+/// seeded by the preflight LIST (`seeded` then also proves absence) and
+/// extended by HEAD/PUT confirmations, so no existence request is repeated
+/// within a run. A different run id starts fresh, so knowledge never leaks
+/// across runs — mirroring the per-sync caches the frontend used to keep.
+struct KnownCloudRun {
+    run_id: String,
+    seeded: bool,
+    hashes: HashSet<String>,
+}
+
+static KNOWN_CLOUD_RUN: Mutex<Option<KnownCloudRun>> = Mutex::new(None);
+
+fn known_cloud_run_apply<T>(run_id: &str, action: impl FnOnce(&mut KnownCloudRun) -> T) -> Option<T> {
+    let mut guard = KNOWN_CLOUD_RUN.lock().ok()?;
+    let matches_run = matches!(guard.as_ref(), Some(run) if run.run_id == run_id);
+    if !matches_run {
+        *guard = Some(KnownCloudRun {
+            run_id: run_id.to_string(),
+            seeded: false,
+            hashes: HashSet::new(),
+        });
+    }
+    guard.as_mut().map(action)
+}
 
 #[derive(Debug, Default)]
 struct NetworkCounters {
@@ -1575,9 +1601,10 @@ pub struct QiniuBlobList {
 
 /// Lists every content-addressed blob in one paginated ListObjectsV2 sweep
 /// (up to 1000 keys per request), so the pre-sync existence check costs one GET
-/// instead of one HEAD per file.
+/// instead of one HEAD per file. With a `run_id`, the listing also seeds the
+/// run's known-hash cache so later native uploads skip their existence HEADs.
 #[tauri::command]
-pub async fn qiniu_list_blobs<R: Runtime>(app: AppHandle<R>) -> Result<QiniuBlobList, String> {
+pub async fn qiniu_list_blobs<R: Runtime>(app: AppHandle<R>, run_id: Option<String>) -> Result<QiniuBlobList, String> {
     let config = load_config(&app)?;
     let secret = load_secret(&config)?;
     let counters = NetworkCounters::default();
@@ -1586,7 +1613,174 @@ pub async fn qiniu_list_blobs<R: Runtime>(app: AppHandle<R>) -> Result<QiniuBlob
     for xml in list_object_pages(&config, &secret, &counters, &prefix).await? {
         sizes.extend(extract_listed_blob_sizes(&xml, &prefix));
     }
+    if let Some(run_id) = run_id.as_deref() {
+        known_cloud_run_apply(run_id, |run| {
+            run.seeded = true;
+            run.hashes.extend(sizes.keys().cloned());
+        });
+    }
     Ok(QiniuBlobList { sizes, stats: counters.snapshot() })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredBlobUploadOutcome {
+    /// Hash of the bytes actually read from disk; `None` when the local file
+    /// could not be read — callers mirror the legacy IndexedDB fallback then.
+    pub sha256: Option<String>,
+    pub size: u64,
+    pub modified_ms: u64,
+    /// File metadata was identical before and after the read; only then may
+    /// the caller cache the hash against this size/mtime pair.
+    pub stable: bool,
+    pub uploaded: bool,
+    pub stats: NetworkStats,
+    pub error: Option<BlobUploadIssue>,
+}
+
+fn stored_blob_outcome(
+    sha256: Option<String>,
+    size: u64,
+    modified_ms: u64,
+    stable: bool,
+    uploaded: bool,
+    counters: &NetworkCounters,
+    error: Option<BlobUploadIssue>,
+) -> StoredBlobUploadOutcome {
+    StoredBlobUploadOutcome { sha256, size, modified_ms, stable, uploaded, stats: counters.snapshot(), error }
+}
+
+/// Native upload of a disk-stored PDF: reads, hashes and uploads entirely in
+/// Rust, so the file bytes never cross the IPC boundary and are hashed once.
+/// Existence checks consult the run's known-hash cache first; after a seeding
+/// LIST, absence from the cache is proof enough to skip the HEAD as well.
+#[tauri::command]
+pub async fn qiniu_upload_stored_blob<R: Runtime>(
+    app: AppHandle<R>,
+    run_id: String,
+    dir: String,
+    file_name: String,
+) -> Result<StoredBlobUploadOutcome, String> {
+    crate::file_storage::validate_stored_file_name(&file_name)?;
+    let counters = NetworkCounters::default();
+
+    let read = tauri::async_runtime::spawn_blocking(move || -> Option<(Vec<u8>, String, u64, bool)> {
+        let path = std::path::Path::new(&dir).join(&file_name);
+        let before = std::fs::metadata(&path).ok().filter(|metadata| metadata.is_file())?;
+        let bytes = std::fs::read(&path).ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        let after = std::fs::metadata(&path).ok()?;
+        let stable = before.len() == after.len()
+            && crate::file_storage::file_modified_ms(&before) == crate::file_storage::file_modified_ms(&after);
+        let sha256 = sha256_hex(&bytes);
+        let modified_ms = crate::file_storage::file_modified_ms(&after);
+        Some((bytes, sha256, modified_ms, stable))
+    })
+    .await
+    .map_err(|error| format!("Blob read task failed: {error}"))?;
+
+    let Some((bytes, sha256, modified_ms, stable)) = read else {
+        return Ok(stored_blob_outcome(None, 0, 0, false, false, &counters, None));
+    };
+    let size = bytes.len() as u64;
+
+    let config = load_config(&app)?;
+    let secret = load_secret(&config)?;
+    let (known, seeded) = known_cloud_run_apply(&run_id, |run| (run.hashes.contains(&sha256), run.seeded))
+        .unwrap_or((false, false));
+    if known {
+        return Ok(stored_blob_outcome(Some(sha256), size, modified_ms, stable, false, &counters, None));
+    }
+
+    let key = format!("{PREFIX}/blobs/sha256/{sha256}");
+    if !seeded {
+        match stat_object_if_exists(&config, &secret, &counters, &key).await {
+            Ok(Some(_)) => {
+                known_cloud_run_apply(&run_id, |run| run.hashes.insert(sha256.clone()));
+                return Ok(stored_blob_outcome(Some(sha256), size, modified_ms, stable, false, &counters, None));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Ok(stored_blob_outcome(
+                    Some(sha256),
+                    size,
+                    modified_ms,
+                    stable,
+                    false,
+                    &counters,
+                    Some(BlobUploadIssue { kind: BlobUploadIssueKind::Fatal, message: error }),
+                ));
+            }
+        }
+    }
+
+    match upload_bytes(&config, &secret, &counters, &key, &bytes).await {
+        Ok(_) => {
+            known_cloud_run_apply(&run_id, |run| run.hashes.insert(sha256.clone()));
+            Ok(stored_blob_outcome(Some(sha256), size, modified_ms, stable, true, &counters, None))
+        }
+        Err(error) => Ok(stored_blob_outcome(
+            Some(sha256),
+            size,
+            modified_ms,
+            stable,
+            false,
+            &counters,
+            Some(BlobUploadIssue { kind: error.kind, message: error.message }),
+        )),
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobDownloadToFilesResult {
+    pub files: Vec<crate::file_storage::StoredCopy>,
+    pub size: u64,
+    pub stats: NetworkStats,
+}
+
+/// Native download of a content-addressed blob straight to the storage folder:
+/// one GET materializes every requested copy, the hash is verified in Rust and
+/// the bytes never enter the webview.
+#[tauri::command]
+pub async fn qiniu_download_blob_to_files<R: Runtime>(
+    app: AppHandle<R>,
+    sha256: String,
+    dir: String,
+    file_names: Vec<String>,
+) -> Result<BlobDownloadToFilesResult, String> {
+    let expected = sha256.trim().to_ascii_lowercase();
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Expected a 64-character SHA-256 value.".to_string());
+    }
+    if file_names.is_empty() {
+        return Err("No target file names given.".to_string());
+    }
+    for name in &file_names {
+        crate::file_storage::validate_stored_file_name(name)?;
+    }
+
+    let config = load_config(&app)?;
+    let secret = load_secret(&config)?;
+    let counters = NetworkCounters::default();
+    let key = format!("{PREFIX}/blobs/sha256/{expected}");
+    let bytes = download_bytes(&config, &secret, &counters, &key).await?;
+    let stats = counters.snapshot();
+
+    let (files, size) = tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+        if sha256_hex(&bytes) != expected {
+            return Err("Downloaded Qiniu object failed SHA-256 verification.".to_string());
+        }
+        let size = bytes.len() as u64;
+        let files = crate::file_storage::write_blob_copies(std::path::Path::new(&dir), &file_names, &bytes)?;
+        Ok((files, size))
+    })
+    .await
+    .map_err(|error| format!("Blob materialize task failed: {error}"))??;
+
+    Ok(BlobDownloadToFilesResult { files, size, stats })
 }
 
 #[tauri::command]
@@ -1867,6 +2061,27 @@ mod tests {
         );
         let blobs = extract_listed_blob_sizes(&xml, "lumora/v1/blobs/sha256/");
         assert_eq!(blobs, vec![(sha_a, 42), (sha_b.to_ascii_lowercase(), 7)]);
+    }
+
+    #[test]
+    fn known_cloud_run_resets_on_a_new_run_id() {
+        let run_a = format!("run-a-{}", uuid::Uuid::new_v4());
+        let run_b = format!("run-b-{}", uuid::Uuid::new_v4());
+
+        known_cloud_run_apply(&run_a, |run| {
+            run.seeded = true;
+            run.hashes.insert("hash-1".to_string());
+        });
+        assert_eq!(
+            known_cloud_run_apply(&run_a, |run| (run.seeded, run.hashes.contains("hash-1"))),
+            Some((true, true))
+        );
+
+        // A different run id must start with no knowledge at all.
+        assert_eq!(
+            known_cloud_run_apply(&run_b, |run| (run.seeded, run.hashes.contains("hash-1"))),
+            Some((false, false))
+        );
     }
 
     #[test]

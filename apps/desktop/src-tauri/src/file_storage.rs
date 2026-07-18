@@ -2,11 +2,83 @@
 // Raw-body store command, bounded range reads for PDF.js, and rename/move
 // with collision-free naming.
 
+use sha2::{Digest, Sha256};
+
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct StoredFileMetadata {
     size: u64,
     modified_ms: u64,
+}
+
+/// One materialized copy of a content blob: the name the caller asked for and
+/// the (possibly suffixed) name actually written to disk.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StoredCopy {
+    pub(crate) requested: String,
+    pub(crate) stored: String,
+}
+
+pub(crate) fn file_modified_ms(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or_default()
+}
+
+/// Writes `bytes` once per requested file name (collision-free), in the order
+/// given, so callers can zip the result back onto their request list.
+pub(crate) fn write_blob_copies(
+    dir: &std::path::Path,
+    file_names: &[String],
+    bytes: &[u8],
+) -> Result<Vec<StoredCopy>, String> {
+    std::fs::create_dir_all(dir).map_err(|error| format!("Failed to create storage folder: {error}"))?;
+    let mut copies = Vec::with_capacity(file_names.len());
+    for file_name in file_names {
+        let target = resolve_collision_free_path(dir, file_name, None);
+        std::fs::write(&target, bytes).map_err(|error| format!("Failed to write PDF: {error}"))?;
+        copies.push(StoredCopy {
+            requested: file_name.clone(),
+            stored: target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(file_name)
+                .to_string(),
+        });
+    }
+    Ok(copies)
+}
+
+/// Fills missing copies of a content-addressed blob from a local sibling: the
+/// source is re-hashed before trusting it, and the bytes never leave Rust.
+#[tauri::command]
+pub(crate) async fn clone_stored_pdf(
+    dir: String,
+    source_file_name: String,
+    expected_sha256: String,
+    target_file_names: Vec<String>,
+) -> Result<Vec<StoredCopy>, String> {
+    validate_stored_file_name(&source_file_name)?;
+    for name in &target_file_names {
+        validate_stored_file_name(name)?;
+    }
+    let expected = expected_sha256.trim().to_ascii_lowercase();
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = std::path::PathBuf::from(&dir);
+        let source_path = dir.join(&source_file_name);
+        let bytes = std::fs::read(&source_path)
+            .map_err(|error| format!("Failed to read {}: {error}", source_path.display()))?;
+        if hex::encode(Sha256::digest(&bytes)) != expected {
+            return Err(format!("Local copy {source_file_name} no longer matches its content hash."));
+        }
+        write_blob_copies(&dir, &target_file_names, &bytes)
+    })
+    .await
+    .map_err(|error| format!("PDF clone task failed: {error}"))?
 }
 
 pub(crate) fn resolve_stored_file_path(dir: &str, file_name: &str) -> Result<std::path::PathBuf, String> {
@@ -35,7 +107,7 @@ fn decode_command_header(headers: &tauri::http::HeaderMap, name: &str) -> Result
         .map_err(|_| format!("Invalid {name} header encoding."))
 }
 
-fn validate_stored_file_name(file_name: &str) -> Result<(), String> {
+pub(crate) fn validate_stored_file_name(file_name: &str) -> Result<(), String> {
     if file_name.is_empty() || file_name.contains('/') || file_name.contains('\\') || file_name == "." || file_name == ".." {
         return Err(format!("Invalid file name: {file_name}"));
     }
@@ -204,13 +276,7 @@ pub(crate) async fn stored_pdf_metadata(dir: String, file_name: String) -> Resul
     if !metadata.is_file() {
         return Err(format!("Not a file: {}", path.display()));
     }
-    let modified_ms = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
-        .unwrap_or_default();
-    Ok(StoredFileMetadata { size: metadata.len(), modified_ms })
+    Ok(StoredFileMetadata { size: metadata.len(), modified_ms: file_modified_ms(&metadata) })
 }
 
 #[tauri::command]
@@ -257,7 +323,35 @@ pub(crate) async fn move_stored_pdf(dir: String, file_name: String, new_dir: Str
 
 #[cfg(test)]
 mod tests {
-    use super::{read_stored_pdf_range_bytes, resolve_stored_file_path};
+    use super::{read_stored_pdf_range_bytes, resolve_stored_file_path, write_blob_copies, StoredCopy};
+
+    #[test]
+    fn writes_blob_copies_in_order_with_collision_free_names() {
+        let directory = std::env::temp_dir().join(format!("lumora-blob-copies-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        // An occupied slot forces the suffix walker for the first target.
+        std::fs::write(directory.join("paper.pdf"), b"occupied").unwrap();
+
+        let copies = write_blob_copies(
+            &directory,
+            &["paper.pdf".to_string(), "other.pdf".to_string()],
+            b"%PDF-1.4-shared",
+        )
+        .unwrap();
+
+        assert_eq!(
+            copies,
+            vec![
+                StoredCopy { requested: "paper.pdf".into(), stored: "paper-2.pdf".into() },
+                StoredCopy { requested: "other.pdf".into(), stored: "other.pdf".into() },
+            ]
+        );
+        assert_eq!(std::fs::read(directory.join("paper-2.pdf")).unwrap(), b"%PDF-1.4-shared");
+        assert_eq!(std::fs::read(directory.join("other.pdf")).unwrap(), b"%PDF-1.4-shared");
+        assert_eq!(std::fs::read(directory.join("paper.pdf")).unwrap(), b"occupied");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn resolves_an_existing_stored_file_and_rejects_path_traversal() {

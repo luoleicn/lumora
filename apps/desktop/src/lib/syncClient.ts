@@ -45,6 +45,18 @@ type QiniuBlobUploadResult = {
   stats: QiniuNetworkStats;
   error?: { kind: "file" | "fatal"; message: string };
 };
+type StoredCopy = { requested: string; stored: string };
+type StoredBlobUploadOutcome = {
+  /** Absent when the local file could not be read (fall back to legacy path). */
+  sha256?: string;
+  size: number;
+  modifiedMs: number;
+  stable: boolean;
+  uploaded: boolean;
+  stats: QiniuNetworkStats;
+  error?: { kind: "file" | "fatal"; message: string };
+};
+type BlobDownloadToFilesResult = { files: StoredCopy[]; size: number; stats: QiniuNetworkStats };
 type VerifiedLocalFile = {
   sha256: string;
   storage: "disk" | "indexedDb";
@@ -192,6 +204,9 @@ export async function syncLibrary(
 ): Promise<{ state: LibraryState; summary: CloudSyncSummary }> {
   let prepared = _state;
   const storage = loadFileStorageSettings();
+  // One id per sync run scopes the Rust-side known-cloud-hash cache; a fresh
+  // run must never inherit existence knowledge from an earlier one.
+  const syncRunId = crypto.randomUUID();
   const paperById = new Map(prepared.papers.map((paper) => [paper.id, paper]));
   const promotedObjectHashes = new Set<string>();
   const nextFiles = [] as typeof prepared.fileAssets;
@@ -224,7 +239,7 @@ export async function syncLibrary(
   // to price future LISTs against per-hash HEADs.
   let cloudBlobSizesPromise: Promise<Record<string, number>> | undefined;
   const fetchCloudBlobSizes = () => {
-    cloudBlobSizesPromise ??= invoke<QiniuBlobList>("qiniu_list_blobs").then((list) => {
+    cloudBlobSizesPromise ??= invoke<QiniuBlobList>("qiniu_list_blobs", { runId: syncRunId }).then((list) => {
       addNetworkStats(preSyncNetworkStats, list.stats);
       try {
         localStorage.setItem(cloudBlobCountKey, String(Object.keys(list.sizes).length));
@@ -334,6 +349,64 @@ export async function syncLibrary(
     if (uploadsSuspended) {
       nextFiles.push(file);
       continue;
+    }
+
+    // Disk-backed files upload natively: Rust reads, hashes and uploads in one
+    // command, so the PDF bytes never cross the IPC boundary and are hashed
+    // exactly once. An unreadable disk file falls through to the legacy path,
+    // which still knows how to serve leftover IndexedDB blobs.
+    if (file.localPath && storage.directory) {
+      uploadedBlobs += 1;
+      onStage?.(`Uploading files ${uploadedBlobs}/${uploadableTotal}: ${file.fileName}`, 1, 5);
+      let outcome: StoredBlobUploadOutcome;
+      try {
+        outcome = await invoke<StoredBlobUploadOutcome>("qiniu_upload_stored_blob", {
+          runId: syncRunId,
+          dir: storage.directory,
+          fileName: file.localPath
+        });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`Cloud upload failed for ${file.fileName}: ${detail}`);
+      }
+      addNetworkStats(preSyncNetworkStats, outcome.stats);
+      if (outcome.sha256) {
+        if (outcome.error?.kind === "fatal") {
+          throw new Error(`Cloud upload failed for ${file.fileName}: ${outcome.error.message}`);
+        }
+        if (outcome.error) {
+          uploadErrors.push(`${file.fileName}: ${outcome.error.message}`);
+          fileUploadFailures += 1;
+          if (fileUploadFailures >= 5) {
+            uploadsSuspended = true;
+            uploadErrors.push("Further file uploads were skipped after 5 file-specific failures; metadata sync continued.");
+          }
+          nextFiles.push(file);
+          continue;
+        }
+        const sha256 = outcome.sha256;
+        // The command confirmed cloud presence (cache, HEAD or PUT), so the
+        // local verification and the cloud verification land together.
+        if (outcome.stable) {
+          verifiedLocalFiles[file.id] = {
+            sha256, storage: "disk", path: file.localPath,
+            size: outcome.size, modifiedMs: outcome.modifiedMs,
+            cloudTarget, cloudVerifiedAt: Date.now()
+          };
+          saveVerifiedLocalFiles(verifiedLocalFiles);
+        }
+        ensuredCloudHashes.add(sha256);
+        if (outcome.uploaded) uploadedFileOk += 1;
+        const healed = file.sha256 === sha256 && file.contentRef?.kind === "object" && file.contentRef.sha256 === sha256
+          ? file
+          : { ...file, sha256, size: outcome.size, contentRef: { kind: "object" as const, sha256 }, updatedAt: new Date().toISOString() };
+        if (healed !== file) await persistEntities([{ entityType: "fileAsset" as const, entity: healed }]);
+        nextFiles.push(healed);
+        continue;
+      }
+      // The disk read failed; undo the progress tick so a successful legacy
+      // attempt below is not double-counted.
+      uploadedBlobs -= 1;
     }
 
     const diskMetadataBefore = file.localPath && storage.directory
@@ -478,6 +551,74 @@ export async function syncLibrary(
       }
     }
     if (missingIndices.length === 0) continue;
+
+    // Native materialization when a storage folder is configured and no legacy
+    // in-memory bytes were captured: cloning from a verified sibling or one
+    // cloud GET writes every missing copy without the bytes ever entering the
+    // webview. Legacy IndexedDB bytes still take the in-memory path below.
+    if (storage.directory && !sharedBytes) {
+      const storageDirectory = storage.directory;
+      const targetNames = missingIndices.map((index) => downloadedFiles[index].fileName);
+      let copies: StoredCopy[] | undefined;
+      for (const index of presentIndices) {
+        const source = downloadedFiles[index];
+        if (!source.localPath) continue;
+        try {
+          copies = await invoke<StoredCopy[]>("clone_stored_pdf", {
+            dir: storageDirectory,
+            sourceFileName: source.localPath,
+            expectedSha256: sha256,
+            targetFileNames: targetNames
+          });
+          break;
+        } catch {
+          // Source unreadable or content drifted; try the next copy or the cloud.
+        }
+      }
+      if (!copies) {
+        const firstMissing = downloadedFiles[missingIndices[0]];
+        onStage?.(`Downloading file from cloud: ${firstMissing.fileName}`, 3, 5);
+        try {
+          const result = await invoke<BlobDownloadToFilesResult>("qiniu_download_blob_to_files", {
+            sha256,
+            dir: storageDirectory,
+            fileNames: targetNames
+          });
+          addNetworkStats(summary, result.stats);
+          copies = result.files;
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          downloadErrors.push(`${firstMissing.fileName}: ${detail}`);
+          consecutiveDownloadFailures += 1;
+          if (consecutiveDownloadFailures >= 5) {
+            summary.errors.push(...downloadErrors);
+            throw new Error(`Cloud sync aborted after ${consecutiveDownloadFailures} consecutive download failures. Latest — ${firstMissing.fileName}: ${detail}`);
+          }
+          continue;
+        }
+      }
+      for (const [position, index] of missingIndices.entries()) {
+        const file = downloadedFiles[index];
+        const stored = copies[position]?.stored;
+        if (!stored) continue;
+        try {
+          const downloaded = { ...file, localPath: stored, downloadState: "local" as const };
+          await persistEntities([{ entityType: "fileAsset" as const, entity: downloaded }], "remote");
+          downloadedFiles[index] = downloaded;
+          summary.downloadedFiles += 1;
+          consecutiveDownloadFailures = 0;
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          downloadErrors.push(`${file.fileName}: ${detail}`);
+          consecutiveDownloadFailures += 1;
+          if (consecutiveDownloadFailures >= 5) {
+            summary.errors.push(...downloadErrors);
+            throw new Error(`Cloud sync aborted after ${consecutiveDownloadFailures} consecutive download failures. Latest — ${file.fileName}: ${detail}`);
+          }
+        }
+      }
+      continue;
+    }
 
     // A missing copy can be filled from a local sibling with the same content
     // hash; verify any candidate's bytes before trusting them.
