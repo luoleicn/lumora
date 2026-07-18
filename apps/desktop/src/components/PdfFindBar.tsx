@@ -48,7 +48,9 @@ export function PdfFindBar({
   const hasQuery = query.trim().length > 0;
   const matchLabel = hasQuery
     ? totalMatches > 0
-      ? `${activeMatchIndex + 1} of ${totalMatches}`
+      ? activeMatchIndex >= 0
+        ? `${activeMatchIndex + 1} of ${totalMatches}`
+        : `${totalMatches} results`
       : "No results"
     : "";
 

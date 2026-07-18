@@ -24,6 +24,16 @@ export type PdfSearchTarget = {
   key: string;
 };
 
+export function nextPdfSearchMatchIndex(activeIndex: number, totalMatches: number): number {
+  if (totalMatches <= 0) return -1;
+  return activeIndex < 0 || activeIndex >= totalMatches - 1 ? 0 : activeIndex + 1;
+}
+
+export function previousPdfSearchMatchIndex(activeIndex: number, totalMatches: number): number {
+  if (totalMatches <= 0) return -1;
+  return activeIndex <= 0 || activeIndex >= totalMatches ? totalMatches - 1 : activeIndex - 1;
+}
+
 // Search the PDF text model rather than the rendered DOM. This keeps find-in-
 // document complete when only a small virtual window of pages is mounted.
 export async function findInPdfText(

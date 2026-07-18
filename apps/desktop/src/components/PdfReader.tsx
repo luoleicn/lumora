@@ -19,6 +19,8 @@ import {
 import {
   findInPageTextLayer,
   findInPdfText,
+  nextPdfSearchMatchIndex,
+  previousPdfSearchMatchIndex,
   type PdfSearchMatch,
   type PdfSearchTarget
 } from "../lib/pdfSearch";
@@ -38,6 +40,8 @@ import {
 } from "../lib/pdfRenderPolicy";
 import { getStoredPdfMetadata, readPdfFromDisk } from "../lib/fileStorage";
 import { createLocalPdfRangeTransport, localPdfRangeChunkSize } from "../lib/pdfRangeTransport";
+import { externalWebUrlFromTarget } from "../lib/externalWebLinks";
+import { resolvePdfDestinationOffset } from "../lib/pdfDestination";
 import { isLegacyWebKit } from "../lib/webkitPolyfills";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
@@ -180,6 +184,7 @@ function PdfReaderComponent({
   const nativePdfSessionId = nativeRenderer.status === "ready" ? nativeRenderer.document.sessionId : undefined;
   const [numPages, setNumPages] = useState(0);
   const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy>();
+  const pdfDocumentRef = useRef<PDFDocumentProxy | undefined>(undefined);
   const [pageWidth, setPageWidth] = useState(760);
   const [viewportHeight, setViewportHeight] = useState(700);
   const [pageAspectRatios, setPageAspectRatios] = useState<Record<number, number>>({});
@@ -241,6 +246,17 @@ function PdfReaderComponent({
     () => buildPdfPageMetrics(numPages, renderedPageWidth, pageAspectRatios),
     [numPages, pageAspectRatios, renderedPageWidth]
   );
+  // react-pdf captures Document.onItemClick only on its first render. Keep the
+  // callback stable and expose all mutable navigation inputs through refs so
+  // internal links never use the initial (document-less) render's closure.
+  const pageMetricsRef = useRef(pageMetrics);
+  const renderedPageWidthRef = useRef(renderedPageWidth);
+  const viewportHeightRef = useRef(viewportHeight);
+  const pdfOverscanPagesRef = useRef(pdfRenderPolicy.overscanPages);
+  pageMetricsRef.current = pageMetrics;
+  renderedPageWidthRef.current = renderedPageWidth;
+  viewportHeightRef.current = viewportHeight;
+  pdfOverscanPagesRef.current = pdfRenderPolicy.overscanPages;
   const virtualPageIndexes = useMemo(() => {
     // Keep the parsed PDF document warm for fast tab switching, but release
     // hidden canvases, text layers and native page images immediately.
@@ -377,6 +393,7 @@ function PdfReaderComponent({
   useEffect(() => {
     setContextMenu(undefined);
     setNumPages(0);
+    pdfDocumentRef.current = undefined;
     setPdfDocument(undefined);
     setPageAspectRatios({});
     setPageRange(initialPageRange);
@@ -402,6 +419,10 @@ function PdfReaderComponent({
   useEffect(() => {
     onViewStateChangeRef.current = onViewStateChange;
   }, [onViewStateChange]);
+
+  useEffect(() => {
+    pdfDocumentRef.current = pdfDocument;
+  }, [pdfDocument]);
 
   useEffect(() => {
     zoomRef.current = zoom;
@@ -618,6 +639,8 @@ function PdfReaderComponent({
     });
     setFindMatches((current) => areSearchMatchesEqual(current, visibleMatches) ? current : visibleMatches);
   }, [pdfSearchQuery, virtualPageIndexes]);
+  const refreshVisibleSearchHighlightsRef = useRef(refreshVisibleSearchHighlights);
+  refreshVisibleSearchHighlightsRef.current = refreshVisibleSearchHighlights;
 
   // Search the PDF text model so virtualized, unmounted pages remain searchable.
   // DOM ranges are only measured for the small set of pages currently mounted.
@@ -643,13 +666,11 @@ function PdfReaderComponent({
 
       setSearchTargets(targets);
       searchTargetsRef.current = targets;
-      const activeIndex = targets.length > 0 ? 0 : -1;
-      setActiveMatchIndex(activeIndex);
-      onPdfSearchUpdate?.({ totalMatches: targets.length, activeMatchIndex: activeIndex });
-      if (targets[0]) {
-        scrollToPage(targets[0].pageIndex, "smooth");
-      }
-      requestAnimationFrame(() => refreshVisibleSearchHighlights(query));
+      // Finding and navigating are separate operations. A new query highlights
+      // visible matches but does not take scroll ownership from the user.
+      setActiveMatchIndex(-1);
+      onPdfSearchUpdate?.({ totalMatches: targets.length, activeMatchIndex: -1 });
+      requestAnimationFrame(() => refreshVisibleSearchHighlightsRef.current(query));
     }).catch(() => {
       if (cancelled) {
         return;
@@ -664,12 +685,12 @@ function PdfReaderComponent({
     return () => {
       cancelled = true;
     };
-  }, [pdfDocument, nativePdfSessionId, pdfSearchQuery, active, onPdfSearchUpdate, refreshVisibleSearchHighlights]);
+  }, [pdfDocument, nativePdfSessionId, pdfSearchQuery, active, onPdfSearchUpdate]);
 
   function goToNextFindMatch() {
     const targets = searchTargetsRef.current;
     if (targets.length === 0) return;
-    const next = activeMatchIndex < 0 || activeMatchIndex >= targets.length - 1 ? 0 : activeMatchIndex + 1;
+    const next = nextPdfSearchMatchIndex(activeMatchIndex, targets.length);
     setActiveMatchIndex(next);
     onPdfSearchUpdate?.({ totalMatches: targets.length, activeMatchIndex: next });
     scrollToPage(targets[next].pageIndex, "smooth");
@@ -678,7 +699,7 @@ function PdfReaderComponent({
   function goToPrevFindMatch() {
     const targets = searchTargetsRef.current;
     if (targets.length === 0) return;
-    const prev = activeMatchIndex <= 0 ? targets.length - 1 : activeMatchIndex - 1;
+    const prev = previousPdfSearchMatchIndex(activeMatchIndex, targets.length);
     setActiveMatchIndex(prev);
     onPdfSearchUpdate?.({ totalMatches: targets.length, activeMatchIndex: prev });
     scrollToPage(targets[prev].pageIndex, "smooth");
@@ -919,6 +940,56 @@ function PdfReaderComponent({
     updatePageRange(top);
   }
 
+  const handlePdfDestination = useCallback(async (pageIndex: number, destination?: unknown) => {
+    const document = pdfDocumentRef.current;
+    const element = scrollRef.current;
+    if (!document || !element) {
+      return;
+    }
+
+    const metrics = pageMetricsRef.current;
+    const pageWidth = renderedPageWidthRef.current;
+    let top: number;
+    try {
+      top = await resolvePdfDestinationOffset(
+        document,
+        metrics,
+        pageWidth,
+        pageIndex,
+        destination
+      );
+    } catch (error) {
+      console.error("Failed to resolve PDF destination coordinates.", error);
+      top = pageOffset(metrics, pageIndex);
+    }
+    // Ignore a destination that finished resolving after another PDF replaced
+    // this reader's document.
+    if (pdfDocumentRef.current !== document || scrollRef.current !== element) {
+      return;
+    }
+    element.scrollTo({ top, behavior: "smooth" });
+    const nextRange = findPdfPageRange(
+      metrics,
+      top,
+      viewportHeightRef.current,
+      pdfOverscanPagesRef.current
+    );
+    setPageRange((current) => current.start === nextRange.start && current.end === nextRange.end
+      ? current
+      : nextRange
+    );
+  }, []);
+
+  const handlePdfItemClick = useCallback(({
+    dest,
+    pageIndex
+  }: {
+    dest?: unknown;
+    pageIndex: number;
+  }) => {
+    void handlePdfDestination(pageIndex, dest);
+  }, [handlePdfDestination]);
+
   function scheduleZoom(nextZoom: number) {
     if (!pdfRenderPolicy.debounceZoom) {
       // zoomRef only syncs post-render; update it now so wheel events landing
@@ -1014,6 +1085,19 @@ function PdfReaderComponent({
     }
   }
 
+  function handlePdfLinkClick(event: React.MouseEvent<HTMLElement>) {
+    const url = externalWebUrlFromTarget(event.target);
+    if (!url) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    void invoke("open_external_url", { url }).catch((error) => {
+      console.error("Failed to open PDF link in the default browser.", error);
+    });
+  }
+
   if (!paper) {
     return (
       <section className="reader-empty">
@@ -1041,6 +1125,7 @@ function PdfReaderComponent({
       className="reader"
       data-pdf-render-tier={pdfRenderPolicy.tier}
       data-pdf-renderer={nativePdfEnabled ? `native-${nativeRenderer.status}` : "pdfjs"}
+      onClickCapture={handlePdfLinkClick}
     >
       <div className="reader-body">
         <div
@@ -1124,9 +1209,11 @@ function PdfReaderComponent({
             <Document
               file={documentFile}
               options={documentOptions}
+              onItemClick={handlePdfItemClick}
               loading={<div className="pdf-status">Loading PDF...</div>}
               error={<div className="pdf-status">Failed to load PDF.{loadError ? <span>{loadError}</span> : null}</div>}
               onLoadSuccess={(document) => {
+                pdfDocumentRef.current = document;
                 setPdfDocument(document);
                 setNumPages(document.numPages);
               }}

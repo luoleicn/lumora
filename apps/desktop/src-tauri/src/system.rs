@@ -93,14 +93,11 @@ fn classify_linux_graphics_capability(
     "hardware"
 }
 
-const EXTERNAL_URL_HOSTS: [&str; 3] = ["dict.youdao.com", "dev.mendeley.com", "scholar.google.com"];
-
 #[tauri::command]
 pub(crate) fn open_external_url(url: String) -> Result<(), String> {
     let parsed = reqwest::Url::parse(&url).map_err(|error| format!("Invalid URL: {error}"))?;
-    let host_allowed = parsed.host_str().is_some_and(|host| EXTERNAL_URL_HOSTS.contains(&host));
-    if parsed.scheme() != "https" || !host_allowed {
-        return Err("URL host is not allowed.".to_string());
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("Only HTTP and HTTPS web URLs can be opened externally.".to_string());
     }
 
     open_url_with_system(&url)
