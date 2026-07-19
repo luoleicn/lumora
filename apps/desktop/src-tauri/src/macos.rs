@@ -38,6 +38,7 @@ pub(crate) fn install_key_shortcut_monitor(app_handle: AppHandle) {
     // full-width "；", which would break a string comparison against ";".
     const SEMICOLON_KEY_CODE: u16 = 41;
     const F_KEY_CODE: u16 = 3;
+    const O_KEY_CODE: u16 = 31;
 
     let handler: block2::RcBlock<dyn Fn(NonNull<NSEvent>) -> *mut NSEvent> =
         block2::RcBlock::new(move |event: NonNull<NSEvent>| {
@@ -78,6 +79,18 @@ pub(crate) fn install_key_shortcut_monitor(app_handle: AppHandle) {
                         let _ = window.eval(js);
                     }
                     let _ = app_handle.emit(crate::menu::WORKSPACE_EVENT, "focus-toolbar-search");
+                    return core::ptr::null_mut();
+                }
+
+                // Cmd+O → return to the position captured before the most
+                // recent PDF-internal link. The event is consumed here so the
+                // menu accelerator cannot dispatch the one-shot command twice.
+                let is_o_key = key_event.keyCode() == O_KEY_CODE
+                    || key_event
+                        .charactersIgnoringModifiers()
+                        .is_some_and(|c| matches!(c.to_string().to_lowercase().as_str(), "o"));
+                if is_o_key {
+                    let _ = app_handle.emit(crate::menu::PDF_VIEW_EVENT, "back-to-link-origin");
                     return core::ptr::null_mut();
                 }
             }

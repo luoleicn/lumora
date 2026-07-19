@@ -7,6 +7,7 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 pub(crate) const PDF_VIEW_EVENT: &str = "lumora-pdf-view-command";
 const PDF_VIEW_FIT_WIDTH: &str = "pdf-view-fit-width";
 const PDF_VIEW_GO_TO_PAGE: &str = "pdf-view-go-to-page";
+const PDF_VIEW_BACK_TO_LINK_ORIGIN: &str = "pdf-view-back-to-link-origin";
 const PDF_VIEW_ZOOM_PREFIX: &str = "pdf-view-zoom-";
 pub(crate) const WORKSPACE_EVENT: &str = "lumora-workspace-command";
 const WORKSPACE_CLOSE_ACTIVE_TAB: &str = "workspace-close-active-tab";
@@ -31,6 +32,8 @@ pub(crate) fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::me
         let _ = app.emit(PDF_VIEW_EVENT, "fit-width");
     } else if id == PDF_VIEW_GO_TO_PAGE {
         let _ = app.emit(PDF_VIEW_EVENT, "go-to-page");
+    } else if id == PDF_VIEW_BACK_TO_LINK_ORIGIN {
+        let _ = app.emit(PDF_VIEW_EVENT, "back-to-link-origin");
     } else if id == WORKSPACE_CLOSE_ACTIVE_TAB {
         let _ = app.emit(WORKSPACE_EVENT, "close-active-tab");
     } else if id == HELP_KEYBOARD_SHORTCUTS {
@@ -135,6 +138,8 @@ pub(crate) fn build_menu<R: Runtime>(app_handle: &AppHandle<R>) -> tauri::Result
         "View",
         true,
         &[
+            &MenuItem::with_id(app_handle, PDF_VIEW_BACK_TO_LINK_ORIGIN, "Back to Previous Location", true, Some("CmdOrCtrl+O"))?,
+            &PredefinedMenuItem::separator(app_handle)?,
             &MenuItem::with_id(app_handle, PDF_VIEW_FIT_WIDTH, "Fit Width", true, Some("CmdOrCtrl+;"))?,
             &zoom_menu(app_handle)?,
             &MenuItem::with_id(app_handle, PDF_VIEW_GO_TO_PAGE, "Go to Page...", true, Some("CmdOrCtrl+G"))?,

@@ -43,6 +43,7 @@ import { createLocalPdfRangeTransport, localPdfRangeChunkSize } from "../lib/pdf
 import { resolvePdfExitViewState, type PdfViewState } from "../lib/pdfViewState";
 import { externalWebUrlFromTarget } from "../lib/externalWebLinks";
 import { resolvePdfDestinationOffset } from "../lib/pdfDestination";
+import { PdfLinkReturnController } from "../lib/pdfLinkReturn";
 import { isLegacyWebKit } from "../lib/webkitPolyfills";
 import { browserPrepareAppExitEvent } from "../lib/appExit";
 import "react-pdf/dist/Page/AnnotationLayer.css";
@@ -253,6 +254,10 @@ function PdfReaderComponent({
   const renderedPageWidthRef = useRef(renderedPageWidth);
   const viewportHeightRef = useRef(viewportHeight);
   const pdfOverscanPagesRef = useRef(pdfRenderPolicy.overscanPages);
+  const linkReturnControllerRef = useRef<PdfLinkReturnController | undefined>(undefined);
+  if (!linkReturnControllerRef.current) {
+    linkReturnControllerRef.current = new PdfLinkReturnController();
+  }
   pageMetricsRef.current = pageMetrics;
   renderedPageWidthRef.current = renderedPageWidth;
   viewportHeightRef.current = viewportHeight;
@@ -391,6 +396,7 @@ function PdfReaderComponent({
   }, [active, contextMenu]);
 
   useEffect(() => {
+    linkReturnControllerRef.current!.reset();
     setContextMenu(undefined);
     setNumPages(0);
     pdfDocumentRef.current = undefined;
@@ -613,6 +619,11 @@ function PdfReaderComponent({
 
       if (command === "go-to-page") {
         handlePromptPageJump();
+        return;
+      }
+
+      if (command === "back-to-link-origin") {
+        handleBackToLinkOrigin();
         return;
       }
 
@@ -974,7 +985,39 @@ function PdfReaderComponent({
     updatePageRange(top);
   }
 
-  const handlePdfDestination = useCallback(async (pageIndex: number, destination?: unknown) => {
+  function scrollToPdfOffset(top: number, behavior: ScrollBehavior = "auto") {
+    const element = scrollRef.current;
+    if (!element) {
+      return;
+    }
+
+    const metrics = pageMetricsRef.current;
+    element.scrollTo({ top, behavior });
+    const nextRange = findPdfPageRange(
+      metrics,
+      top,
+      viewportHeightRef.current,
+      pdfOverscanPagesRef.current
+    );
+    setPageRange((current) => current.start === nextRange.start && current.end === nextRange.end
+      ? current
+      : nextRange
+    );
+  }
+
+  function handleBackToLinkOrigin() {
+    const top = linkReturnControllerRef.current!.consumeReturn();
+    if (top === undefined) {
+      return;
+    }
+    scrollToPdfOffset(top, "smooth");
+  }
+
+  const handlePdfDestination = useCallback(async (
+    pageIndex: number,
+    destination: unknown,
+    navigationRevision: number
+  ) => {
     const document = pdfDocumentRef.current;
     const element = scrollRef.current;
     if (!document || !element) {
@@ -996,22 +1039,14 @@ function PdfReaderComponent({
       console.error("Failed to resolve PDF destination coordinates.", error);
       top = pageOffset(metrics, pageIndex);
     }
-    // Ignore a destination that finished resolving after another PDF replaced
-    // this reader's document.
-    if (pdfDocumentRef.current !== document || scrollRef.current !== element) {
+    // Ignore a destination that finished resolving after the document changed,
+    // a newer internal link was clicked, or the user already returned.
+    if (pdfDocumentRef.current !== document
+      || scrollRef.current !== element
+      || !linkReturnControllerRef.current!.isCurrent(navigationRevision)) {
       return;
     }
-    element.scrollTo({ top, behavior: "smooth" });
-    const nextRange = findPdfPageRange(
-      metrics,
-      top,
-      viewportHeightRef.current,
-      pdfOverscanPagesRef.current
-    );
-    setPageRange((current) => current.start === nextRange.start && current.end === nextRange.end
-      ? current
-      : nextRange
-    );
+    scrollToPdfOffset(top, "smooth");
   }, []);
 
   const handlePdfItemClick = useCallback(({
@@ -1021,7 +1056,12 @@ function PdfReaderComponent({
     dest?: unknown;
     pageIndex: number;
   }) => {
-    void handlePdfDestination(pageIndex, dest);
+    const element = scrollRef.current;
+    if (!element) {
+      return;
+    }
+    const navigationRevision = linkReturnControllerRef.current!.beginLink(element.scrollTop);
+    void handlePdfDestination(pageIndex, dest, navigationRevision);
   }, [handlePdfDestination]);
 
   function scheduleZoom(nextZoom: number) {
