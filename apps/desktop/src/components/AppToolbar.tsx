@@ -1,4 +1,5 @@
 import { HelpCircle, Search } from "lucide-react";
+import { handleSearchEscape } from "../lib/searchKeyboard";
 import { PdfFindBar } from "./PdfFindBar";
 
 type AppToolbarProps = {
@@ -34,6 +35,7 @@ export function AppToolbar({
             data-search-input=""
             value={search}
             onChange={(event) => onSearchChange(event.target.value)}
+            onKeyDown={(event) => handleSearchEscape(event, () => onSearchChange(""))}
             placeholder="Search library"
           />
         </label>

@@ -1,5 +1,6 @@
 import { ChevronDown, ChevronUp, Search, X } from "lucide-react";
 import { useEffect, useRef } from "react";
+import { handleSearchEscape } from "../lib/searchKeyboard";
 
 type PdfFindBarProps = {
   query: string;
@@ -32,6 +33,10 @@ export function PdfFindBar({
 
   // Keyboard shortcuts within the find bar.
   function handleKeyDown(event: React.KeyboardEvent) {
+    if (handleSearchEscape(event, onClose)) {
+      return;
+    }
+
     if (event.key === "Enter") {
       event.preventDefault();
       if (event.shiftKey) {
@@ -39,9 +44,6 @@ export function PdfFindBar({
       } else {
         onNextMatch();
       }
-    } else if (event.key === "Escape") {
-      event.preventDefault();
-      onClose();
     }
   }
 
