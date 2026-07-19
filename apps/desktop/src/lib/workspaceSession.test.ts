@@ -5,6 +5,7 @@ import {
   loadWorkspaceSession,
   parseWorkspaceSession,
   reconcileWorkspaceSession,
+  reorderWorkspaceTabs,
   saveWorkspaceSession,
   workspaceSessionKey,
   type WorkspaceSessionV1
@@ -105,5 +106,27 @@ describe("workspace session", () => {
     expect(reconciled.activeTabId).toBe("documents");
     expect(reconciled.selectedCollectionId).toBe("all");
     expect(reconciled.selectedPaperId).toBeUndefined();
+  });
+
+  it("reorders tabs on either side of a drop target", () => {
+    const tabs = [
+      session.tabs[0],
+      session.tabs[1],
+      { id: "paper:paper-b", kind: "paper" as const, paperId: "paper-b", title: "B" },
+      session.tabs[2]
+    ];
+
+    expect(reorderWorkspaceTabs(tabs, "paper:paper-b", "paper:paper-a", "before").map((tab) => tab.id))
+      .toEqual(["documents", "paper:paper-b", "paper:paper-a", "notebook"]);
+    expect(reorderWorkspaceTabs(tabs, "paper:paper-a", "notebook", "after").map((tab) => tab.id))
+      .toEqual(["documents", "paper:paper-b", "notebook", "paper:paper-a"]);
+  });
+
+  it("keeps Documents pinned first and ignores attempts to drag it", () => {
+    const tabs = session.tabs;
+
+    expect(reorderWorkspaceTabs(tabs, "notebook", "documents", "before").map((tab) => tab.id))
+      .toEqual(["documents", "notebook", "paper:paper-a"]);
+    expect(reorderWorkspaceTabs(tabs, "documents", "notebook", "after")).toBe(tabs);
   });
 });

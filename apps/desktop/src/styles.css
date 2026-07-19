@@ -747,6 +747,7 @@ button {
 }
 
 .workspace-tab {
+  position: relative;
   display: inline-flex;
   align-items: center;
   min-width: 112px;
@@ -756,6 +757,38 @@ button {
   border-bottom: 0;
   border-radius: 7px 7px 0 0;
   color: #59636f;
+}
+
+.workspace-tab[data-workspace-tab-movable] .workspace-tab-select {
+  cursor: grab;
+}
+
+body.workspace-tab-pointer-dragging,
+body.workspace-tab-pointer-dragging * {
+  cursor: grabbing !important;
+}
+
+.workspace-tab.dragging {
+  opacity: 0.45;
+}
+
+.workspace-tab.drop-before::before,
+.workspace-tab.drop-after::after {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  border-radius: 2px;
+  background: #3b82f6;
+  content: "";
+}
+
+.workspace-tab.drop-before::before {
+  left: -1px;
+}
+
+.workspace-tab.drop-after::after {
+  right: -1px;
 }
 
 .workspace-tab.active {

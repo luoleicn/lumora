@@ -21,6 +21,8 @@ export type WorkspaceSessionV1 = {
 
 export const documentsTab: WorkspaceTab = { id: "documents", kind: "documents", title: "Documents" };
 
+export type WorkspaceTabDropEdge = "before" | "after";
+
 const virtualCollectionIds = new Set([
   "all",
   "recently_added",
@@ -134,6 +136,34 @@ export function reconcileWorkspaceSession(
       Object.entries(session.pdfViewStates).filter(([paperId]) => papersById.has(paperId))
     )
   };
+}
+
+/** Reorders a movable tab while preserving Documents as the pinned first tab. */
+export function reorderWorkspaceTabs(
+  tabs: WorkspaceTab[],
+  draggedTabId: string,
+  targetTabId: string,
+  edge: WorkspaceTabDropEdge
+): WorkspaceTab[] {
+  if (draggedTabId === documentsTab.id || draggedTabId === targetTabId) {
+    return tabs;
+  }
+
+  const draggedTab = tabs.find((tab) => tab.id === draggedTabId);
+  const targetTab = tabs.find((tab) => tab.id === targetTabId);
+  if (!draggedTab || !targetTab) {
+    return tabs;
+  }
+
+  const next = tabs.filter((tab) => tab.id !== draggedTabId);
+  const targetIndex = next.findIndex((tab) => tab.id === targetTabId);
+  const requestedIndex = targetTabId === documentsTab.id
+    ? 1
+    : targetIndex + (edge === "after" ? 1 : 0);
+  const insertIndex = Math.min(Math.max(requestedIndex, 1), next.length);
+  next.splice(insertIndex, 0, draggedTab);
+
+  return next.every((tab, index) => tab === tabs[index]) ? tabs : next;
 }
 
 function normalizeTabs(value: unknown): WorkspaceTab[] {

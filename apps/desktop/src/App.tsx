@@ -77,7 +77,9 @@ import {
   documentsTab,
   loadWorkspaceSession,
   reconcileWorkspaceSession,
+  reorderWorkspaceTabs,
   saveWorkspaceSession,
+  type WorkspaceTabDropEdge,
   type WorkspaceSessionV1,
   type WorkspaceTab
 } from "./lib/workspaceSession";
@@ -1636,6 +1638,9 @@ export default function App() {
               activeTabId={activeWorkspaceTabId}
               onSelectTab={handleActivateWorkspaceTab}
               onCloseTab={handleCloseWorkspaceTab}
+              onReorderTab={(draggedTabId, targetTabId, edge) => {
+                setWorkspaceTabs((current) => reorderWorkspaceTabs(current, draggedTabId, targetTabId, edge));
+              }}
             >
               {workspaceTabs
                 // Restored background readers mount lazily on first activation,
@@ -1890,49 +1895,180 @@ function WorkspaceTabs({
   activeTabId,
   onSelectTab,
   onCloseTab,
+  onReorderTab,
   children
 }: {
   tabs: WorkspaceTab[];
   activeTabId: string;
   onSelectTab: (tab: WorkspaceTab) => void;
   onCloseTab: (tabId: string) => void;
+  onReorderTab: (draggedTabId: string, targetTabId: string, edge: WorkspaceTabDropEdge) => void;
   children: React.ReactNode;
 }) {
+  const tabBarRef = useRef<HTMLDivElement>(null);
+  const pointerDragRef = useRef<WorkspaceTabPointerDrag | undefined>(undefined);
+  const suppressClickTabIdRef = useRef<string | undefined>(undefined);
+  const [draggedTabId, setDraggedTabId] = useState<string>();
+  const [dropTarget, setDropTarget] = useState<{ tabId: string; edge: WorkspaceTabDropEdge }>();
+
+  useEffect(() => () => pointerDragRef.current?.cleanup(), []);
+
+  function resolveDropTarget(clientX: number, clientY: number, sourceTabId: string) {
+    const element = document.elementFromPoint(clientX, clientY);
+    const target = element?.closest<HTMLElement>("[data-workspace-tab-id]");
+    const tabId = target?.dataset.workspaceTabId;
+    if (!target || !tabId || tabId === sourceTabId || !tabBarRef.current?.contains(target)) {
+      return undefined;
+    }
+
+    const rect = target.getBoundingClientRect();
+    const edge: WorkspaceTabDropEdge = tabId === documentsTab.id || clientX >= rect.left + rect.width / 2
+      ? "after"
+      : "before";
+    return { tabId, edge };
+  }
+
+  function handleTabPointerDown(event: React.PointerEvent<HTMLDivElement>, tab: WorkspaceTab) {
+    if (tab.id === documentsTab.id || event.button !== 0 || (event.target as HTMLElement).closest(".workspace-tab-close")) {
+      return;
+    }
+
+    pointerDragRef.current?.cleanup();
+    const previousUserSelect = document.body.style.userSelect;
+    const drag: WorkspaceTabPointerDrag = {
+      tabId: tab.id,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      dragging: false,
+      cleanup: () => {
+        window.removeEventListener("pointermove", handlePointerMove);
+        window.removeEventListener("pointerup", handlePointerEnd);
+        window.removeEventListener("pointercancel", handlePointerEnd);
+        document.body.classList.remove("workspace-tab-pointer-dragging");
+        document.body.style.userSelect = previousUserSelect;
+        if (pointerDragRef.current === drag) {
+          pointerDragRef.current = undefined;
+        }
+      }
+    };
+
+    function handlePointerMove(pointerEvent: PointerEvent) {
+      if (pointerEvent.pointerId !== drag.pointerId) {
+        return;
+      }
+
+      const distance = Math.hypot(pointerEvent.clientX - drag.startX, pointerEvent.clientY - drag.startY);
+      if (!drag.dragging && distance > 6) {
+        drag.dragging = true;
+        document.body.classList.add("workspace-tab-pointer-dragging");
+        document.body.style.userSelect = "none";
+        setDraggedTabId(drag.tabId);
+      }
+
+      if (!drag.dragging) {
+        return;
+      }
+
+      pointerEvent.preventDefault();
+      const tabBar = tabBarRef.current;
+      if (tabBar) {
+        const rect = tabBar.getBoundingClientRect();
+        const edgeScrollZone = 32;
+        if (pointerEvent.clientX < rect.left + edgeScrollZone) {
+          tabBar.scrollLeft -= 12;
+        } else if (pointerEvent.clientX > rect.right - edgeScrollZone) {
+          tabBar.scrollLeft += 12;
+        }
+      }
+      setDropTarget(resolveDropTarget(pointerEvent.clientX, pointerEvent.clientY, drag.tabId));
+    }
+
+    function handlePointerEnd(pointerEvent: PointerEvent) {
+      if (pointerEvent.pointerId !== drag.pointerId) {
+        return;
+      }
+
+      const target = drag.dragging && pointerEvent.type === "pointerup"
+        ? resolveDropTarget(pointerEvent.clientX, pointerEvent.clientY, drag.tabId)
+        : undefined;
+      drag.cleanup();
+      setDraggedTabId(undefined);
+      setDropTarget(undefined);
+
+      if (drag.dragging) {
+        pointerEvent.preventDefault();
+        suppressClickTabIdRef.current = drag.tabId;
+        window.setTimeout(() => {
+          if (suppressClickTabIdRef.current === drag.tabId) {
+            suppressClickTabIdRef.current = undefined;
+          }
+        }, 0);
+        if (target) {
+          onReorderTab(drag.tabId, target.tabId, target.edge);
+        }
+      }
+    }
+
+    pointerDragRef.current = drag;
+    window.addEventListener("pointermove", handlePointerMove, { passive: false });
+    window.addEventListener("pointerup", handlePointerEnd);
+    window.addEventListener("pointercancel", handlePointerEnd);
+  }
+
   return (
     <section className="workspace-tabs">
-      <div className="workspace-tab-bar" role="tablist" aria-label="Open documents">
-        {tabs.map((tab) => (
-          <div
-            key={tab.id}
-            className={tab.id === activeTabId ? "workspace-tab active" : "workspace-tab"}
-            title={tab.title}
-          >
-            <button
-              type="button"
-              className="workspace-tab-select"
-              onClick={() => onSelectTab(tab)}
-              role="tab"
-              aria-selected={tab.id === activeTabId}
+      <div ref={tabBarRef} className="workspace-tab-bar" role="tablist" aria-label="Open documents">
+        {tabs.map((tab) => {
+          const tabClasses = [
+            "workspace-tab",
+            tab.id === activeTabId ? "active" : "",
+            tab.id === draggedTabId ? "dragging" : "",
+            dropTarget?.tabId === tab.id ? `drop-${dropTarget.edge}` : ""
+          ].filter(Boolean).join(" ");
+          return (
+            <div
+              key={tab.id}
+              className={tabClasses}
+              title={tab.title}
+              data-workspace-tab-id={tab.id}
+              data-workspace-tab-movable={tab.id === documentsTab.id ? undefined : ""}
+              onPointerDown={(event) => handleTabPointerDown(event, tab)}
             >
-              {tab.kind === "paper" && <FileText size={14} />}
-              <span>{tab.title}</span>
-            </button>
-            {tab.id !== documentsTab.id && (
               <button
                 type="button"
-                className="workspace-tab-close"
+                className="workspace-tab-select"
                 onClick={(event) => {
-                  event.stopPropagation();
-                  onCloseTab(tab.id);
+                  if (suppressClickTabIdRef.current === tab.id) {
+                    event.preventDefault();
+                    suppressClickTabIdRef.current = undefined;
+                    return;
+                  }
+                  onSelectTab(tab);
                 }}
-                aria-label={`Close ${tab.title}`}
-                title={`Close ${tab.title}`}
+                role="tab"
+                aria-selected={tab.id === activeTabId}
               >
-                <X size={13} />
+                {tab.kind === "paper" && <FileText size={14} />}
+                <span>{tab.title}</span>
               </button>
-            )}
-          </div>
-        ))}
+              {tab.id !== documentsTab.id && (
+                <button
+                  type="button"
+                  className="workspace-tab-close"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onCloseTab(tab.id);
+                  }}
+                  aria-label={`Close ${tab.title}`}
+                  title={`Close ${tab.title}`}
+                >
+                  <X size={13} />
+                </button>
+              )}
+            </div>
+          );
+        })}
       </div>
       <div className="workspace-tab-content">
         {children}
@@ -1940,6 +2076,15 @@ function WorkspaceTabs({
     </section>
   );
 }
+
+type WorkspaceTabPointerDrag = {
+  tabId: string;
+  pointerId: number;
+  startX: number;
+  startY: number;
+  dragging: boolean;
+  cleanup: () => void;
+};
 
 function WorkspaceTabContent({
   active,
