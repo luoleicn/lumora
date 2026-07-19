@@ -1,6 +1,9 @@
 // Composition root: module declarations, the liveness probe, and the Tauri
 // builder wiring. All domain logic lives in the sibling modules.
 
+use std::time::Duration;
+use tauri::Emitter;
+
 mod arxiv;
 mod cloud_sync;
 mod db;
@@ -20,10 +23,27 @@ fn ping() -> &'static str {
     "lumora-ready"
 }
 
+const PREPARE_APP_EXIT_EVENT: &str = "lumora-prepare-app-exit";
+
+#[tauri::command]
+fn complete_app_exit(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .setup(|app| {
+            #[cfg(desktop)]
+            app.handle().plugin(
+                tauri_plugin_window_state::Builder::default()
+                    .with_state_flags(
+                        tauri_plugin_window_state::StateFlags::SIZE
+                            | tauri_plugin_window_state::StateFlags::POSITION
+                            | tauri_plugin_window_state::StateFlags::MAXIMIZED,
+                    )
+                    .build(),
+            )?;
             #[cfg(target_os = "macos")]
             {
                 macos::enable_trackpad_pinch_zoom(app);
@@ -41,6 +61,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             ping,
+            complete_app_exit,
             system::linux_graphics_capability,
             native_pdf::native_pdf_open_path,
             native_pdf::native_pdf_stage_chunk,
@@ -92,6 +113,21 @@ pub fn run() {
             cloud_sync::qiniu_sync_library,
             duplicates::cleanup_duplicate_downloads
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running lumora");
+        .build(tauri::generate_context!())
+        .expect("error while building lumora");
+
+    app.run(|app, event| {
+        if let tauri::RunEvent::ExitRequested { code: None, api, .. } = event {
+            api.prevent_exit();
+            let _ = app.emit(PREPARE_APP_EXIT_EVENT, ());
+
+            // If the WebView is already unavailable, do not leave a user who
+            // pressed Cmd+Q with an application that can no longer exit.
+            let fallback_handle = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(1));
+                fallback_handle.exit(0);
+            });
+        }
+    });
 }

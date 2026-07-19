@@ -40,9 +40,11 @@ import {
 } from "../lib/pdfRenderPolicy";
 import { getStoredPdfMetadata, readPdfFromDisk } from "../lib/fileStorage";
 import { createLocalPdfRangeTransport, localPdfRangeChunkSize } from "../lib/pdfRangeTransport";
+import { resolvePdfExitViewState, type PdfViewState } from "../lib/pdfViewState";
 import { externalWebUrlFromTarget } from "../lib/externalWebLinks";
 import { resolvePdfDestinationOffset } from "../lib/pdfDestination";
 import { isLegacyWebKit } from "../lib/webkitPolyfills";
+import { browserPrepareAppExitEvent } from "../lib/appExit";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
 
@@ -127,10 +129,7 @@ type NativePdfRendererState =
   | { status: "unavailable"; error: string }
   | { status: "ready"; document: NativePdfDocumentInfo };
 
-export type PdfReaderViewState = {
-  scrollTop: number;
-  zoom?: number;
-};
+export type PdfReaderViewState = PdfViewState;
 
 const colors = ["#ffe45c", "#8ee6a8", "#82cfff", "#ffadad"];
 const pdfViewEvent = "lumora-pdf-view-command";
@@ -192,6 +191,7 @@ function PdfReaderComponent({
   const [zoom, setZoom] = useState(viewState?.zoom ?? 1);
   const zoomRef = useRef(zoom);
   const [hasExplicitZoom, setHasExplicitZoom] = useState(viewState?.zoom !== undefined);
+  const hasExplicitZoomRef = useRef(viewState?.zoom !== undefined);
   const [color, setColor] = useState(colors[0]);
   const [contextMenu, setContextMenu] = useState<AnnotationContextMenu>();
   const [pageJumpOpen, setPageJumpOpen] = useState(false);
@@ -403,6 +403,7 @@ function PdfReaderComponent({
     pendingScrollRestoreRef.current = viewState?.scrollTop ?? 0;
     restoringScrollRef.current = true;
     setHasExplicitZoom(viewState?.zoom !== undefined);
+    hasExplicitZoomRef.current = viewState?.zoom !== undefined;
     setZoom(viewState?.zoom ?? 1);
     setFindMatches([]);
     setSearchTargets([]);
@@ -455,12 +456,21 @@ function PdfReaderComponent({
   }, [pageMetrics, pdfRenderPolicy.overscanPages, viewportHeight]);
 
   useEffect(() => () => {
-    if (zoomCommitTimerRef.current !== undefined) {
-      window.clearTimeout(zoomCommitTimerRef.current);
-    }
-    // A closed tab can unmount during the debounce window; persist its last
-    // scroll position before releasing the warm PDF reader.
-    flushPendingViewState();
+    // A closed tab can unmount during either debounce window; persist its last
+    // scroll position and zoom before releasing the warm PDF reader.
+    flushViewStateForExit();
+  }, []);
+
+  useEffect(() => {
+    const flushForPageExit = () => flushViewStateForExit();
+    window.addEventListener("beforeunload", flushForPageExit);
+    window.addEventListener("pagehide", flushForPageExit);
+    window.addEventListener(browserPrepareAppExitEvent, flushForPageExit);
+    return () => {
+      window.removeEventListener("beforeunload", flushForPageExit);
+      window.removeEventListener("pagehide", flushForPageExit);
+      window.removeEventListener(browserPrepareAppExitEvent, flushForPageExit);
+    };
   }, []);
 
   useEffect(() => {
@@ -925,6 +935,30 @@ function PdfReaderComponent({
     }
   }
 
+  function flushViewStateForExit() {
+    if (viewStateCommitTimerRef.current !== undefined) {
+      window.clearTimeout(viewStateCommitTimerRef.current);
+      viewStateCommitTimerRef.current = undefined;
+    }
+    if (zoomCommitTimerRef.current !== undefined) {
+      window.clearTimeout(zoomCommitTimerRef.current);
+      zoomCommitTimerRef.current = undefined;
+    }
+
+    const pending = pendingViewStateRef.current;
+    pendingViewStateRef.current = undefined;
+    const pendingZoom = pendingZoomRef.current;
+    pendingZoomRef.current = undefined;
+    onViewStateChangeRef.current?.(resolvePdfExitViewState({
+      pendingViewState: pending,
+      currentScrollTop: scrollRef.current?.scrollTop,
+      restoredScrollTop: viewState?.scrollTop,
+      pendingZoom,
+      currentZoom: zoomRef.current,
+      hasExplicitZoom: hasExplicitZoomRef.current
+    }));
+  }
+
   function updatePageRange(scrollTop: number) {
     const nextRange = findPdfPageRange(pageMetrics, scrollTop, viewportHeight, pdfRenderPolicy.overscanPages);
     setPageRange((current) => current.start === nextRange.start && current.end === nextRange.end ? current : nextRange);
@@ -1000,6 +1034,7 @@ function PdfReaderComponent({
     }
 
     pendingZoomRef.current = clamp(nextZoom, minZoom, maxZoom);
+    hasExplicitZoomRef.current = true;
     setHasExplicitZoom(true);
     if (zoomCommitTimerRef.current !== undefined) {
       window.clearTimeout(zoomCommitTimerRef.current);
@@ -1020,6 +1055,7 @@ function PdfReaderComponent({
       zoomCommitTimerRef.current = undefined;
     }
     pendingZoomRef.current = undefined;
+    hasExplicitZoomRef.current = explicit;
     setHasExplicitZoom(explicit);
     setZoom(clamp(nextZoom, minZoom, maxZoom));
   }

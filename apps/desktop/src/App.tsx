@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import type { Annotation, Collection, FileAsset, LibraryState, Paper } from "@lumora/shared";
 import { FileText, X } from "lucide-react";
 import { AppToolbar } from "./components/AppToolbar";
@@ -71,6 +72,15 @@ import { useLibraryStore } from "./hooks/useLibraryStore";
 import { useCloudSync } from "./hooks/useCloudSync";
 import { useMendeleySync } from "./hooks/useMendeleySync";
 import { useArxivDownloads } from "./hooks/useArxivDownloads";
+import { browserPrepareAppExitEvent, nativePrepareAppExitEvent } from "./lib/appExit";
+import {
+  documentsTab,
+  loadWorkspaceSession,
+  reconcileWorkspaceSession,
+  saveWorkspaceSession,
+  type WorkspaceSessionV1,
+  type WorkspaceTab
+} from "./lib/workspaceSession";
 
 const workspaceLayoutKey = "lumora:workspace-layout";
 const collapseThreshold = 82;
@@ -111,13 +121,6 @@ const defaultWorkspaceLayout: WorkspaceLayout = {
 };
 
 const panelOrder: MainPanelKey[] = ["library", "workspace", "sync"];
-
-type WorkspaceTab =
-  | { id: "documents"; kind: "documents"; title: "Documents" }
-  | { id: "notebook"; kind: "notebook"; title: "Notebook" }
-  | { id: string; kind: "paper"; paperId: string; title: string };
-
-const documentsTab: WorkspaceTab = { id: "documents", kind: "documents", title: "Documents" };
 
 function isPdfFile(fileAsset: FileAsset) {
   return fileAsset.mime === "application/pdf" || /\.pdf$/i.test(fileAsset.fileName);
@@ -163,6 +166,9 @@ export default function App() {
   // Filled by whichever PdfReader is active; the toolbar drives find next/prev
   // through it without re-rendering the memoized readers.
   const pdfSearchNavRef = useRef<PdfSearchNavHandle | null>(null);
+  const [initialWorkspaceSession] = useState(() => loadWorkspaceSession());
+  const workspaceSessionRef = useRef<WorkspaceSessionV1>(initialWorkspaceSession);
+  const workspaceSessionReconciledRef = useRef(false);
   const [status, setStatus] = useState<string>();
   const [fileStorageSettings, setFileStorageSettings] = useState<FileStorageSettings>(() => loadFileStorageSettings());
   const [syncSettingsOpen, setSyncSettingsOpen] = useState(false);
@@ -170,7 +176,7 @@ export default function App() {
     onError: setStatus,
     reconcile: (state) => reconcileFileStorage(state, fileStorageSettings)
   });
-  const { library, setLibrary, libraryRef, loadedRef: libraryLoadedRef, adoptFromDb } = libraryStore;
+  const { library, setLibrary, libraryRef, loadedRef: libraryLoadedRef, loaded: libraryLoaded, adoptFromDb } = libraryStore;
   const cloudSync = useCloudSync({
     store: libraryStore,
     onStatus: setStatus,
@@ -178,13 +184,18 @@ export default function App() {
   });
   const mendeleySync = useMendeleySync({ store: libraryStore, fileStorageSettings, onStatus: setStatus });
   const arxivDownloads = useArxivDownloads({ store: libraryStore, fileStorageSettings, onStatus: setStatus });
-  const [selectedCollectionId, setSelectedCollectionId] = useState("all");
+  const [selectedCollectionId, setSelectedCollectionId] = useState(initialWorkspaceSession.selectedCollectionId);
   const [selectedAuthor, setSelectedAuthor] = useState<string>();
   const [selectedTag, setSelectedTag] = useState<string>();
-  const [selectedPaperId, setSelectedPaperId] = useState<string>();
-  const [workspaceTabs, setWorkspaceTabs] = useState<WorkspaceTab[]>([documentsTab]);
-  const [activeWorkspaceTabId, setActiveWorkspaceTabId] = useState(documentsTab.id);
-  const [pdfViewStates, setPdfViewStates] = useState<Record<string, PdfReaderViewState>>({});
+  const [selectedPaperId, setSelectedPaperId] = useState<string | undefined>(initialWorkspaceSession.selectedPaperId);
+  const [workspaceTabs, setWorkspaceTabs] = useState<WorkspaceTab[]>(initialWorkspaceSession.tabs);
+  const [activeWorkspaceTabId, setActiveWorkspaceTabId] = useState(initialWorkspaceSession.activeTabId);
+  const [pdfViewStates, setPdfViewStates] = useState<Record<string, PdfReaderViewState>>(initialWorkspaceSession.pdfViewStates);
+  const pdfViewStatesRef = useRef<Record<string, PdfReaderViewState>>(initialWorkspaceSession.pdfViewStates);
+  const [hydratedPaperTabIds, setHydratedPaperTabIds] = useState<Set<string>>(() => {
+    const activeTab = initialWorkspaceSession.tabs.find((tab) => tab.id === initialWorkspaceSession.activeTabId);
+    return new Set(activeTab?.kind === "paper" ? [activeTab.id] : []);
+  });
   const [search, setSearch] = useState("");
   const [searchHits, setSearchHits] = useState<SearchHit[]>();
   const [pdfSearchQuery, setPdfSearchQuery] = useState("");
@@ -232,6 +243,42 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(workspaceLayoutKey, JSON.stringify(workspaceLayout));
   }, [workspaceLayout]);
+
+  useEffect(() => {
+    const session: WorkspaceSessionV1 = {
+      version: 1,
+      tabs: workspaceTabs,
+      activeTabId: activeWorkspaceTabId,
+      selectedCollectionId,
+      selectedPaperId,
+      pdfViewStates
+    };
+    workspaceSessionRef.current = session;
+    pdfViewStatesRef.current = pdfViewStates;
+    saveWorkspaceSession(session);
+  }, [activeWorkspaceTabId, pdfViewStates, selectedCollectionId, selectedPaperId, workspaceTabs]);
+
+  useEffect(() => {
+    if (!libraryLoaded || workspaceSessionReconciledRef.current) {
+      return;
+    }
+    workspaceSessionReconciledRef.current = true;
+
+    const session = reconcileWorkspaceSession(workspaceSessionRef.current, library);
+    workspaceSessionRef.current = session;
+    saveWorkspaceSession(session);
+    setWorkspaceTabs(session.tabs);
+    setActiveWorkspaceTabId(session.activeTabId);
+    setSelectedCollectionId(session.selectedCollectionId);
+    setSelectedPaperId(session.selectedPaperId);
+    pdfViewStatesRef.current = session.pdfViewStates;
+    setPdfViewStates(session.pdfViewStates);
+
+    const activeTab = session.tabs.find((tab) => tab.id === session.activeTabId);
+    if (activeTab?.kind === "paper") {
+      setHydratedPaperTabIds(new Set([activeTab.id]));
+    }
+  }, [library, libraryLoaded]);
 
   useEffect(() => {
     saveFileStorageSettings(fileStorageSettings);
@@ -361,6 +408,30 @@ export default function App() {
 
     void listen<string>(workspaceCommandEvent, (event) => {
       workspaceCommandRef.current(event.payload);
+    }).then((nextUnlisten) => {
+      if (disposed) {
+        nextUnlisten();
+        return;
+      }
+      unlisten = nextUnlisten;
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+
+    void listen(nativePrepareAppExitEvent, () => {
+      // Native Cmd+Q does not reliably fire WebView lifecycle events on macOS.
+      // Give every mounted reader one synchronous chance to commit its latest
+      // debounced position before acknowledging the intercepted quit request.
+      window.dispatchEvent(new Event(browserPrepareAppExitEvent));
+      void invoke("complete_app_exit");
     }).then((nextUnlisten) => {
       if (disposed) {
         nextUnlisten();
@@ -1256,6 +1327,7 @@ export default function App() {
 
     handleSelectPaper(paperId);
     const tabId = `paper:${paperId}`;
+    setHydratedPaperTabIds((current) => current.has(tabId) ? current : new Set(current).add(tabId));
     setWorkspaceTabs((current) => {
       if (current.some((tab) => tab.id === tabId)) {
         return current;
@@ -1306,22 +1378,26 @@ export default function App() {
   function handleActivateWorkspaceTab(tab: WorkspaceTab) {
     setActiveWorkspaceTabId(tab.id);
     if (tab.kind === "paper") {
+      setHydratedPaperTabIds((current) => current.has(tab.id) ? current : new Set(current).add(tab.id));
       handleSelectPaper(tab.paperId);
     }
   }
 
   function handleUpdatePdfViewState(paperId: string, viewState: PdfReaderViewState) {
-    setPdfViewStates((current) => {
-      const previous = current[paperId];
-      if (previous?.scrollTop === viewState.scrollTop && previous.zoom === viewState.zoom) {
-        return current;
-      }
+    const previous = pdfViewStatesRef.current[paperId];
+    if (previous?.scrollTop === viewState.scrollTop && previous.zoom === viewState.zoom) {
+      return;
+    }
 
-      return {
-        ...current,
-        [paperId]: viewState
-      };
-    });
+    const next = { ...pdfViewStatesRef.current, [paperId]: viewState };
+    pdfViewStatesRef.current = next;
+    // This direct, synchronous snapshot write is also used by PdfReader's
+    // page-exit flush. React effects are not guaranteed to run after Cmd+Q,
+    // while localStorage completes before the WebView is torn down.
+    const session = { ...workspaceSessionRef.current, pdfViewStates: next };
+    workspaceSessionRef.current = session;
+    saveWorkspaceSession(session);
+    setPdfViewStates(next);
   }
 
   function handleUpdatePaper(paper: Paper) {
@@ -1562,10 +1638,13 @@ export default function App() {
               onCloseTab={handleCloseWorkspaceTab}
             >
               {workspaceTabs
-                // Paper tabs stay warm to preserve their renderer session and
-                // visible page cache. Non-paper views are cheap to recreate and
-                // would otherwise keep a large hidden document list rendering.
-                .filter((tab) => tab.kind === "paper" || tab.id === activeWorkspaceTabId)
+                // Restored background readers mount lazily on first activation,
+                // avoiding a startup burst when the previous session had many
+                // PDFs open. Once hydrated, paper tabs stay warm to preserve
+                // their renderer session and visible page cache.
+                .filter((tab) => tab.kind === "paper"
+                  ? hydratedPaperTabIds.has(tab.id)
+                  : tab.id === activeWorkspaceTabId)
                 .map((tab) => {
                   const tabActive = tab.id === activeWorkspaceTabId;
                   return (

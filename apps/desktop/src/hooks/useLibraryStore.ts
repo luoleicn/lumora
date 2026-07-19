@@ -24,6 +24,7 @@ export type UseLibraryStoreOptions = {
  */
 export function useLibraryStore({ onError, reconcile }: UseLibraryStoreOptions) {
   const [library, setLibrary] = useState<LibraryState>(() => loadLibraryState());
+  const [loaded, setLoaded] = useState(false);
   const libraryRef = useRef<LibraryState | undefined>(undefined);
   const lastPersistedLibraryRef = useRef<LibraryState | undefined>(undefined);
   const loadedRef = useRef(false);
@@ -79,6 +80,7 @@ export function useLibraryStore({ onError, reconcile }: UseLibraryStoreOptions) 
         if (!empty) {
           lastPersistedLibraryRef.current = dbState;
           loadedRef.current = true;
+          setLoaded(true);
           setLibrary(dbState);
           // Reconcile records against the storage folder: drain any leftover
           // IndexedDB blobs to disk, re-link PDFs that lost their localPath, and
@@ -100,10 +102,12 @@ export function useLibraryStore({ onError, reconcile }: UseLibraryStoreOptions) 
         }
         lastPersistedLibraryRef.current = legacyState;
         loadedRef.current = true;
+        setLoaded(true);
       } catch (error) {
         // Without a working database, fall back to the legacy localStorage
         // persistence for this session rather than silently losing edits.
         localStorageFallbackRef.current = true;
+        setLoaded(true);
         onErrorRef.current(`Library database unavailable, falling back to browser storage: ${error}`);
       }
     })();
@@ -140,6 +144,8 @@ export function useLibraryStore({ onError, reconcile }: UseLibraryStoreOptions) 
     libraryRef,
     /** True once SQLite finished loading; persistence is inert before that. */
     loadedRef,
+    /** True once startup selected SQLite or the browser-storage fallback. */
+    loaded,
     markPersisted,
     adoptFromDb
   };
