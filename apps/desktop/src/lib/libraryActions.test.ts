@@ -5,8 +5,10 @@ import {
   deleteCollectionAndReassignPapers,
   deletePaperFromLibrary,
   getActivePaperCollectionIds,
+  getCollectionOptions,
   getCollectionAndDescendantIds,
   getCollectionPaperCount,
+  movePaperToCollection,
   removePaperFromCollectionTree,
   permanentlyDeletePaperFromTrash,
   renameCollection,
@@ -83,6 +85,16 @@ describe("library actions", () => {
     ]);
   });
 
+  it("builds alphabetized collection options with complete nested paths", () => {
+    expect(getCollectionOptions(state().collections).map((item) => item.path)).toEqual([
+      "collection_inbox",
+      "folder-parent",
+      "folder-parent / folder-child",
+      "folder-parent / folder-child / folder-grandchild",
+      "folder-target"
+    ]);
+  });
+
   it("permanently removes only a paper that is already in trash and its dependents", () => {
     const trashed = deletePaperFromLibrary(state(), "paper-a", now);
     const next = permanentlyDeletePaperFromTrash(trashed, "paper-a");
@@ -136,6 +148,49 @@ describe("library actions", () => {
       item.id === "folder-target" ? { ...item, deletedAt: now } : item
     ) };
     expect(addPaperToCollection(deletedFolderState, "paper-a", "folder-target", now)).toBe(deletedFolderState);
+  });
+
+  it("moves a paper from the current collection tree to another collection", () => {
+    const next = movePaperToCollection(state(), "paper-a", "collection_inbox", "folder-parent", now);
+
+    expect(next.paperCollections.find((item) => item.id === "pc-parent-a")?.deletedAt).toBe(now);
+    expect(next.paperCollections.find((item) => item.id === "pc-grandchild-a")?.deletedAt).toBe(now);
+    expect(next.paperCollections.find((item) => item.id === "pc-target-a")?.deletedAt).toBeUndefined();
+    expect(next.paperCollections.some((item) =>
+      item.paperId === "paper-a" && item.collectionId === "collection_inbox" && !item.deletedAt
+    )).toBe(true);
+  });
+
+  it("files a paper from a virtual view without removing its other collection links", () => {
+    const next = movePaperToCollection(state(), "paper-b", "folder-target", undefined, now);
+
+    expect(next.paperCollections.find((item) => item.id === "pc-child-b")?.deletedAt).toBeUndefined();
+    expect(next.paperCollections.some((item) =>
+      item.paperId === "paper-b" && item.collectionId === "folder-target" && !item.deletedAt
+    )).toBe(true);
+  });
+
+  it("keeps an existing target link while removing the source link", () => {
+    const next = movePaperToCollection(state(), "paper-a", "folder-target", "folder-parent", now);
+
+    expect(next.paperCollections.find((item) => item.id === "pc-parent-a")?.deletedAt).toBe(now);
+    expect(next.paperCollections.find((item) => item.id === "pc-grandchild-a")?.deletedAt).toBe(now);
+    expect(next.paperCollections.find((item) => item.id === "pc-target-a")?.deletedAt).toBeUndefined();
+    expect(next.paperCollections.filter((item) => !item.deletedAt && item.paperId === "paper-a" && item.collectionId === "folder-target")).toHaveLength(1);
+  });
+
+  it("preserves a descendant target while removing the rest of the selected collection tree", () => {
+    const next = movePaperToCollection(state(), "paper-a", "folder-grandchild", "folder-parent", now);
+
+    expect(next.paperCollections.find((item) => item.id === "pc-parent-a")?.deletedAt).toBe(now);
+    expect(next.paperCollections.find((item) => item.id === "pc-grandchild-a")?.deletedAt).toBeUndefined();
+    expect(next.paperCollections.find((item) => item.id === "pc-target-a")?.deletedAt).toBeUndefined();
+  });
+
+  it("ignores a move to the currently selected collection", () => {
+    const current = state();
+
+    expect(movePaperToCollection(current, "paper-a", "folder-parent", "folder-parent", now)).toBe(current);
   });
 
   it("deletes a child folder and moves its papers to the parent folder without duplicates", () => {

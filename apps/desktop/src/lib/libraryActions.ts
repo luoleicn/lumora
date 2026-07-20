@@ -1,11 +1,45 @@
 import type { Collection, EntityId, LibraryState, PaperCollection } from "@lumora/shared";
 import { createId } from "./id";
 
+export type CollectionOption = {
+  id: EntityId;
+  path: string;
+};
+
 export function sortCollectionsAlphabetically(collections: Collection[]): Collection[] {
   return [...collections].sort((a, b) => a.name.localeCompare(b.name, undefined, {
     sensitivity: "base",
     numeric: true
   }));
+}
+
+export function getCollectionOptions(collections: Collection[]): CollectionOption[] {
+  const activeCollections = collections.filter((collection) => !collection.deletedAt);
+  const collectionById = new Map(activeCollections.map((collection) => [collection.id, collection]));
+
+  return activeCollections
+    .map((collection) => {
+      const names = [collection.name];
+      const visited = new Set<EntityId>([collection.id]);
+      let parentId = collection.parentId;
+
+      while (parentId && !visited.has(parentId)) {
+        visited.add(parentId);
+        const parent = collectionById.get(parentId);
+        if (!parent) break;
+        names.unshift(parent.name);
+        parentId = parent.parentId;
+      }
+
+      return {
+        id: collection.id,
+        path: names.join(" / ")
+      };
+    })
+    .sort((a, b) => a.path.localeCompare(b.path, undefined, {
+      sensitivity: "base",
+      numeric: true
+    }));
 }
 
 export function getActivePaperCollectionIds(state: LibraryState, paperId?: EntityId): Set<EntityId> {
@@ -91,6 +125,64 @@ export function addPaperToCollection(state: LibraryState, paperId: EntityId, col
     ...state,
     paperCollections: [paperCollection, ...state.paperCollections]
   };
+}
+
+/**
+ * Moves a paper out of the currently viewed real collection tree and into a
+ * target collection. Virtual views pass no source collection, preserving any
+ * other organization links and making the action equivalent to filing an
+ * unfiled/all-documents result.
+ */
+export function movePaperToCollection(
+  state: LibraryState,
+  paperId: EntityId,
+  targetCollectionId: EntityId,
+  sourceCollectionId?: EntityId,
+  now = new Date().toISOString()
+) {
+  const paper = state.papers.find((item) => item.id === paperId && !item.deletedAt);
+  const target = state.collections.find((item) => item.id === targetCollectionId && !item.deletedAt);
+  const source = sourceCollectionId
+    ? state.collections.find((item) => item.id === sourceCollectionId && !item.deletedAt)
+    : undefined;
+  if (!paper || !target || source?.id === target.id) {
+    return state;
+  }
+
+  const sourceCollectionIds = source
+    ? getCollectionAndDescendantIds(state.collections, source.id)
+    : new Set<EntityId>();
+  const removableLinkIds = new Set(state.paperCollections
+    .filter((item) =>
+      !item.deletedAt
+      && item.paperId === paperId
+      && item.collectionId !== target.id
+      && sourceCollectionIds.has(item.collectionId)
+    )
+    .map((item) => item.id));
+  const targetLinkExists = state.paperCollections.some((item) =>
+    !item.deletedAt && item.paperId === paperId && item.collectionId === target.id
+  );
+
+  if (removableLinkIds.size === 0 && targetLinkExists) {
+    return state;
+  }
+
+  const paperCollections = state.paperCollections.map((item) =>
+    removableLinkIds.has(item.id) ? { ...item, deletedAt: now, updatedAt: now } : item
+  );
+  if (targetLinkExists) {
+    return { ...state, paperCollections };
+  }
+
+  const targetLink: PaperCollection = {
+    id: createId("paper_collection"),
+    paperId,
+    collectionId: target.id,
+    createdAt: now,
+    updatedAt: now
+  };
+  return { ...state, paperCollections: [targetLink, ...paperCollections] };
 }
 
 export function deletePaperFromLibrary(state: LibraryState, paperId: EntityId, now = new Date().toISOString()) {

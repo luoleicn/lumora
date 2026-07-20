@@ -1199,6 +1199,56 @@ body.paper-pointer-dragging * {
   background: #eef6f3;
 }
 
+.paper-context-menu button:disabled {
+  cursor: default;
+  color: #98a2ad;
+  background: transparent;
+}
+
+.paper-context-submenu-anchor {
+  position: relative;
+}
+
+.paper-context-menu-chevron {
+  margin-left: auto;
+}
+
+.paper-context-submenu {
+  position: absolute;
+  top: -5px;
+  left: calc(100% + 6px);
+  z-index: 31;
+  display: flex;
+  min-width: 240px;
+  max-width: min(360px, calc(100vw - 24px));
+  max-height: min(360px, calc(100vh - 24px));
+  flex-direction: column;
+  overflow-y: auto;
+  border: 1px solid #cfd7df;
+  border-radius: 7px;
+  background: #ffffff;
+  box-shadow: 0 12px 28px rgba(28, 36, 43, 0.18);
+  padding: 5px;
+}
+
+.paper-context-submenu.open-left {
+  right: calc(100% + 6px);
+  left: auto;
+}
+
+.paper-context-collection-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.paper-context-menu-empty {
+  padding: 8px 9px;
+  color: #7b8792;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .paper-context-menu button.danger {
   color: #b42318;
 }

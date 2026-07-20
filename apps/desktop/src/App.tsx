@@ -22,6 +22,7 @@ import {
   deleteCollectionAndReassignPapers,
   deletePaperFromLibrary,
   getCollectionAndDescendantIds,
+  movePaperToCollection,
   removePaperFromCollectionTree,
   renameCollection,
   restorePaperFromTrash,
@@ -1118,6 +1119,36 @@ export default function App() {
     setPaperDrag({ paperId });
   }
 
+  function handleMovePaperToCollection(paperId: string, targetCollectionId: string) {
+    let moved = false;
+    let paperTitle = "paper";
+    let collectionName = "folder";
+
+    flushSync(() => {
+      setLibrary((current) => {
+        const sourceCollection = current.collections.find((item) =>
+          item.id === selectedCollectionId && !item.deletedAt
+        );
+        const nextLibrary = movePaperToCollection(
+          current,
+          paperId,
+          targetCollectionId,
+          sourceCollection?.id
+        );
+        moved = nextLibrary !== current;
+        paperTitle = current.papers.find((item) => item.id === paperId)?.title ?? paperTitle;
+        collectionName = current.collections.find((item) => item.id === targetCollectionId)?.name ?? collectionName;
+        return nextLibrary;
+      });
+      setSelectedCollectionId(targetCollectionId);
+    });
+
+    setStatus(moved
+      ? `Moved ${paperTitle} to ${collectionName}.`
+      : "Paper is already in that folder."
+    );
+  }
+
   function handlePaperDragMove(paperId: string, overCollectionId?: string) {
     setPaperDrag((current) => {
       if (current?.paperId === paperId && current.overCollectionId === overCollectionId) {
@@ -1679,6 +1710,7 @@ export default function App() {
                         onPaperDragStart={handlePaperDragStart}
                         onPaperDragMove={handlePaperDragMove}
                         onPaperDragEnd={handlePaperDragEnd}
+                        onMovePaperToCollection={handleMovePaperToCollection}
                         onRemovePaperFromCollection={handleRemovePaperFromSelectedCollection}
                         onDeletePaper={handleDeletePaper}
                         onRestorePaper={handleRestorePaper}
@@ -2106,6 +2138,7 @@ function WorkspaceTabContent({
   onPaperDragStart,
   onPaperDragMove,
   onPaperDragEnd,
+  onMovePaperToCollection,
   onRemovePaperFromCollection,
   onDeletePaper,
   onRestorePaper,
@@ -2134,6 +2167,7 @@ function WorkspaceTabContent({
   onPaperDragStart: (paperId: string) => void;
   onPaperDragMove: (paperId: string, collectionId?: string) => void;
   onPaperDragEnd: (paperId: string, collectionId?: string) => void;
+  onMovePaperToCollection: (paperId: string, collectionId: string) => void;
   onRemovePaperFromCollection: (paperId: string) => void;
   onDeletePaper: (paperId: string) => void;
   onRestorePaper: (paperId: string) => void;
@@ -2157,6 +2191,7 @@ function WorkspaceTabContent({
         onPaperDragStart={onPaperDragStart}
         onPaperDragMove={onPaperDragMove}
         onPaperDragEnd={onPaperDragEnd}
+        onMovePaperToCollection={onMovePaperToCollection}
         onRemovePaperFromCollection={onRemovePaperFromCollection}
         onDeletePaper={onDeletePaper}
         onRestorePaper={onRestorePaper}

@@ -1,7 +1,8 @@
-import { FileCheck2, FileDown, FilePlus2, FileQuestion, FileText, FolderMinus, RotateCcw, Star, Trash2 } from "lucide-react";
+import { ChevronRight, FileCheck2, FileDown, FilePlus2, FileQuestion, FileText, FolderInput, FolderMinus, RotateCcw, Star, Trash2 } from "lucide-react";
 import type { FileAsset, LibraryState, Paper } from "@lumora/shared";
 import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import { resolveVirtualListRange } from "../lib/listVirtualization";
+import { getCollectionOptions, type CollectionOption } from "../lib/libraryActions";
 import { collapseCjkSpaces, splitSnippet, type PaperSearchMeta, type SearchMatchedField } from "../lib/searchIndex";
 
 const matchedFieldLabels: Record<SearchMatchedField, string> = {
@@ -72,6 +73,7 @@ type PaperListProps = {
   onPaperDragStart: (paperId: string) => void;
   onPaperDragMove: (paperId: string, collectionId?: string) => void;
   onPaperDragEnd: (paperId: string, collectionId?: string) => void;
+  onMovePaperToCollection: (paperId: string, collectionId: string) => void;
   onRemovePaperFromCollection: (paperId: string) => void;
   onDeletePaper: (paperId: string) => void;
   onRestorePaper: (paperId: string) => void;
@@ -91,6 +93,7 @@ export function PaperList({
   onPaperDragStart,
   onPaperDragMove,
   onPaperDragEnd,
+  onMovePaperToCollection,
   onRemovePaperFromCollection,
   onDeletePaper,
   onRestorePaper,
@@ -136,6 +139,7 @@ export function PaperList({
     }
   ), [sortedPapers.length, tableViewport]);
   const visiblePapers = sortedPapers.slice(virtualRange.start, virtualRange.end);
+  const collectionOptions = useMemo(() => getCollectionOptions(state.collections), [state.collections]);
 
   useEffect(() => {
     const element = tableWrapRef.current;
@@ -418,12 +422,19 @@ export function PaperList({
       </div>
       {contextMenu && (
         <PaperContextMenu
+          key={`${contextMenu.paperId}:${contextMenu.x}:${contextMenu.y}`}
           x={contextMenu.x}
           y={contextMenu.y}
           isTrash={isTrash}
+          collectionOptions={collectionOptions}
+          selectedCollectionId={selectedCollectionId}
           canRemoveFromCollection={isRealCollectionId(selectedCollectionId)}
           hasLocalPdf={state.fileAssets.some((file) => file.paperId === contextMenu.paperId && !file.deletedAt && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName)) && (Boolean(file.localPath) || file.downloadState === "local"))}
           onBindLocalPdf={() => { onBindLocalPdf(contextMenu.paperId); setContextMenu(undefined); }}
+          onMoveToCollection={(collectionId) => {
+            onMovePaperToCollection(contextMenu.paperId, collectionId);
+            setContextMenu(undefined);
+          }}
           onRemoveFromCollection={() => {
             onRemovePaperFromCollection(contextMenu.paperId);
             setContextMenu(undefined);
@@ -605,17 +616,22 @@ function PaperContextMenu({
   x,
   y,
   isTrash,
+  collectionOptions,
+  selectedCollectionId,
   canRemoveFromCollection,
   onRemoveFromCollection,
   onRestorePaper,
   onPermanentlyDeletePaper,
   onDeletePaper,
   hasLocalPdf,
-  onBindLocalPdf
+  onBindLocalPdf,
+  onMoveToCollection
 }: {
   x: number;
   y: number;
   isTrash: boolean;
+  collectionOptions: CollectionOption[];
+  selectedCollectionId: string;
   canRemoveFromCollection: boolean;
   onRemoveFromCollection: () => void;
   onRestorePaper: () => void;
@@ -623,7 +639,11 @@ function PaperContextMenu({
   onDeletePaper: () => void;
   hasLocalPdf: boolean;
   onBindLocalPdf: () => void;
+  onMoveToCollection: (collectionId: string) => void;
 }) {
+  const [moveMenuOpen, setMoveMenuOpen] = useState(false);
+  const submenuOpensLeft = typeof window !== "undefined" && x + 430 > window.innerWidth;
+
   return (
     <div
       className="paper-context-menu"
@@ -651,6 +671,45 @@ function PaperContextMenu({
               <span>Bind Local PDF…</span>
             </button>
           )}
+          <div className="paper-context-submenu-anchor">
+            <button
+              type="button"
+              role="menuitem"
+              aria-haspopup="menu"
+              aria-expanded={moveMenuOpen}
+              onClick={() => setMoveMenuOpen((current) => !current)}
+            >
+              <FolderInput size={15} />
+              <span>Move to</span>
+              <ChevronRight className="paper-context-menu-chevron" size={14} />
+            </button>
+            {moveMenuOpen && (
+              <div
+                className={`paper-context-submenu${submenuOpensLeft ? " open-left" : ""}`}
+                role="menu"
+                aria-label="Move document to collection"
+              >
+                {collectionOptions.map((collection) => {
+                  const isCurrentCollection = collection.id === selectedCollectionId;
+                  return (
+                    <button
+                      key={collection.id}
+                      type="button"
+                      role="menuitem"
+                      disabled={isCurrentCollection}
+                      title={isCurrentCollection ? `${collection.path} — current collection` : collection.path}
+                      onClick={() => onMoveToCollection(collection.id)}
+                    >
+                      <span className="paper-context-collection-path">{collection.path}</span>
+                    </button>
+                  );
+                })}
+                {collectionOptions.length === 0 && (
+                  <span className="paper-context-menu-empty">No collections available</span>
+                )}
+              </div>
+            )}
+          </div>
           {canRemoveFromCollection && (
             <button type="button" role="menuitem" onClick={onRemoveFromCollection}>
               <FolderMinus size={15} />
