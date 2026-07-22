@@ -4,6 +4,7 @@ import type { CloudSyncSummary, LibraryState } from "@lumora/shared";
 const invokeMock = vi.fn();
 const persistEntitiesMock = vi.fn();
 const loadLibraryFromDbMock = vi.fn();
+const persistLibraryStateSnapshotMock = vi.fn();
 const readFileBytesMock = vi.fn();
 const getStoredPdfMetadataMock = vi.fn();
 const storePdfToDiskMock = vi.fn();
@@ -12,7 +13,8 @@ const putFileBlobMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
 vi.mock("./libraryDb", () => ({
   persistEntities: (...args: unknown[]) => persistEntitiesMock(...args),
-  loadLibraryFromDb: (...args: unknown[]) => loadLibraryFromDbMock(...args)
+  loadLibraryFromDb: (...args: unknown[]) => loadLibraryFromDbMock(...args),
+  persistLibraryStateSnapshot: (...args: unknown[]) => persistLibraryStateSnapshotMock(...args)
 }));
 vi.mock("./fileStorage", () => ({
   loadFileStorageSettings: () => ({ directory: "/library", nameTemplate: "{title}" }),
@@ -64,6 +66,7 @@ describe("syncLibrary arXiv boundary", () => {
     invokeMock.mockReset();
     persistEntitiesMock.mockReset().mockResolvedValue(undefined);
     loadLibraryFromDbMock.mockReset();
+    persistLibraryStateSnapshotMock.mockReset().mockResolvedValue(undefined);
     readFileBytesMock.mockReset();
     getStoredPdfMetadataMock.mockReset();
     storePdfToDiskMock.mockReset();
@@ -74,6 +77,50 @@ describe("syncLibrary arXiv boundary", () => {
       setItem: (key: string, value: string) => local.set(key, value),
       removeItem: (key: string) => local.delete(key)
     });
+  });
+
+  it("persists the collection state shown by the UI before native metadata sync scans SQLite", async () => {
+    const moved: LibraryState = {
+      papers: [{ id: "paper-a", title: "Wall-OSS-0.5 Technical Report", authors: [], createdAt: now, updatedAt: now }],
+      fileAssets: [],
+      collections: [
+        { id: "collection-unread", name: "0unread", sortOrder: 0, createdAt: now, updatedAt: now },
+        { id: "collection-manipulation", name: "1Manipulation", sortOrder: 1, createdAt: now, updatedAt: now }
+      ],
+      paperCollections: [
+        {
+          id: "membership-unread", paperId: "paper-a", collectionId: "collection-unread",
+          createdAt: now, updatedAt: now, deletedAt: now
+        },
+        {
+          id: "membership-manipulation", paperId: "paper-a", collectionId: "collection-manipulation",
+          createdAt: now, updatedAt: now
+        }
+      ],
+      annotations: []
+    };
+    let releasePersist!: () => void;
+    persistLibraryStateSnapshotMock.mockReturnValue(new Promise<void>((resolve) => {
+      releasePersist = resolve;
+    }));
+    loadLibraryFromDbMock.mockResolvedValue({ state: moved, empty: false });
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "qiniu_sync_library") return Promise.resolve(summary());
+      return Promise.resolve(undefined);
+    });
+
+    const task = syncLibrary(
+      { accessKey: "ak", bucket: "bucket", region: "", privateDomain: "domain", prefix: "lumora/v1", configured: true },
+      moved
+    );
+    await Promise.resolve();
+    expect(invokeMock.mock.calls.some(([command]) => command === "qiniu_sync_library")).toBe(false);
+
+    releasePersist();
+    await task;
+
+    expect(persistLibraryStateSnapshotMock).toHaveBeenCalledWith(moved);
+    expect(invokeMock.mock.calls.some(([command]) => command === "qiniu_sync_library")).toBe(true);
   });
 
   it("syncs only metadata and deletes the old blob when a paper has an arXiv ID", async () => {

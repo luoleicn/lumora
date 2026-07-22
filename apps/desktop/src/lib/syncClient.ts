@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { ArxivMetadata, CloudSyncConfig, CloudSyncSummary, LibraryState } from "@lumora/shared";
-import { loadLibraryFromDb, persistEntities } from "./libraryDb";
+import { loadLibraryFromDb, persistEntities, persistLibraryStateSnapshot } from "./libraryDb";
 import { getStoredPdfMetadata, loadFileStorageSettings, readFileBytes, storePdfToDisk } from "./fileStorage";
 import { putFileBlob } from "./localStore";
 import { normalizeArxivId } from "./arxivFiles";
@@ -202,6 +202,11 @@ export async function syncLibrary(
   _state: LibraryState,
   onStage?: (message: string, completed?: number, total?: number) => void
 ): Promise<{ state: LibraryState; summary: CloudSyncSummary }> {
+  // Native cloud sync discovers outgoing metadata from SQLite. Make the state
+  // currently shown by the UI authoritative first: this drains debounced edits
+  // and repairs any UI/DB divergence before the native scanner can publish a
+  // stale collection membership.
+  await persistLibraryStateSnapshot(_state);
   let prepared = _state;
   const storage = loadFileStorageSettings();
   // One id per sync run scopes the Rust-side known-cloud-hash cache; a fresh

@@ -19,13 +19,34 @@ Every install owns one random device ID and a strictly increasing batch
 sequence. Change objects are immutable and retries reuse the same key. Other
 devices discover device heads, then fetch only sequence numbers beyond their
 SQLite vector cursor. Qiniu `putTime`, followed by device ID, batch sequence,
-and operation index, is the deterministic last-write-wins version stamp.
+and operation index, is the deterministic last-write-wins version stamp for
+ordinary entities.
+
+Paper/collection membership has stronger domain-specific merge rules. A
+logical relation always uses an ID derived from `(paperId, collectionId)`, so
+two devices cannot create independent active rows for the same relation. Each
+membership operation carries a hybrid logical clock (HLC) version. **Add**
+updates one relation; **Move** writes the target relation, tombstones every
+other current relation, and writes a per-paper reset barrier with the same HLC
+version. A relation older than that barrier is suppressed, even if its immutable
+batch was uploaded later. A subsequent explicit Add has a newer HLC version and
+therefore remains valid, preserving intentional multi-collection filing.
+
+Existing random membership IDs are canonicalized transactionally on upgrade.
+Legacy rows receive deterministic versions derived from their timestamp,
+deleted state, and old entity ID; every HLC operation wins over a legacy
+version. Incoming legacy batches are canonicalized at apply time, so an older
+device cannot resurrect a membership removed by a newer Move. Device heads
+advertise the `membership-hlc-v1` capability while the object-key namespace
+remains `lumora/v1`.
 
 SQLite writes and the local dirty marker are transactional. A batch is sealed
 locally before upload, the cloud object is verified with Stat, and the dirty
-rows are cleared only after the device head is published. A remote operation
-that collides with a still-dirty local entity is retained in `sync_inbox`
-instead of overwriting the edit.
+rows are cleared only after the device head is published. A remote ordinary
+operation that collides with a still-dirty local entity is retained in
+`sync_inbox` instead of overwriting the edit. Membership conflicts are resolved
+by their semantic HLC version; the newer membership operation wins regardless
+of batch arrival order.
 
 The app syncs once after startup, then every hour while running. Manual sync is
 always available. There is no edit-debounce sync.
@@ -80,7 +101,9 @@ and request counts split by HTTP method.
 - Never edit or overwrite change objects manually. Metadata history is retained
   in version 1; snapshots optimize bootstrap but are not authorization to erase
   the immutable log.
-- Last-write-wins can lose concurrent edits to the same entity. Directory
-  membership and annotations remain separate entities, reducing conflict scope.
+- Last-write-wins can lose concurrent edits to the same ordinary entity.
+  Directory membership instead uses deterministic pair identities, HLC
+  operation ordering, and Move reset barriers; annotations remain separate
+  entities to reduce conflict scope.
 - Losing both the local library and Qiniu credentials makes recovery impossible;
   keep normal device and credential backups.

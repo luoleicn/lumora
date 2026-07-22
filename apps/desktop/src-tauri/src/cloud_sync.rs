@@ -4,6 +4,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    cmp::Ordering as CmpOrdering,
     collections::{HashMap, HashSet},
     io::{Read, Write},
     sync::{
@@ -27,6 +28,8 @@ const PREFIX: &str = "lumora/v1";
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_CHANGES_PER_BATCH: usize = 500;
 const DEVICE_STATE_REPUBLISH_INTERVAL_MS: u64 = 24 * 60 * 60 * 1_000;
+const MEMBERSHIP_MIGRATION_META_KEY: &str = "paperCollectionModelV2";
+const MEMBERSHIP_SYNC_CAPABILITY: &str = "membership-hlc-v1";
 
 // A single shared reqwest client. A server that accepts a connection and never
 // responds must fail fast rather than hang the whole sync forever, which would
@@ -445,6 +448,8 @@ struct DeviceState {
     updated_at: String,
     #[serde(default)]
     seen: HashMap<String, u64>,
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -454,6 +459,8 @@ struct PublishedDeviceState {
     device_id: String,
     latest_batch_seq: u64,
     seen: HashMap<String, u64>,
+    #[serde(default)]
+    capabilities: Vec<String>,
     published_at_ms: u64,
 }
 
@@ -528,6 +535,177 @@ fn keyring_entry(access_key: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYRING_SERVICE, access_key).map_err(|error| error.to_string())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MembershipVersion {
+    Legacy(String, bool, String),
+    Hlc(u64, u64, String, String),
+}
+
+impl Ord for MembershipVersion {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        match (self, other) {
+            (Self::Hlc(..), Self::Legacy(..)) => CmpOrdering::Greater,
+            (Self::Legacy(..), Self::Hlc(..)) => CmpOrdering::Less,
+            (Self::Legacy(left_time, left_deleted, left_id), Self::Legacy(right_time, right_deleted, right_id)) =>
+                (left_time, left_deleted, left_id).cmp(&(right_time, right_deleted, right_id)),
+            (Self::Hlc(left_wall, left_counter, left_node, left_op), Self::Hlc(right_wall, right_counter, right_node, right_op)) =>
+                (left_wall, left_counter, left_node, left_op).cmp(&(right_wall, right_counter, right_node, right_op)),
+        }
+    }
+}
+
+impl PartialOrd for MembershipVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn canonical_paper_collection_id(paper_id: &str, collection_id: &str) -> String {
+    format!("paper_collection:{}:{}{}", paper_id.chars().count(), paper_id, collection_id)
+}
+
+fn canonical_paper_collection_reset_id(paper_id: &str) -> String {
+    format!("paper_collection_reset:{}:{paper_id}", paper_id.chars().count())
+}
+
+fn membership_version(data: &Value, original_id: &str) -> MembershipVersion {
+    let version = data.get("membershipVersion");
+    if version.and_then(|item| item.get("kind")).and_then(Value::as_str) == Some("hlc") {
+        return MembershipVersion::Hlc(
+            version.and_then(|item| item.get("wallTimeMs")).and_then(Value::as_u64).unwrap_or(0),
+            version.and_then(|item| item.get("counter")).and_then(Value::as_u64).unwrap_or(0),
+            version.and_then(|item| item.get("nodeId")).and_then(Value::as_str).unwrap_or_default().to_string(),
+            version.and_then(|item| item.get("operationId")).and_then(Value::as_str).unwrap_or_default().to_string(),
+        );
+    }
+    if version.and_then(|item| item.get("kind")).and_then(Value::as_str) == Some("legacy") {
+        return MembershipVersion::Legacy(
+            version.and_then(|item| item.get("updatedAt")).and_then(Value::as_str).unwrap_or_default().to_string(),
+            version.and_then(|item| item.get("deleted")).and_then(Value::as_bool).unwrap_or(false),
+            version.and_then(|item| item.get("entityId")).and_then(Value::as_str).unwrap_or(original_id).to_string(),
+        );
+    }
+    MembershipVersion::Legacy(
+        data.get("updatedAt").and_then(Value::as_str).unwrap_or_default().to_string(),
+        data.get("deletedAt").and_then(Value::as_str).is_some(),
+        original_id.to_string(),
+    )
+}
+
+fn membership_version_json(version: &MembershipVersion) -> Value {
+    match version {
+        MembershipVersion::Legacy(updated_at, deleted, entity_id) => serde_json::json!({
+            "kind": "legacy", "updatedAt": updated_at, "deleted": deleted, "entityId": entity_id
+        }),
+        MembershipVersion::Hlc(wall, counter, node, operation) => serde_json::json!({
+            "kind": "hlc", "wallTimeMs": wall, "counter": counter, "nodeId": node, "operationId": operation
+        }),
+    }
+}
+
+pub(crate) fn normalize_membership_entity(entity_type: &str, data: &Value) -> Result<(String, Value), String> {
+    let original_id = data.get("id").and_then(Value::as_str).ok_or_else(|| "Membership entity has no id".to_string())?;
+    let mut normalized = data.clone();
+    let object = normalized.as_object_mut().ok_or_else(|| "Membership entity is not an object".to_string())?;
+    let canonical_id = match entity_type {
+        "paperCollection" => {
+            let paper_id = data.get("paperId").and_then(Value::as_str).ok_or_else(|| "Membership has no paperId".to_string())?;
+            let collection_id = data.get("collectionId").and_then(Value::as_str).ok_or_else(|| "Membership has no collectionId".to_string())?;
+            object.insert("membershipVersion".into(), membership_version_json(&membership_version(data, original_id)));
+            canonical_paper_collection_id(paper_id, collection_id)
+        }
+        "paperCollectionReset" => {
+            let paper_id = data.get("paperId").and_then(Value::as_str).ok_or_else(|| "Membership reset has no paperId".to_string())?;
+            canonical_paper_collection_reset_id(paper_id)
+        }
+        _ => original_id.to_string(),
+    };
+    object.insert("id".into(), Value::String(canonical_id.clone()));
+    Ok((canonical_id, normalized))
+}
+
+pub(crate) fn reconcile_paper_memberships(
+    transaction: &rusqlite::Transaction<'_>,
+    paper_id: &str,
+) -> Result<(), String> {
+    let reset_data: Option<String> = transaction.query_row(
+        "SELECT data FROM entities WHERE entity_type='paperCollectionReset' AND id=?1",
+        [canonical_paper_collection_reset_id(paper_id)],
+        |row| row.get(0),
+    ).optional().map_err(|error| error.to_string())?;
+    let Some(reset_data) = reset_data else { return Ok(()); };
+    let reset: Value = serde_json::from_str(&reset_data).map_err(|error| error.to_string())?;
+    let reset_id = reset.get("id").and_then(Value::as_str).unwrap_or_default();
+    let reset_version = membership_version(&reset, reset_id);
+    let target = reset.get("targetCollectionId").and_then(Value::as_str).unwrap_or_default();
+    let reset_updated_at = reset.get("updatedAt").and_then(Value::as_str).unwrap_or_default().to_string();
+
+    let rows = {
+        let mut statement = transaction.prepare(
+            "SELECT id,data FROM entities WHERE entity_type='paperCollection' AND json_extract(data,'$.paperId')=?1"
+        ).map_err(|error| error.to_string())?;
+        let rows = statement.query_map([paper_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+        rows
+    };
+    for (id, raw) in rows {
+        let mut membership: Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+        if membership.get("deletedAt").and_then(Value::as_str).is_some() { continue; }
+        let version = membership_version(&membership, &id);
+        let collection_id = membership.get("collectionId").and_then(Value::as_str).unwrap_or_default();
+        if version < reset_version || (version == reset_version && collection_id != target) {
+            let object = membership.as_object_mut().ok_or_else(|| "Membership entity is not an object".to_string())?;
+            object.insert("membershipVersion".into(), membership_version_json(&reset_version));
+            object.insert("deletedAt".into(), Value::String(reset_updated_at.clone()));
+            object.insert("updatedAt".into(), Value::String(reset_updated_at.clone()));
+            transaction.execute(
+                "UPDATE entities SET data=?2,updated_at=?3,deleted_at=?3,local_seq=0 WHERE entity_type='paperCollection' AND id=?1",
+                params![id, serde_json::to_string(&membership).map_err(|error| error.to_string())?, reset_updated_at],
+            ).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_legacy_memberships(connection: &rusqlite::Connection) -> Result<(), String> {
+    if crate::db::get_meta_value(connection, MEMBERSHIP_MIGRATION_META_KEY).is_some() { return Ok(()); }
+    let rows = {
+        let mut statement = connection.prepare("SELECT id,data FROM entities WHERE entity_type='paperCollection'")
+            .map_err(|error| error.to_string())?;
+        let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+        rows
+    };
+    let mut winners: HashMap<String, (Value, MembershipVersion)> = HashMap::new();
+    for (_id, raw) in &rows {
+        let data: Value = serde_json::from_str(raw).map_err(|error| error.to_string())?;
+        let (canonical_id, normalized) = normalize_membership_entity("paperCollection", &data)?;
+        let version = membership_version(&normalized, &canonical_id);
+        if winners.get(&canonical_id).map_or(true, |(_, current)| version > *current) {
+            winners.insert(canonical_id, (normalized, version));
+        }
+    }
+    let transaction = connection.unchecked_transaction().map_err(|error| error.to_string())?;
+    if !rows.is_empty() {
+        let next_seq: i64 = transaction.query_row("SELECT COALESCE(MAX(local_seq),0)+1 FROM entities", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        transaction.execute("DELETE FROM entities WHERE entity_type='paperCollection'", [])
+            .map_err(|error| error.to_string())?;
+        for (id, (data, _)) in winners {
+            let updated_at = data.get("updatedAt").and_then(Value::as_str).unwrap_or_default();
+            let deleted_at = data.get("deletedAt").and_then(Value::as_str);
+            transaction.execute(
+                "INSERT INTO entities(entity_type,id,data,updated_at,deleted_at,local_seq) VALUES('paperCollection',?1,?2,?3,?4,?5)",
+                params![id, serde_json::to_string(&data).map_err(|error| error.to_string())?, updated_at, deleted_at, next_seq],
+            ).map_err(|error| error.to_string())?;
+        }
+    }
+    crate::db::set_meta_value(&transaction, MEMBERSHIP_MIGRATION_META_KEY, "1")?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
 pub(crate) fn init_sync_schema(connection: &rusqlite::Connection) -> Result<(), String> {
     connection
         .execute_batch(
@@ -591,6 +769,7 @@ pub(crate) fn init_sync_schema(connection: &rusqlite::Connection) -> Result<(), 
             [],
         )
         .map_err(|error| error.to_string())?;
+    migrate_legacy_memberships(connection)?;
     Ok(())
 }
 
@@ -912,11 +1091,41 @@ fn apply_change(
     batch_seq: u64,
     op_index: usize,
 ) -> Result<bool, String> {
-    let id = change
-        .data
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "Cloud entity has no id".to_string())?;
+    let membership_entity = change.entity == "paperCollection" || change.entity == "paperCollectionReset";
+    let (normalized_id, normalized_data) = if membership_entity {
+        normalize_membership_entity(&change.entity, &change.data)?
+    } else {
+        (
+            change.data.get("id").and_then(Value::as_str)
+                .ok_or_else(|| "Cloud entity has no id".to_string())?.to_string(),
+            change.data.clone(),
+        )
+    };
+    let id = normalized_id.as_str();
+    let existing_data: Option<String> = transaction.query_row(
+        "SELECT data FROM entities WHERE entity_type=?1 AND id=?2",
+        params![change.entity, id],
+        |row| row.get(0),
+    ).optional().map_err(|error| error.to_string())?;
+    let semantic_comparison = if membership_entity {
+        existing_data.as_deref().map(|raw| -> Result<CmpOrdering, String> {
+            let existing: Value = serde_json::from_str(raw).map_err(|error| error.to_string())?;
+            Ok(membership_version(&normalized_data, id).cmp(&membership_version(&existing, id)))
+        }).transpose()?
+    } else { None };
+    if semantic_comparison == Some(CmpOrdering::Less) {
+        return Ok(false);
+    }
+    if semantic_comparison == Some(CmpOrdering::Equal) {
+        let incoming_deleted = normalized_data.get("deletedAt").and_then(Value::as_str).is_some();
+        let existing_deleted = existing_data.as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|data| data.get("deletedAt").and_then(Value::as_str).map(str::to_string))
+            .is_some();
+        if existing_deleted && !incoming_deleted {
+            return Ok(false);
+        }
+    }
     let dirty: i64 = transaction
         .query_row(
             "SELECT local_seq FROM entities WHERE entity_type = ?1 AND id = ?2",
@@ -945,10 +1154,11 @@ fn apply_change(
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    if !version_is_newer((put_time, device, batch_seq, op_index), existing) {
+    let semantic_is_newer = semantic_comparison == Some(CmpOrdering::Greater);
+    if !semantic_is_newer && !version_is_newer((put_time, device, batch_seq, op_index), existing) {
         return Ok(false);
     }
-    let mut merged_data = change.data.clone();
+    let mut merged_data = normalized_data;
     if change.entity == "fileAsset" {
         let existing_data: Option<String> = transaction
             .query_row(
@@ -969,8 +1179,8 @@ fn apply_change(
         }
     }
     let data = serde_json::to_string(&merged_data).map_err(|error| error.to_string())?;
-    let updated_at = change.data.get("updatedAt").and_then(Value::as_str).unwrap_or("");
-    let deleted_at = change.data.get("deletedAt").and_then(Value::as_str);
+    let updated_at = merged_data.get("updatedAt").and_then(Value::as_str).unwrap_or("");
+    let deleted_at = merged_data.get("deletedAt").and_then(Value::as_str);
     transaction
         .execute(
             "INSERT INTO entities(entity_type,id,data,updated_at,deleted_at,local_seq)
@@ -991,6 +1201,11 @@ fn apply_change(
         .map_err(|error| error.to_string())?;
     if let Err(error) = crate::search::sync_search_index_for_change(transaction, &change.entity, id, &data, deleted_at) {
         eprintln!("Search index update failed after cloud sync: {error}");
+    }
+    if membership_entity {
+        if let Some(paper_id) = merged_data.get("paperId").and_then(Value::as_str) {
+            reconcile_paper_memberships(transaction, paper_id)?;
+        }
     }
     Ok(true)
 }
@@ -1124,6 +1339,7 @@ fn current_device_state<R: Runtime>(
         latest_batch_seq: latest,
         updated_at: now_iso(),
         seen,
+        capabilities: vec![MEMBERSHIP_SYNC_CAPABILITY.to_string()],
     })
 }
 
@@ -1152,6 +1368,7 @@ fn published_device_state_is_current(
         && published.device_id == state.device_id
         && published.latest_batch_seq == state.latest_batch_seq
         && published.seen == state.seen
+        && published.capabilities == state.capabilities
         && now_ms.saturating_sub(published.published_at_ms) < DEVICE_STATE_REPUBLISH_INTERVAL_MS
 }
 
@@ -1178,6 +1395,7 @@ async fn upload_device_state<R: Runtime>(
         device_id: state.device_id.clone(),
         latest_batch_seq: state.latest_batch_seq,
         seen: state.seen.clone(),
+        capabilities: state.capabilities.clone(),
         published_at_ms: now_millis(),
     };
     let connection = crate::db::open_library_db(app)?;
@@ -1854,10 +2072,87 @@ pub async fn qiniu_sync_library<R: Runtime>(app: AppHandle<R>) -> Result<SyncSum
 mod tests {
     use super::*;
 
+    fn membership_change(id: &str, paper_id: &str, collection_id: &str, updated_at: &str, deleted_at: Option<&str>) -> CloudChange {
+        let mut data = serde_json::json!({
+            "id": id,
+            "paperId": paper_id,
+            "collectionId": collection_id,
+            "createdAt": updated_at,
+            "updatedAt": updated_at
+        });
+        if let Some(deleted_at) = deleted_at {
+            data.as_object_mut().unwrap().insert("deletedAt".into(), Value::String(deleted_at.into()));
+        }
+        CloudChange { operation_id: id.into(), entity: "paperCollection".into(), op: "upsert".into(), data }
+    }
+
+    fn hlc(wall_time_ms: u64, node_id: &str, operation_id: &str) -> Value {
+        serde_json::json!({
+            "kind": "hlc", "wallTimeMs": wall_time_ms, "counter": 0,
+            "nodeId": node_id, "operationId": operation_id
+        })
+    }
+
     #[test]
     fn cloud_version_has_deterministic_tie_breakers() {
         assert!(version_is_newer((10, "b", 1, 0), Some((10, "a".into(), 9, 9))));
         assert!(!version_is_newer((9, "z", 99, 99), Some((10, "a".into(), 1, 0))));
+    }
+
+    #[test]
+    fn membership_ids_are_canonical_across_legacy_entity_ids() {
+        assert_eq!(
+            canonical_paper_collection_id("paper-a", "collection-b"),
+            "paper_collection:7:paper-acollection-b"
+        );
+        let first = membership_change("random-a", "paper-a", "collection-b", "2026-07-01T00:00:00Z", None);
+        let second = membership_change("random-b", "paper-a", "collection-b", "2026-07-01T00:00:00Z", None);
+        assert_eq!(
+            normalize_membership_entity("paperCollection", &first.data).unwrap().0,
+            normalize_membership_entity("paperCollection", &second.data).unwrap().0
+        );
+    }
+
+    #[test]
+    fn move_reset_prevents_a_late_legacy_membership_from_resurrecting() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_library_schema(&connection).unwrap();
+        init_sync_schema(&connection).unwrap();
+        let transaction = connection.transaction().unwrap();
+
+        let old = membership_change("legacy-old", "paper-a", "collection-unread", "2026-07-01T00:00:00Z", None);
+        assert!(apply_change(&transaction, &old, 10, "device-b", 1, 0).unwrap());
+
+        let version = hlc(2_000, "device-a", "move-a");
+        let reset = CloudChange {
+            operation_id: "move-a".into(),
+            entity: "paperCollectionReset".into(),
+            op: "upsert".into(),
+            data: serde_json::json!({
+                "id": "reset-random", "paperId": "paper-a", "targetCollectionId": "collection-manipulation",
+                "membershipVersion": version, "createdAt": "2026-07-02T00:00:00Z", "updatedAt": "2026-07-02T00:00:00Z"
+            }),
+        };
+        assert!(apply_change(&transaction, &reset, 20, "device-a", 2, 0).unwrap());
+        let mut target = membership_change("target-random", "paper-a", "collection-manipulation", "2026-07-02T00:00:00Z", None);
+        target.data.as_object_mut().unwrap().insert("membershipVersion".into(), hlc(2_000, "device-a", "move-a"));
+        assert!(apply_change(&transaction, &target, 20, "device-a", 2, 1).unwrap());
+
+        // This operation reaches cloud later, but its semantic mutation is legacy/older.
+        let stale = membership_change("another-random-id", "paper-a", "collection-unread", "2026-07-01T00:00:00Z", None);
+        assert!(!apply_change(&transaction, &stale, 30, "device-b", 3, 0).unwrap());
+
+        let active: Vec<String> = {
+            let mut statement = transaction.prepare(
+                "SELECT json_extract(data,'$.collectionId') FROM entities
+                 WHERE entity_type='paperCollection' AND deleted_at IS NULL ORDER BY 1"
+            ).unwrap();
+            let rows = statement.query_map([], |row| row.get(0)).unwrap()
+                .collect::<Result<Vec<_>, _>>().unwrap();
+            rows
+        };
+        assert_eq!(active, vec!["collection-manipulation"]);
+        transaction.commit().unwrap();
     }
 
     #[test]
@@ -1930,12 +2225,14 @@ mod tests {
             latest_batch_seq: 7,
             updated_at: "new".into(),
             seen: seen.clone(),
+            capabilities: vec![MEMBERSHIP_SYNC_CAPABILITY.into()],
         };
         let published = PublishedDeviceState {
             target: "target-a".into(),
             device_id: "local".into(),
             latest_batch_seq: 7,
             seen,
+            capabilities: vec![MEMBERSHIP_SYNC_CAPABILITY.into()],
             published_at_ms: 1_000,
         };
         assert!(published_device_state_is_current(

@@ -1,6 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Annotation, Author, Collection, FileAsset, LibraryState, Paper, PaperCollection } from "@lumora/shared";
+import {
+  canonicalPaperCollectionId,
+  reconcilePaperCollections,
+  type Annotation,
+  type Author,
+  type Collection,
+  type FileAsset,
+  type LibraryState,
+  type Paper,
+  type PaperCollection
+} from "@lumora/shared";
 import { createId } from "./id";
+import { nextMembershipVersion } from "./membershipClock";
 import { deleteFileBlob, getFileBytes, putFileBlob } from "./localStore";
 import { buildPdfFileName, storePdfToDisk, type FileStorageSettings } from "./fileStorage";
 
@@ -499,20 +510,28 @@ export function mergeBackgroundSyncState(
     return [...output.values()];
   };
 
+  const paperCollectionResets = merge(
+    base.paperCollectionResets ?? [],
+    synced.paperCollectionResets ?? [],
+    current.paperCollectionResets ?? []
+  );
+  const paperCollections = merge(base.paperCollections, synced.paperCollections, current.paperCollections);
   return {
     ...synced,
     papers: merge(base.papers, synced.papers, current.papers),
     fileAssets: merge(base.fileAssets, synced.fileAssets, current.fileAssets),
     collections: merge(base.collections, synced.collections, current.collections),
-    paperCollections: merge(base.paperCollections, synced.paperCollections, current.paperCollections),
+    paperCollections: reconcilePaperCollections(paperCollections, paperCollectionResets),
+    paperCollectionResets,
     annotations: merge(base.annotations, synced.annotations, current.annotations)
   };
 }
 
 // Synchronizes every personal-library resource represented by Lumora:
 // documents and full metadata, folders and membership, file attachment
-// metadata, and annotations. Pulling precedes pushing so server changes win
-// when both sides changed since the previous cursor.
+// metadata, and annotations. Pulling precedes pushing, while a local
+// membership operation newer than the previous cursor remains authoritative
+// until its add/remove has been pushed to Mendeley.
 //
 // After the first full sync, every pull is incremental against the stored
 // cursor: documents, trash, and annotations via modified_since, files via
@@ -546,7 +565,14 @@ export async function syncWithMendeley(
     onProgress?.({ phase, message, completed, total });
   };
   const publishState = () => {
-    syncOptions?.onStateUpdate?.({ ...state, papers, collections, paperCollections, fileAssets, annotations });
+    syncOptions?.onStateUpdate?.({
+      ...state,
+      papers,
+      collections,
+      paperCollections: reconcilePaperCollections(paperCollections, state.paperCollectionResets ?? []),
+      fileAssets,
+      annotations
+    });
   };
   const ensureActive = () => {
     if (syncOptions?.isCancelled?.()) {
@@ -850,9 +876,20 @@ export async function syncWithMendeley(
       const existing = paperCollections.find((item) =>
         item.mendeleyId === id || (item.paperId === paper.id && item.collectionId === collection.id)
       );
+      // A membership edited locally after the last completed Mendeley sync is
+      // pending push. Do not let the pull phase resurrect its tombstone; the
+      // push phase below will first make Mendeley match the local intent.
+      if (existing && cursor && existing.updatedAt > cursor) {
+        continue;
+      }
+      const membershipVersion = nextMembershipVersion({
+        ...state, papers, collections, paperCollections, fileAssets, annotations
+      });
       const mapped: PaperCollection = {
-        ...(existing ?? { id: createId("paper_collection"), createdAt: startedAt }),
-        paperId: paper.id, collectionId: collection.id, mendeleyId: id, updatedAt: startedAt, deletedAt: undefined
+        ...(existing ?? { createdAt: startedAt }),
+        id: canonicalPaperCollectionId(paper.id, collection.id),
+        paperId: paper.id, collectionId: collection.id, mendeleyId: id,
+        membershipVersion, updatedAt: startedAt, deletedAt: undefined
       };
       paperCollections = existing
         ? paperCollections.map((item) => item.id === existing.id ? mapped : item)
@@ -863,8 +900,17 @@ export async function syncWithMendeley(
   }
   paperCollections = paperCollections.map((item) => {
     if (item.mendeleyId && refreshedCollectionIds.has(item.collectionId) && !remoteRelationIds.has(item.mendeleyId)) {
+      if (cursor && item.updatedAt > cursor) return item;
       pulledRelationIds.add(item.id);
-      return { ...item, deletedAt: item.deletedAt ?? startedAt, updatedAt: startedAt };
+      if (item.deletedAt) return item;
+      return {
+        ...item,
+        membershipVersion: nextMembershipVersion({
+          ...state, papers, collections, paperCollections, fileAssets, annotations
+        }),
+        deletedAt: startedAt,
+        updatedAt: startedAt
+      };
     }
     return item;
   });
@@ -1005,5 +1051,15 @@ export async function syncWithMendeley(
   ensureActive();
   await invoke("db_set_meta", { key: mendeleySyncedAtMetaKey, value: startedAt });
   report("complete", "Mendeley sync complete", 8);
-  return { state: { ...state, papers, collections, paperCollections, fileAssets, annotations }, summary };
+  return {
+    state: {
+      ...state,
+      papers,
+      collections,
+      paperCollections: reconcilePaperCollections(paperCollections, state.paperCollectionResets ?? []),
+      fileAssets,
+      annotations
+    },
+    summary
+  };
 }

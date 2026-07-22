@@ -4,7 +4,13 @@ import type { LibraryState, Paper } from "@lumora/shared";
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
 
-import { deletePersistedEntities, diffLibraryStates, enqueueLibraryPersist, flushLibraryPersist } from "./libraryDb";
+import {
+  deletePersistedEntities,
+  diffLibraryStates,
+  diffLibraryStateValues,
+  enqueueLibraryPersist,
+  flushLibraryPersist
+} from "./libraryDb";
 
 const now = "2026-07-10T00:00:00.000Z";
 
@@ -71,6 +77,48 @@ describe("diffLibraryStates", () => {
     const next = { ...current, papers: [...current.papers] };
 
     expect(diffLibraryStates(current, next)).toEqual([]);
+  });
+});
+
+describe("diffLibraryStateValues", () => {
+  it("ignores entities rebuilt from SQLite with equal values", () => {
+    const persisted = state();
+    const inMemory = JSON.parse(JSON.stringify(persisted)) as LibraryState;
+    inMemory.papers[0] = {
+      updatedAt: inMemory.papers[0].updatedAt,
+      createdAt: inMemory.papers[0].createdAt,
+      authors: inMemory.papers[0].authors,
+      title: inMemory.papers[0].title,
+      id: inMemory.papers[0].id,
+      deletedAt: undefined
+    };
+
+    expect(diffLibraryStateValues(persisted, inMemory)).toEqual([]);
+  });
+
+  it("repairs a DB membership that is active while the UI shows it removed", () => {
+    const oldMembership = {
+      id: "membership-unread",
+      paperId: "paper-a",
+      collectionId: "collection-unread",
+      createdAt: now,
+      updatedAt: now
+    };
+    const newMembership = {
+      id: "membership-manipulation",
+      paperId: "paper-a",
+      collectionId: "collection-manipulation",
+      createdAt: now,
+      updatedAt: now
+    };
+    const persisted = state({ paperCollections: [oldMembership] });
+    const removedMembership = { ...oldMembership, deletedAt: now };
+    const inMemory = state({ paperCollections: [removedMembership, newMembership] });
+
+    expect(diffLibraryStateValues(persisted, inMemory)).toEqual([
+      { entityType: "paperCollection", entity: removedMembership },
+      { entityType: "paperCollection", entity: newMembership }
+    ]);
   });
 });
 

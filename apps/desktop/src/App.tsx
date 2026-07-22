@@ -2,7 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import type { Annotation, Collection, FileAsset, LibraryState, Paper } from "@lumora/shared";
+import {
+  canonicalPaperCollectionId,
+  type Annotation,
+  type Collection,
+  type FileAsset,
+  type LibraryState,
+  type Paper
+} from "@lumora/shared";
 import { FileText, X } from "lucide-react";
 import { AppToolbar } from "./components/AppToolbar";
 import { ArxivDownloadToast } from "./components/ArxivDownloadToast";
@@ -17,6 +24,7 @@ import { PdfReader, type PdfReaderViewState, type PdfSearchNavHandle } from "./c
 import { SyncPanel } from "./components/SyncPanel";
 import { SyncSettingsModal } from "./components/SyncSettingsModal";
 import { createId } from "./lib/id";
+import { nextMembershipVersion } from "./lib/membershipClock";
 import {
   addPaperToCollection,
   deleteCollectionAndReassignPapers,
@@ -934,19 +942,22 @@ export default function App() {
       }
 
       const now = new Date().toISOString();
-      const paperCollections = papers.map((paper) => ({
-        id: createId("paper_collection"),
-        paperId: paper.id,
-        collectionId: "collection_inbox",
-        createdAt: now,
-        updatedAt: now
-      }));
-
-      setLibrary((current) => ({
-        ...current,
-        papers: [...papers, ...current.papers],
-        paperCollections: [...paperCollections, ...current.paperCollections]
-      }));
+      setLibrary((current) => {
+        const membershipVersion = nextMembershipVersion(current);
+        const paperCollections = papers.map((paper) => ({
+          id: canonicalPaperCollectionId(paper.id, "collection_inbox"),
+          paperId: paper.id,
+          collectionId: "collection_inbox",
+          membershipVersion,
+          createdAt: now,
+          updatedAt: now
+        }));
+        return {
+          ...current,
+          papers: [...papers, ...current.papers],
+          paperCollections: [...paperCollections, ...current.paperCollections]
+        };
+      });
       setSelectedCollectionId("all");
       setSelectedAuthor(undefined);
       setSelectedTag(undefined);
@@ -988,9 +999,10 @@ export default function App() {
       papers: [paper, ...current.papers],
       paperCollections: [
         {
-          id: createId("paper_collection"),
+          id: canonicalPaperCollectionId(paper.id, "collection_inbox"),
           paperId: paper.id,
           collectionId: "collection_inbox",
+          membershipVersion: nextMembershipVersion(current),
           createdAt: now,
           updatedAt: now
         },
@@ -1126,14 +1138,10 @@ export default function App() {
 
     flushSync(() => {
       setLibrary((current) => {
-        const sourceCollection = current.collections.find((item) =>
-          item.id === selectedCollectionId && !item.deletedAt
-        );
         const nextLibrary = movePaperToCollection(
           current,
           paperId,
-          targetCollectionId,
-          sourceCollection?.id
+          targetCollectionId
         );
         moved = nextLibrary !== current;
         paperTitle = current.papers.find((item) => item.id === paperId)?.title ?? paperTitle;
@@ -1223,6 +1231,7 @@ export default function App() {
     const files = library.fileAssets.filter((item) => item.paperId === paperId);
     const annotations = library.annotations.filter((item) => item.paperId === paperId);
     const memberships = library.paperCollections.filter((item) => item.paperId === paperId);
+    const membershipResets = (library.paperCollectionResets ?? []).filter((item) => item.paperId === paperId);
     setLibrary((current) => permanentlyDeletePaperFromTrash(current, paperId));
     if (selectedPaperId === paperId) setSelectedPaperId(undefined);
     setFileDataById((current) => Object.fromEntries(
@@ -1241,7 +1250,8 @@ export default function App() {
       { entityType: "paper", id: paperId },
       ...files.map((file) => ({ entityType: "fileAsset" as const, id: file.id })),
       ...annotations.map((annotation) => ({ entityType: "annotation" as const, id: annotation.id })),
-      ...memberships.map((membership) => ({ entityType: "paperCollection" as const, id: membership.id }))
+      ...memberships.map((membership) => ({ entityType: "paperCollection" as const, id: membership.id })),
+      ...membershipResets.map((reset) => ({ entityType: "paperCollectionReset" as const, id: reset.id }))
     ]);
     setStatus(`Permanently deleted ${paper.title}.`);
   }
@@ -1275,6 +1285,8 @@ export default function App() {
     const files = library.fileAssets.filter((item) => trashedPapers.some((paper) => paper.id === item.paperId));
     const annotations = library.annotations.filter((item) => trashedPapers.some((paper) => paper.id === item.paperId));
     const memberships = library.paperCollections.filter((item) => trashedPapers.some((paper) => paper.id === item.paperId));
+    const membershipResets = (library.paperCollectionResets ?? [])
+      .filter((item) => trashedPapers.some((paper) => paper.id === item.paperId));
     const trashedPaperIds = new Set(trashedPapers.map((paper) => paper.id));
 
     const { state: nextState } = permanentlyDeleteAllFromTrash(library);
@@ -1299,7 +1311,8 @@ export default function App() {
       ...trashedPapers.map((paper) => ({ entityType: "paper" as const, id: paper.id })),
       ...files.map((file) => ({ entityType: "fileAsset" as const, id: file.id })),
       ...annotations.map((annotation) => ({ entityType: "annotation" as const, id: annotation.id })),
-      ...memberships.map((membership) => ({ entityType: "paperCollection" as const, id: membership.id }))
+      ...memberships.map((membership) => ({ entityType: "paperCollection" as const, id: membership.id })),
+      ...membershipResets.map((reset) => ({ entityType: "paperCollectionReset" as const, id: reset.id }))
     ]);
     setStatus(`Emptied Trash: permanently deleted ${trashedPapers.length} document${trashedPapers.length === 1 ? "" : "s"}.`);
   }

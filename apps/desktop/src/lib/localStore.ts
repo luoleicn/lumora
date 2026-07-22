@@ -1,12 +1,14 @@
-import type {
-  Annotation,
-  Collection,
-  FileAsset,
-  LibraryState,
-  Paper,
-  PaperCollection
+import {
+  canonicalPaperCollectionId,
+  type Annotation,
+  type Collection,
+  type FileAsset,
+  type LibraryState,
+  type Paper,
+  type PaperCollection
 } from "@lumora/shared";
 import { createId } from "./id";
+import { nextMembershipVersion } from "./membershipClock";
 
 const libraryKey = "lumora:library-state";
 const clientIdKey = "lumora:client-id";
@@ -114,9 +116,10 @@ export async function importPdfFile(
   };
 
   const paperCollection: PaperCollection = {
-    id: createId("paper_collection"),
+    id: canonicalPaperCollectionId(paperId, "collection_inbox"),
     paperId,
     collectionId: "collection_inbox",
+    membershipVersion: nextMembershipVersion(current),
     createdAt: now,
     updatedAt: now
   };

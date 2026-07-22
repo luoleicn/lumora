@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Collection, LibraryState, Paper } from "@lumora/shared";
+import type { Collection, LibraryState, Paper, PaperCollection } from "@lumora/shared";
 import {
   addPaperToCollection,
   deleteCollectionAndReassignPapers,
@@ -62,6 +62,12 @@ function state(): LibraryState {
   };
 }
 
+function membership(current: LibraryState, paperId: string, collectionId: string): PaperCollection | undefined {
+  return current.paperCollections.find((item) =>
+    item.paperId === paperId && item.collectionId === collectionId
+  );
+}
+
 describe("library actions", () => {
   it("returns every active folder assigned to the selected paper and all of their ancestors", () => {
     const current = state();
@@ -96,13 +102,15 @@ describe("library actions", () => {
   });
 
   it("permanently removes only a paper that is already in trash and its dependents", () => {
-    const trashed = deletePaperFromLibrary(state(), "paper-a", now);
+    const moved = movePaperToCollection(state(), "paper-a", "collection_inbox", now);
+    const trashed = deletePaperFromLibrary(moved, "paper-a", now);
     const next = permanentlyDeletePaperFromTrash(trashed, "paper-a");
 
     expect(next.papers.find((paper) => paper.id === "paper-a")).toBeUndefined();
     expect(next.fileAssets.some((file) => file.paperId === "paper-a")).toBe(false);
     expect(next.annotations.some((annotation) => annotation.paperId === "paper-a")).toBe(false);
     expect(next.paperCollections.some((membership) => membership.paperId === "paper-a")).toBe(false);
+    expect(next.paperCollectionResets?.some((reset) => reset.paperId === "paper-a")).toBe(false);
     const active = state();
     expect(permanentlyDeletePaperFromTrash(active, "paper-a")).toBe(active);
   });
@@ -151,46 +159,76 @@ describe("library actions", () => {
   });
 
   it("moves a paper from the current collection tree to another collection", () => {
-    const next = movePaperToCollection(state(), "paper-a", "collection_inbox", "folder-parent", now);
+    const next = movePaperToCollection(state(), "paper-a", "collection_inbox", now);
 
-    expect(next.paperCollections.find((item) => item.id === "pc-parent-a")?.deletedAt).toBe(now);
-    expect(next.paperCollections.find((item) => item.id === "pc-grandchild-a")?.deletedAt).toBe(now);
-    expect(next.paperCollections.find((item) => item.id === "pc-target-a")?.deletedAt).toBeUndefined();
+    expect(membership(next, "paper-a", "folder-parent")?.deletedAt).toBe(now);
+    expect(membership(next, "paper-a", "folder-grandchild")?.deletedAt).toBe(now);
+    expect(membership(next, "paper-a", "folder-target")?.deletedAt).toBe(now);
     expect(next.paperCollections.some((item) =>
       item.paperId === "paper-a" && item.collectionId === "collection_inbox" && !item.deletedAt
     )).toBe(true);
   });
 
-  it("files a paper from a virtual view without removing its other collection links", () => {
-    const next = movePaperToCollection(state(), "paper-b", "folder-target", undefined, now);
+  it("moves a paper from a virtual view without leaving its old collection active", () => {
+    const next = movePaperToCollection(state(), "paper-b", "folder-target", now);
 
-    expect(next.paperCollections.find((item) => item.id === "pc-child-b")?.deletedAt).toBeUndefined();
+    expect(membership(next, "paper-b", "folder-child")?.deletedAt).toBe(now);
     expect(next.paperCollections.some((item) =>
       item.paperId === "paper-b" && item.collectionId === "folder-target" && !item.deletedAt
     )).toBe(true);
   });
 
   it("keeps an existing target link while removing the source link", () => {
-    const next = movePaperToCollection(state(), "paper-a", "folder-target", "folder-parent", now);
+    const next = movePaperToCollection(state(), "paper-a", "folder-target", now);
 
-    expect(next.paperCollections.find((item) => item.id === "pc-parent-a")?.deletedAt).toBe(now);
-    expect(next.paperCollections.find((item) => item.id === "pc-grandchild-a")?.deletedAt).toBe(now);
-    expect(next.paperCollections.find((item) => item.id === "pc-target-a")?.deletedAt).toBeUndefined();
+    expect(membership(next, "paper-a", "folder-parent")?.deletedAt).toBe(now);
+    expect(membership(next, "paper-a", "folder-grandchild")?.deletedAt).toBe(now);
+    expect(membership(next, "paper-a", "folder-target")?.deletedAt).toBeUndefined();
     expect(next.paperCollections.filter((item) => !item.deletedAt && item.paperId === "paper-a" && item.collectionId === "folder-target")).toHaveLength(1);
   });
 
-  it("preserves a descendant target while removing the rest of the selected collection tree", () => {
-    const next = movePaperToCollection(state(), "paper-a", "folder-grandchild", "folder-parent", now);
+  it("preserves the target while removing every other collection link", () => {
+    const next = movePaperToCollection(state(), "paper-a", "folder-grandchild", now);
 
-    expect(next.paperCollections.find((item) => item.id === "pc-parent-a")?.deletedAt).toBe(now);
-    expect(next.paperCollections.find((item) => item.id === "pc-grandchild-a")?.deletedAt).toBeUndefined();
-    expect(next.paperCollections.find((item) => item.id === "pc-target-a")?.deletedAt).toBeUndefined();
+    expect(membership(next, "paper-a", "folder-parent")?.deletedAt).toBe(now);
+    expect(membership(next, "paper-a", "folder-grandchild")?.deletedAt).toBeUndefined();
+    expect(membership(next, "paper-a", "folder-target")?.deletedAt).toBe(now);
   });
 
-  it("ignores a move to the currently selected collection", () => {
+  it("records an exclusive move even when the target is the only active collection", () => {
     const current = state();
+    const onlyTarget = {
+      ...current,
+      paperCollections: current.paperCollections.filter((item) =>
+        item.paperId !== "paper-a" || item.collectionId === "folder-parent"
+      )
+    };
 
-    expect(movePaperToCollection(current, "paper-a", "folder-parent", "folder-parent", now)).toBe(current);
+    const next = movePaperToCollection(onlyTarget, "paper-a", "folder-parent", now);
+
+    expect(membership(next, "paper-a", "folder-parent")?.deletedAt).toBeUndefined();
+    expect(next.paperCollectionResets).toEqual([
+      expect.objectContaining({ paperId: "paper-a", targetCollectionId: "folder-parent" })
+    ]);
+  });
+
+  it("deduplicates equivalent target memberships created on different devices", () => {
+    const current = state();
+    const duplicate = {
+      id: "pc-target-duplicate",
+      paperId: "paper-a",
+      collectionId: "folder-target",
+      createdAt: now,
+      updatedAt: now
+    };
+    const withDuplicate = { ...current, paperCollections: [duplicate, ...current.paperCollections] };
+
+    const next = movePaperToCollection(withDuplicate, "paper-a", "folder-target", now);
+
+    expect(next.paperCollections.filter((item) =>
+      item.paperId === "paper-a" && item.collectionId === "folder-target" && !item.deletedAt
+    )).toHaveLength(1);
+    expect(membership(next, "paper-a", "folder-target")?.deletedAt).toBeUndefined();
   });
 
   it("deletes a child folder and moves its papers to the parent folder without duplicates", () => {
@@ -198,11 +236,11 @@ describe("library actions", () => {
 
     expect(next.collections.find((item) => item.id === "folder-child")?.deletedAt).toBe(now);
     expect(next.collections.find((item) => item.id === "folder-grandchild")?.parentId).toBe("folder-parent");
-    expect(next.paperCollections.find((item) => item.id === "pc-child-b")).toEqual(
+    expect(membership(next, "paper-b", "folder-parent")).toEqual(
       expect.objectContaining({ paperId: "paper-b", collectionId: "folder-parent" })
     );
-    expect(next.paperCollections.find((item) => item.id === "pc-child-b")?.deletedAt).toBeUndefined();
-    expect(next.paperCollections.find((item) => item.id === "pc-child-c")?.deletedAt).toBe(now);
+    expect(membership(next, "paper-b", "folder-parent")?.deletedAt).toBeUndefined();
+    expect(membership(next, "paper-c", "folder-child")?.deletedAt).toBe(now);
   });
 
   it("deletes a top-level folder and moves its papers to Unsorted", () => {
@@ -210,7 +248,7 @@ describe("library actions", () => {
 
     expect(next.collections.find((item) => item.id === "folder-parent")?.deletedAt).toBe(now);
     expect(next.collections.find((item) => item.id === "folder-child")?.parentId).toBeUndefined();
-    expect(next.paperCollections.find((item) => item.id === "pc-parent-a")?.deletedAt).toBe(now);
+    expect(membership(next, "paper-a", "folder-parent")?.deletedAt).toBe(now);
   });
 
   it("renames a folder and stamps updatedAt", () => {
@@ -320,24 +358,24 @@ describe("library actions", () => {
   it("moves a paper to the parent folder when removed from a child folder", () => {
     const next = removePaperFromCollectionTree(state(), "paper-b", "folder-child", now);
 
-    expect(next.paperCollections.find((item) => item.id === "pc-child-b")).toEqual(
+    expect(membership(next, "paper-b", "folder-parent")).toEqual(
       expect.objectContaining({ paperId: "paper-b", collectionId: "folder-parent", updatedAt: now })
     );
-    expect(next.paperCollections.find((item) => item.id === "pc-child-b")?.deletedAt).toBeUndefined();
+    expect(membership(next, "paper-b", "folder-parent")?.deletedAt).toBeUndefined();
   });
 
   it("removes duplicate child links when the paper already belongs to the parent folder", () => {
     const next = removePaperFromCollectionTree(state(), "paper-c", "folder-child", now);
 
-    expect(next.paperCollections.find((item) => item.id === "pc-child-c")?.deletedAt).toBe(now);
-    expect(next.paperCollections.find((item) => item.id === "pc-parent-c")?.deletedAt).toBeUndefined();
+    expect(membership(next, "paper-c", "folder-child")?.deletedAt).toBe(now);
+    expect(membership(next, "paper-c", "folder-parent")?.deletedAt).toBeUndefined();
   });
 
   it("removes a paper from a top-level folder and its descendants so it can become unsorted", () => {
     const next = removePaperFromCollectionTree(state(), "paper-a", "folder-parent", now);
 
-    expect(next.paperCollections.find((item) => item.id === "pc-parent-a")?.deletedAt).toBe(now);
-    expect(next.paperCollections.find((item) => item.id === "pc-grandchild-a")?.deletedAt).toBe(now);
-    expect(next.paperCollections.find((item) => item.id === "pc-target-a")?.deletedAt).toBeUndefined();
+    expect(membership(next, "paper-a", "folder-parent")?.deletedAt).toBe(now);
+    expect(membership(next, "paper-a", "folder-grandchild")?.deletedAt).toBe(now);
+    expect(membership(next, "paper-a", "folder-target")?.deletedAt).toBeUndefined();
   });
 });

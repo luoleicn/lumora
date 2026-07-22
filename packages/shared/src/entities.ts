@@ -5,6 +5,7 @@ export type SyncEntity =
   | "fileAsset"
   | "collection"
   | "paperCollection"
+  | "paperCollectionReset"
   | "annotation";
 
 export type SyncOperation = "upsert" | "delete";
@@ -134,9 +135,34 @@ export type PaperCollection = {
   paperId: EntityId;
   collectionId: EntityId;
   mendeleyId?: string;
+  membershipVersion?: MembershipVersion;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string;
+};
+
+export type MembershipVersion =
+  | {
+      kind: "legacy";
+      updatedAt: string;
+      deleted: boolean;
+      entityId: EntityId;
+    }
+  | {
+      kind: "hlc";
+      wallTimeMs: number;
+      counter: number;
+      nodeId: string;
+      operationId: string;
+    };
+
+export type PaperCollectionReset = {
+  id: EntityId;
+  paperId: EntityId;
+  targetCollectionId: EntityId;
+  membershipVersion: MembershipVersion;
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type NormalizedRect = {
@@ -185,6 +211,7 @@ export type EntityPayloadMap = {
   fileAsset: FileAsset;
   collection: Collection;
   paperCollection: PaperCollection;
+  paperCollectionReset: PaperCollectionReset;
   annotation: Annotation;
 };
 
@@ -193,6 +220,8 @@ export type LibraryState = {
   fileAssets: FileAsset[];
   collections: Collection[];
   paperCollections: PaperCollection[];
+  /** Move barriers; optional only while legacy states are upgraded. */
+  paperCollectionResets?: PaperCollectionReset[];
   annotations: Annotation[];
   /** @deprecated The object-storage protocol keeps a vector cursor in native SQLite. */
   lastSyncCursor?: number;
@@ -203,4 +232,5 @@ export type LibraryEntity =
   | FileAsset
   | Collection
   | PaperCollection
+  | PaperCollectionReset
   | Annotation;

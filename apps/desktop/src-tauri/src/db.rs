@@ -2,7 +2,7 @@
 // schema, the JSON-document entity table with its local_seq dirty markers,
 // and the shared meta key/value helpers the other modules build on.
 
-use std::path::{Path, PathBuf};
+use std::{collections::HashSet, path::{Path, PathBuf}};
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Manager, Runtime};
@@ -14,7 +14,14 @@ const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 // caller opens an extra connection instead of waiting on the pool.
 const MAX_IDLE_CONNECTIONS: usize = 4;
 
-const LIBRARY_ENTITY_TYPES: [&str; 5] = ["paper", "fileAsset", "collection", "paperCollection", "annotation"];
+const LIBRARY_ENTITY_TYPES: [&str; 6] = [
+    "paper",
+    "fileAsset",
+    "collection",
+    "paperCollection",
+    "paperCollectionReset",
+    "annotation",
+];
 
 struct LibraryPool {
     /// Set once the schema is initialized; the pool only recycles connections
@@ -235,6 +242,7 @@ pub(crate) async fn db_upsert_entities(app: AppHandle, changes: Vec<EntityUpsert
         };
 
         {
+            let mut affected_membership_papers = HashSet::new();
             let mut upsert = transaction
                 .prepare_cached(
                     "INSERT INTO entities (entity_type, id, data, updated_at, deleted_at, local_seq)
@@ -252,13 +260,29 @@ pub(crate) async fn db_upsert_entities(app: AppHandle, changes: Vec<EntityUpsert
                     return Err(format!("Unknown entity type: {}", change.entity_type));
                 }
 
+                let (id, data, updated_at, deleted_at) = if change.entity_type == "paperCollection"
+                    || change.entity_type == "paperCollectionReset"
+                {
+                    let value: serde_json::Value = serde_json::from_str(&change.data).map_err(|error| error.to_string())?;
+                    let (id, normalized) = crate::cloud_sync::normalize_membership_entity(&change.entity_type, &value)?;
+                    if let Some(paper_id) = normalized.get("paperId").and_then(serde_json::Value::as_str) {
+                        affected_membership_papers.insert(paper_id.to_string());
+                    }
+                    let updated_at = normalized.get("updatedAt").and_then(serde_json::Value::as_str)
+                        .unwrap_or(&change.updated_at).to_string();
+                    let deleted_at = normalized.get("deletedAt").and_then(serde_json::Value::as_str).map(str::to_string);
+                    (id, serde_json::to_string(&normalized).map_err(|error| error.to_string())?, updated_at, deleted_at)
+                } else {
+                    (change.id.clone(), change.data.clone(), change.updated_at.clone(), change.deleted_at.clone())
+                };
+
                 upsert
                     .execute(rusqlite::params![
                         change.entity_type,
-                        change.id,
-                        change.data,
-                        change.updated_at,
-                        change.deleted_at,
+                        id,
+                        data,
+                        updated_at,
+                        deleted_at,
                         next_seq
                     ])
                     .map_err(|error| error.to_string())?;
@@ -267,15 +291,19 @@ pub(crate) async fn db_upsert_entities(app: AppHandle, changes: Vec<EntityUpsert
                 if let Err(error) = crate::search::sync_search_index_for_change(
                     &transaction,
                     &change.entity_type,
-                    &change.id,
-                    &change.data,
-                    change.deleted_at.as_deref(),
+                    &id,
+                    &data,
+                    deleted_at.as_deref(),
                 ) {
                     eprintln!(
                         "Search index update failed for {} {}: {error}",
-                        change.entity_type, change.id
+                        change.entity_type, id
                     );
                 }
+            }
+            drop(upsert);
+            for paper_id in affected_membership_papers {
+                crate::cloud_sync::reconcile_paper_memberships(&transaction, &paper_id)?;
             }
         }
 

@@ -14,6 +14,7 @@ const entityCollections: Array<{ entityType: SyncEntity; key: keyof LibraryState
   { entityType: "fileAsset", key: "fileAssets" },
   { entityType: "collection", key: "collections" },
   { entityType: "paperCollection", key: "paperCollections" },
+  { entityType: "paperCollectionReset", key: "paperCollectionResets" },
   { entityType: "annotation", key: "annotations" }
 ];
 
@@ -27,8 +28,8 @@ export function diffLibraryStates(previous: LibraryState, next: LibraryState): E
   const changes: EntityChange[] = [];
 
   for (const { entityType, key } of entityCollections) {
-    const previousItems = previous[key] as LibraryEntity[];
-    const nextItems = next[key] as LibraryEntity[];
+    const previousItems = (previous[key] as LibraryEntity[] | undefined) ?? [];
+    const nextItems = (next[key] as LibraryEntity[] | undefined) ?? [];
     if (previousItems === nextItems) {
       continue;
     }
@@ -36,6 +37,46 @@ export function diffLibraryStates(previous: LibraryState, next: LibraryState): E
     const previousById = new Map(previousItems.map((item) => [item.id, item]));
     for (const item of nextItems) {
       if (previousById.get(item.id) !== item) {
+        changes.push({ entityType, entity: item });
+      }
+    }
+  }
+
+  return changes;
+}
+
+function entityValuesEqual(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((item, index) => entityValuesEqual(item, right[index]));
+  }
+  if (!left || !right || typeof left !== "object" || typeof right !== "object") return false;
+
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord).filter((key) => leftRecord[key] !== undefined);
+  const rightKeys = Object.keys(rightRecord).filter((key) => rightRecord[key] !== undefined);
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key) => Object.prototype.hasOwnProperty.call(rightRecord, key)
+      && entityValuesEqual(leftRecord[key], rightRecord[key]));
+}
+
+// The normal React-store path can use object identity because immutable edits
+// preserve references. A sync integrity check compares a freshly parsed DB
+// snapshot with the in-memory state, so it must compare entity values instead.
+export function diffLibraryStateValues(persisted: LibraryState, inMemory: LibraryState): EntityChange[] {
+  const changes: EntityChange[] = [];
+
+  for (const { entityType, key } of entityCollections) {
+    const persistedItems = (persisted[key] as LibraryEntity[] | undefined) ?? [];
+    const inMemoryItems = (inMemory[key] as LibraryEntity[] | undefined) ?? [];
+    const persistedById = new Map(persistedItems.map((item) => [item.id, item]));
+    for (const item of inMemoryItems) {
+      const stored = persistedById.get(item.id);
+      if (!stored || !entityValuesEqual(stored, item)) {
         changes.push({ entityType, entity: item });
       }
     }
@@ -100,6 +141,7 @@ export async function loadLibraryFromDb(): Promise<{ state: LibraryState; empty:
     fileAssets: pick("fileAsset", base.fileAssets),
     collections: pick("collection", base.collections),
     paperCollections: pick("paperCollection", base.paperCollections),
+    paperCollectionResets: pick("paperCollectionReset", []),
     annotations: pick("annotation", base.annotations)
   };
 
@@ -114,7 +156,7 @@ export async function loadLibraryFromDb(): Promise<{ state: LibraryState; empty:
 export async function importStateToDb(state: LibraryState): Promise<void> {
   const changes: EntityChange[] = [];
   for (const { entityType, key } of entityCollections) {
-    for (const entity of state[key] as LibraryEntity[]) {
+    for (const entity of (state[key] as LibraryEntity[] | undefined) ?? []) {
       changes.push({ entityType, entity });
     }
   }
@@ -123,6 +165,22 @@ export async function importStateToDb(state: LibraryState): Promise<void> {
   if (state.lastSyncCursor !== undefined) {
     await persistSyncCursor(state.lastSyncCursor);
   }
+}
+
+/**
+ * Makes the state currently shown by the UI authoritative before native cloud
+ * sync scans SQLite. The regular debounced queue should already keep both in
+ * lockstep; the value comparison is an integrity boundary for interrupted or
+ * incorrectly-baselined writes, and only marks genuinely divergent rows dirty.
+ */
+export async function persistLibraryStateSnapshot(state: LibraryState): Promise<void> {
+  await flushLibraryPersist();
+  const persisted = await loadLibraryFromDb();
+  if (persisted.empty) {
+    await importStateToDb(state);
+    return;
+  }
+  await persistEntities(diffLibraryStateValues(persisted.state, state), "local");
 }
 
 // Serializes writes so rapid successive state changes land in order. On top of

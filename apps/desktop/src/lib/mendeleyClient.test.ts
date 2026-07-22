@@ -315,6 +315,42 @@ describe("syncWithMendeley", () => {
     expect(result.state.paperCollections[0].deletedAt).toBeDefined();
   });
 
+  it("keeps a pending local membership removal and pushes it to Mendeley", async () => {
+    const cursor = "2026-07-01T00:00:00.000Z";
+    invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "db_get_meta") return cursor;
+      if (command === "db_set_meta") return undefined;
+      if (command !== "mendeley_request") throw new Error(`Unexpected command: ${command}`);
+      const path = String(args?.path);
+      if (path === "/folders?limit=500") {
+        return { status: 200, body: JSON.stringify([{ id: "mf-1", name: "Research", modified: "2026-07-05T00:00:00.000Z" }]) };
+      }
+      if (path === "/folders/mf-1/documents?limit=500") {
+        // The server still has the relation that was removed locally.
+        return { status: 200, body: JSON.stringify([{ id: "md-1" }]) };
+      }
+      return { status: 200, body: "[]" };
+    });
+
+    const result = await syncWithMendeley({
+      papers: [{ id: "p1", title: "T", authors: [], mendeleyId: "md-1", createdAt: now, updatedAt: "2026-06-01T00:00:00.000Z" }],
+      fileAssets: [],
+      collections: [{ id: "col-1", name: "Research", mendeleyId: "mf-1", sortOrder: 0, createdAt: now, updatedAt: "2026-06-01T00:00:00.000Z" }],
+      paperCollections: [{
+        id: "rel-1", paperId: "p1", collectionId: "col-1", mendeleyId: "mendeley_relation_mf-1_md-1",
+        createdAt: now, updatedAt: "2026-07-03T00:00:00.000Z", deletedAt: "2026-07-03T00:00:00.000Z"
+      }],
+      annotations: []
+    }, { clientId: "id", clientSecret: "secret" }, { nameTemplate: "{title}-{year}-{author}" });
+
+    expect(result.state.paperCollections[0].deletedAt).toBe("2026-07-03T00:00:00.000Z");
+    expect(invokeMock.mock.calls.some(([command, args]) =>
+      command === "mendeley_request"
+      && args?.method === "DELETE"
+      && args?.path === "/folders/mf-1/documents/md-1"
+    )).toBe(true);
+  });
+
   it("does not POST folder membership that was just pulled from Mendeley", async () => {
     invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
       if (command === "db_get_meta") return null;

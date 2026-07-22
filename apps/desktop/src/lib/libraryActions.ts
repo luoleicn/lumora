@@ -1,5 +1,14 @@
-import type { Collection, EntityId, LibraryState, PaperCollection } from "@lumora/shared";
-import { createId } from "./id";
+import {
+  canonicalPaperCollectionId,
+  canonicalPaperCollectionResetId,
+  reconcilePaperCollections,
+  type Collection,
+  type EntityId,
+  type LibraryState,
+  type PaperCollection,
+  type PaperCollectionReset
+} from "@lumora/shared";
+import { nextMembershipVersion } from "./membershipClock";
 
 export type CollectionOption = {
   id: EntityId;
@@ -113,76 +122,88 @@ export function addPaperToCollection(state: LibraryState, paperId: EntityId, col
     return state;
   }
 
+  const membershipVersion = nextMembershipVersion(state);
   const paperCollection: PaperCollection = {
-    id: createId("paper_collection"),
+    id: canonicalPaperCollectionId(paperId, collectionId),
     paperId,
     collectionId,
+    membershipVersion,
     createdAt: now,
     updatedAt: now
   };
 
   return {
     ...state,
-    paperCollections: [paperCollection, ...state.paperCollections]
+    paperCollections: reconcilePaperCollections(
+      [paperCollection, ...state.paperCollections],
+      state.paperCollectionResets ?? []
+    )
   };
 }
 
 /**
- * Moves a paper out of the currently viewed real collection tree and into a
- * target collection. Virtual views pass no source collection, preserving any
- * other organization links and making the action equivalent to filing an
- * unfiled/all-documents result.
+ * Moves a paper to exactly one target collection. This is deliberately
+ * independent of the currently selected view: the context-menu action says
+ * "Move", so invoking it from All Documents or search must not silently turn
+ * into "Add" and leave old memberships active. Drag-and-drop uses
+ * addPaperToCollection when multi-collection filing is intended.
+ *
+ * Equivalent memberships can be created independently on different devices.
+ * Keep one deterministic target link and tombstone every other active link so
+ * the move also repairs those cross-device duplicates.
  */
 export function movePaperToCollection(
   state: LibraryState,
   paperId: EntityId,
   targetCollectionId: EntityId,
-  sourceCollectionId?: EntityId,
   now = new Date().toISOString()
 ) {
   const paper = state.papers.find((item) => item.id === paperId && !item.deletedAt);
   const target = state.collections.find((item) => item.id === targetCollectionId && !item.deletedAt);
-  const source = sourceCollectionId
-    ? state.collections.find((item) => item.id === sourceCollectionId && !item.deletedAt)
-    : undefined;
-  if (!paper || !target || source?.id === target.id) {
+  if (!paper || !target) {
     return state;
   }
 
-  const sourceCollectionIds = source
-    ? getCollectionAndDescendantIds(state.collections, source.id)
-    : new Set<EntityId>();
-  const removableLinkIds = new Set(state.paperCollections
-    .filter((item) =>
-      !item.deletedAt
-      && item.paperId === paperId
-      && item.collectionId !== target.id
-      && sourceCollectionIds.has(item.collectionId)
-    )
+  const membershipVersion = nextMembershipVersion(state);
+  const activeLinks = state.paperCollections.filter((item) => !item.deletedAt && item.paperId === paperId);
+  const targetLink = activeLinks
+    .filter((item) => item.collectionId === target.id)
+    .sort((a, b) => Number(Boolean(b.mendeleyId)) - Number(Boolean(a.mendeleyId)) || a.id.localeCompare(b.id))[0];
+  const removableLinkIds = new Set(activeLinks
+    .filter((item) => item.collectionId !== target.id)
     .map((item) => item.id));
-  const targetLinkExists = state.paperCollections.some((item) =>
-    !item.deletedAt && item.paperId === paperId && item.collectionId === target.id
+
+  let paperCollections = state.paperCollections.map((item) =>
+    removableLinkIds.has(item.id)
+      ? { ...item, membershipVersion, deletedAt: now, updatedAt: now }
+      : item
   );
-
-  if (removableLinkIds.size === 0 && targetLinkExists) {
-    return state;
-  }
-
-  const paperCollections = state.paperCollections.map((item) =>
-    removableLinkIds.has(item.id) ? { ...item, deletedAt: now, updatedAt: now } : item
-  );
-  if (targetLinkExists) {
-    return { ...state, paperCollections };
-  }
-
-  const targetLink: PaperCollection = {
-    id: createId("paper_collection"),
+  const newTargetLink: PaperCollection = {
+    ...(targetLink ?? {} as PaperCollection),
+    id: canonicalPaperCollectionId(paperId, target.id),
     paperId,
     collectionId: target.id,
-    createdAt: now,
+    membershipVersion,
+    createdAt: targetLink?.createdAt ?? now,
+    deletedAt: undefined,
     updatedAt: now
   };
-  return { ...state, paperCollections: [targetLink, ...paperCollections] };
+  paperCollections = [newTargetLink, ...paperCollections.filter((item) => !(
+    item.paperId === paperId && item.collectionId === target.id
+  ))];
+  const reset: PaperCollectionReset = {
+    id: canonicalPaperCollectionResetId(paperId),
+    paperId,
+    targetCollectionId: target.id,
+    membershipVersion,
+    createdAt: state.paperCollectionResets?.find((item) => item.paperId === paperId)?.createdAt ?? now,
+    updatedAt: now
+  };
+  return {
+    ...state,
+    paperCollections: reconcilePaperCollections(paperCollections, [reset, ...(state.paperCollectionResets ?? [])]),
+    paperCollectionResets: [reset, ...(state.paperCollectionResets ?? []).filter((item) => item.paperId !== paperId)]
+  };
 }
 
 export function deletePaperFromLibrary(state: LibraryState, paperId: EntityId, now = new Date().toISOString()) {
@@ -191,6 +212,7 @@ export function deletePaperFromLibrary(state: LibraryState, paperId: EntityId, n
     return state;
   }
 
+  const membershipVersion = nextMembershipVersion(state);
   return {
     ...state,
     papers: state.papers.map((item) =>
@@ -200,7 +222,9 @@ export function deletePaperFromLibrary(state: LibraryState, paperId: EntityId, n
       item.paperId === paperId && !item.deletedAt ? { ...item, deletedAt: now, updatedAt: now } : item
     ),
     paperCollections: state.paperCollections.map((item) =>
-      item.paperId === paperId && !item.deletedAt ? { ...item, deletedAt: now, updatedAt: now } : item
+      item.paperId === paperId && !item.deletedAt
+        ? { ...item, membershipVersion, deletedAt: now, updatedAt: now }
+        : item
     ),
     annotations: state.annotations.map((item) =>
       item.paperId === paperId && !item.deletedAt ? { ...item, deletedAt: now, updatedAt: now } : item
@@ -245,6 +269,7 @@ export function permanentlyDeletePaperFromTrash(state: LibraryState, paperId: En
     papers: state.papers.filter((item) => item.id !== paperId),
     fileAssets: state.fileAssets.filter((item) => item.paperId !== paperId),
     paperCollections: state.paperCollections.filter((item) => item.paperId !== paperId),
+    paperCollectionResets: (state.paperCollectionResets ?? []).filter((item) => item.paperId !== paperId),
     annotations: state.annotations.filter((item) => item.paperId !== paperId)
   };
 }
@@ -267,6 +292,7 @@ export function permanentlyDeleteAllFromTrash(state: LibraryState): { state: Lib
       papers: state.papers.filter((item) => !trashedPaperIds.has(item.id)),
       fileAssets: state.fileAssets.filter((item) => !trashedPaperIds.has(item.paperId)),
       paperCollections: state.paperCollections.filter((item) => !trashedPaperIds.has(item.paperId)),
+      paperCollectionResets: (state.paperCollectionResets ?? []).filter((item) => !trashedPaperIds.has(item.paperId)),
       annotations: state.annotations.filter((item) => !trashedPaperIds.has(item.paperId))
     },
     removedPaperIds: [...trashedPaperIds]
@@ -293,29 +319,32 @@ export function removePaperFromCollectionTree(
     return state;
   }
 
+  const membershipVersion = nextMembershipVersion(state);
   const removableLinkIds = new Set(removableLinks.map((item) => item.id));
   const parentId = collection.parentId;
   const parentLink = parentId
     ? state.paperCollections.find((item) => !item.deletedAt && item.paperId === paperId && item.collectionId === parentId)
     : undefined;
   const moveTargetCollectionId = parentId && !parentLink ? parentId : undefined;
-  const linkToMove = moveTargetCollectionId
-    ? removableLinks.find((item) => item.collectionId === collectionId) ?? removableLinks[0]
-    : undefined;
+  let paperCollections = state.paperCollections.map((item) => removableLinkIds.has(item.id)
+    ? { ...item, membershipVersion, deletedAt: now, updatedAt: now }
+    : item);
+  if (moveTargetCollectionId) {
+    paperCollections = [{
+      id: canonicalPaperCollectionId(paperId, moveTargetCollectionId),
+      paperId,
+      collectionId: moveTargetCollectionId,
+      membershipVersion,
+      createdAt: now,
+      updatedAt: now
+    }, ...paperCollections.filter((item) => !(
+      item.paperId === paperId && item.collectionId === moveTargetCollectionId
+    ))];
+  }
 
   return {
     ...state,
-    paperCollections: state.paperCollections.map((item) => {
-      if (!removableLinkIds.has(item.id)) {
-        return item;
-      }
-
-      if (linkToMove && moveTargetCollectionId && item.id === linkToMove.id) {
-        return { ...item, collectionId: moveTargetCollectionId, updatedAt: now };
-      }
-
-      return { ...item, deletedAt: now, updatedAt: now };
-    })
+    paperCollections: reconcilePaperCollections(paperCollections, state.paperCollectionResets ?? [])
   };
 }
 
@@ -351,6 +380,27 @@ export function deleteCollectionAndReassignPapers(state: LibraryState, collectio
       : []
   );
 
+  const membershipVersion = nextMembershipVersion(state);
+  let paperCollections = state.paperCollections.map((paperCollection) => {
+    if (paperCollection.deletedAt || paperCollection.collectionId !== target.id) return paperCollection;
+    return { ...paperCollection, membershipVersion, deletedAt: now, updatedAt: now };
+  });
+  if (parentId) {
+    const reassignedPaperIds = new Set(state.paperCollections
+      .filter((item) => !item.deletedAt && item.collectionId === target.id && !activeParentPaperIds.has(item.paperId))
+      .map((item) => item.paperId));
+    for (const paperId of reassignedPaperIds) {
+      paperCollections = [{
+        id: canonicalPaperCollectionId(paperId, parentId),
+        paperId,
+        collectionId: parentId,
+        membershipVersion,
+        createdAt: now,
+        updatedAt: now
+      }, ...paperCollections.filter((item) => !(item.paperId === paperId && item.collectionId === parentId))];
+    }
+  }
+
   return {
     ...state,
     collections: state.collections.map((collection) => {
@@ -364,17 +414,6 @@ export function deleteCollectionAndReassignPapers(state: LibraryState, collectio
 
       return collection;
     }),
-    paperCollections: state.paperCollections.map((paperCollection) => {
-      if (paperCollection.deletedAt || paperCollection.collectionId !== target.id) {
-        return paperCollection;
-      }
-
-      if (!parentId || activeParentPaperIds.has(paperCollection.paperId)) {
-        return { ...paperCollection, deletedAt: now, updatedAt: now };
-      }
-
-      activeParentPaperIds.add(paperCollection.paperId);
-      return { ...paperCollection, collectionId: parentId, updatedAt: now };
-    })
+    paperCollections: reconcilePaperCollections(paperCollections, state.paperCollectionResets ?? [])
   };
 }
