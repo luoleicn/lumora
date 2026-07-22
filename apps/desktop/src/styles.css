@@ -2921,6 +2921,12 @@ button:disabled {
   font-size: 12px;
 }
 
+.about-modal-build-time {
+  margin: 0;
+  color: #91a0ad;
+  font-size: 11px;
+}
+
 .about-modal-origin {
   margin-top: 20px;
   border-top: 1px solid #dce3ea;

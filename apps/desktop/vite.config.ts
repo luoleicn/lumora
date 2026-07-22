@@ -3,6 +3,9 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   plugins: [react()],
+  define: {
+    __LUMORA_BUILD_TIME__: JSON.stringify(new Date().toISOString())
+  },
   clearScreen: false,
   server: {
     host: "127.0.0.1",
