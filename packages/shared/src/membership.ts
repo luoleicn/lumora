@@ -83,11 +83,17 @@ export function reconcilePaperCollections(
     const version = membershipVersionOf(membership);
     const reset = resetByPaper.get(membership.paperId);
     const survives = membershipSurvivesReset({ ...membership, membershipVersion: version }, reset);
-    return {
-      ...membership,
-      id,
-      membershipVersion: survives || membership.deletedAt ? version : reset?.membershipVersion ?? version,
-      deletedAt: survives ? undefined : membership.deletedAt ?? reset?.updatedAt
-    };
+    const nextVersion = survives || membership.deletedAt ? version : reset?.membershipVersion ?? version;
+    const nextDeletedAt = survives ? undefined : membership.deletedAt ?? reset?.updatedAt;
+    // Identity-preserving: a membership that reconciliation leaves unchanged is
+    // returned as the same object. Callers reconcile the whole list on every
+    // merge, and the persistence layer diffs by reference — fresh objects here
+    // would re-mark (and re-upload) the entire membership table each time.
+    if (membership.id === id
+      && membership.membershipVersion === nextVersion
+      && membership.deletedAt === nextDeletedAt) {
+      return membership;
+    }
+    return { ...membership, id, membershipVersion: nextVersion, deletedAt: nextDeletedAt };
   });
 }

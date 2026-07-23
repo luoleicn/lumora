@@ -79,6 +79,34 @@ describe("paper collection membership reconciliation", () => {
     expect(result.find((item) => item.collectionId === "collection-b")?.deletedAt).toBeUndefined();
   });
 
+  it("returns the identical object for a membership reconciliation does not change", () => {
+    const canonical = {
+      ...membership("collection-a", hlc(10, "add")),
+      id: canonicalPaperCollectionId("paper-a", "collection-a")
+    };
+    const tombstone = {
+      ...membership("collection-b", hlc(20, "remove")),
+      id: canonicalPaperCollectionId("paper-a", "collection-b"),
+      deletedAt: moveTime
+    };
+
+    const result = reconcilePaperCollections([canonical, tombstone], []);
+
+    // Reference equality is the contract: the persistence layer diffs by
+    // reference, so an unchanged membership must not become a fresh object.
+    expect(result.find((item) => item.collectionId === "collection-a")).toBe(canonical);
+    expect(result.find((item) => item.collectionId === "collection-b")).toBe(tombstone);
+  });
+
+  it("still rewrites memberships whose canonical id or reset state changes", () => {
+    const legacyId = membership("collection-a", hlc(10, "add"));
+
+    const result = reconcilePaperCollections([legacyId], []);
+
+    expect(result[0]).not.toBe(legacyId);
+    expect(result[0].id).toBe(canonicalPaperCollectionId("paper-a", "collection-a"));
+  });
+
   it("allows an explicit add made after a move reset", () => {
     const reset: PaperCollectionReset = {
       id: "paper_collection_reset:7:paper-a",
