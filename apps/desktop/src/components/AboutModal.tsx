@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { X } from "lucide-react";
 import { getVersion } from "@tauri-apps/api/app";
 import lumoraLogoUrl from "../assets/lumora-logo-64.png";
-import { buildTime, formatBuildTime } from "../buildInfo";
+import { buildTime, formatBuildTime, gitCommit } from "../buildInfo";
 
 type AboutModalProps = {
   open: boolean;
@@ -56,7 +56,7 @@ export function AboutModal({ open, onClose }: AboutModalProps) {
           <h2>lumora</h2>
           <p className="about-modal-slogan">lumora — light up your literature.</p>
           {version && <p className="about-modal-version">Version {version}</p>}
-          <p className="about-modal-build-time">Built {formatBuildTime(buildTime)}</p>
+          <p className="about-modal-build-time">Built {formatBuildTime(buildTime)} · {gitCommit}</p>
 
           <div className="about-modal-origin">
             <h3>Where the name comes from</h3>

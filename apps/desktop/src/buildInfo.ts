@@ -1,4 +1,5 @@
 export const buildTime = __LUMORA_BUILD_TIME__;
+export const gitCommit = __LUMORA_GIT_COMMIT__;
 
 export function formatBuildTime(value: string, timezoneOffsetMinutes?: number): string {
   const date = new Date(value);
