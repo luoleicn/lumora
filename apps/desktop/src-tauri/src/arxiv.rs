@@ -1,5 +1,6 @@
-// arXiv integration: title search over the Atom API, version-pinned PDF
-// downloads with progress events, and the feed/text parsing helpers.
+// arXiv integration: title search and id lookup over the Atom API,
+// version-pinned PDF downloads with progress events, and the feed/text parsing
+// helpers.
 
 use tauri::AppHandle;
 
@@ -71,6 +72,44 @@ pub(crate) async fn search_arxiv_by_title(app: AppHandle, title: String) -> Resu
     Ok(results)
 }
 
+// Metadata lookup for a known id. The title search above can only find papers
+// by name; adding a paper straight from its id needs the id_list endpoint.
+#[tauri::command]
+pub(crate) async fn fetch_arxiv_by_id(app: AppHandle, arxiv_id: String) -> Result<Option<ArxivMetadata>, String> {
+    let arxiv_id = validate_arxiv_id(&arxiv_id)?;
+
+    let mut url = reqwest::Url::parse("https://export.arxiv.org/api/query")
+        .map_err(|error| error.to_string())?;
+    url.query_pairs_mut()
+        .append_pair("id_list", &arxiv_id)
+        .append_pair("start", "0")
+        .append_pair("max_results", "1");
+
+    let response = crate::proxy::network_client(&app)?
+        .get(url)
+        .header("accept", "application/atom+xml")
+        .send()
+        .await
+        .map_err(|error| format!("arXiv request failed: {error}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!("arXiv lookup failed for {arxiv_id} ({})", response.status()));
+    }
+
+    let xml = response
+        .text()
+        .await
+        .map_err(|error| format!("Failed to read arXiv response: {error}"))?;
+
+    // No query title to score against here; `score` stays 0.0 and is unused on
+    // this path (only the title-search popover ranks by it). An unknown id comes
+    // back as an empty feed, and the id check drops arXiv's `Error` entry shape
+    // so a failed lookup can never turn into a paper titled "Error".
+    Ok(parse_arxiv_feed(&xml, "")
+        .into_iter()
+        .find(|entry| arxiv_id_base(&entry.arxiv_id) == arxiv_id_base(&arxiv_id)))
+}
+
 #[tauri::command]
 pub(crate) async fn download_arxiv_pdf(
     app: AppHandle,
@@ -93,13 +132,7 @@ async fn download_arxiv_pdf_impl(
     arxiv_id: String,
     on_progress: Option<&tauri::ipc::Channel<ArxivDownloadEvent>>,
 ) -> Result<tauri::ipc::Response, String> {
-    let arxiv_id = arxiv_id.trim();
-    let modern = regex::Regex::new(r"^\d{4}\.\d{4,5}(v\d+)?$").map_err(|error| error.to_string())?;
-    let legacy = regex::Regex::new(r"^[A-Za-z-]+(?:\.[A-Za-z-]+)?/\d{7}(v\d+)?$")
-        .map_err(|error| error.to_string())?;
-    if !modern.is_match(arxiv_id) && !legacy.is_match(arxiv_id) {
-        return Err(format!("Invalid arXiv identifier: {arxiv_id}"));
-    }
+    let arxiv_id = validate_arxiv_id(&arxiv_id)?;
 
     let url = format!("https://arxiv.org/pdf/{arxiv_id}");
     let mut response = crate::proxy::network_client(&app)?
@@ -254,6 +287,30 @@ fn decode_xml_entities(value: &str) -> String {
         .replace("&apos;", "'")
 }
 
+// Drops the version suffix so a request for 1706.03762 matches the 1706.03762v7
+// entry arXiv answers with.
+fn arxiv_id_base(value: &str) -> &str {
+    match value.rfind('v') {
+        Some(index) if value[index + 1..].chars().all(|char| char.is_ascii_digit())
+            && index + 1 < value.len() => &value[..index],
+        _ => value
+    }
+}
+
+// Rejects anything that is not a modern (2301.12345v2) or legacy (cs/0112017v3)
+// arXiv identifier, so a typo fails before any network round trip.
+fn validate_arxiv_id(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    let modern = regex::Regex::new(r"^\d{4}\.\d{4,5}(v\d+)?$").map_err(|error| error.to_string())?;
+    let legacy = regex::Regex::new(r"^[A-Za-z-]+(?:\.[A-Za-z-]+)?/\d{7}(v\d+)?$")
+        .map_err(|error| error.to_string())?;
+    if !modern.is_match(trimmed) && !legacy.is_match(trimmed) {
+        return Err(format!("Invalid arXiv identifier: {trimmed}"));
+    }
+
+    Ok(trimmed.to_string())
+}
+
 // Keeps the version suffix (2301.12345v2): the versioned id links to the exact
 // revision the metadata describes, and the PDF-extraction path keeps it too.
 fn normalize_arxiv_id(value: &str) -> String {
@@ -296,7 +353,7 @@ fn tokenize(value: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_arxiv_id;
+    use super::{arxiv_id_base, normalize_arxiv_id, parse_arxiv_feed, validate_arxiv_id};
 
     #[test]
     fn keeps_version_suffix_on_modern_ids() {
@@ -313,5 +370,86 @@ mod tests {
     fn handles_unversioned_ids_and_url_noise() {
         assert_eq!(normalize_arxiv_id("http://arxiv.org/abs/2301.12345"), "2301.12345");
         assert_eq!(normalize_arxiv_id("https://arxiv.org/abs/2301.12345v2?context=cs"), "2301.12345v2");
+    }
+
+    #[test]
+    fn accepts_modern_and_legacy_identifiers() {
+        assert_eq!(validate_arxiv_id("1706.03762").unwrap(), "1706.03762");
+        assert_eq!(validate_arxiv_id(" 2301.12345v2 ").unwrap(), "2301.12345v2");
+        assert_eq!(validate_arxiv_id("cs/0112017").unwrap(), "cs/0112017");
+        assert_eq!(validate_arxiv_id("cond-mat.stat-mech/0112017v3").unwrap(), "cond-mat.stat-mech/0112017v3");
+    }
+
+    #[test]
+    fn rejects_malformed_identifiers() {
+        for value in ["", "not-an-id", "1706", "1706.0", "https://arxiv.org/abs/1706.03762", "cs/011201"] {
+            assert!(validate_arxiv_id(value).is_err(), "expected {value} to be rejected");
+        }
+    }
+
+    #[test]
+    fn parses_an_id_list_entry() {
+        let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom">
+          <entry>
+            <id>http://arxiv.org/abs/1706.03762v7</id>
+            <published>2017-06-12T18:44:11Z</published>
+            <updated>2023-08-02T00:41:18Z</updated>
+            <title>Attention Is All You Need</title>
+            <summary>The dominant sequence transduction models are based on
+            complex recurrent networks.</summary>
+            <author><name>Ashish Vaswani</name></author>
+            <author><name>Noam Shazeer</name></author>
+            <arxiv:doi>10.48550/arXiv.1706.03762</arxiv:doi>
+            <category term="cs.CL" scheme="http://arxiv.org/schemas/atom"/>
+            <category term="cs.LG" scheme="http://arxiv.org/schemas/atom"/>
+          </entry>
+        </feed>"#;
+
+        let results = parse_arxiv_feed(xml, "");
+        assert_eq!(results.len(), 1);
+        let entry = &results[0];
+        assert_eq!(entry.arxiv_id, "1706.03762v7");
+        assert_eq!(entry.title, "Attention Is All You Need");
+        assert_eq!(entry.url, "https://arxiv.org/abs/1706.03762v7");
+        assert_eq!(
+            entry.authors.iter().map(|author| author.full_name.as_str()).collect::<Vec<_>>(),
+            vec!["Ashish Vaswani", "Noam Shazeer"]
+        );
+        assert_eq!(entry.year, Some(2017));
+        assert_eq!(entry.doi.as_deref(), Some("10.48550/arXiv.1706.03762"));
+        assert_eq!(entry.venue, "arXiv");
+        assert_eq!(entry.categories, vec!["cs.CL", "cs.LG"]);
+        assert!(entry.abstract_.starts_with("The dominant sequence transduction models"));
+    }
+
+    #[test]
+    fn returns_nothing_for_an_empty_feed() {
+        assert!(parse_arxiv_feed("<feed xmlns=\"http://www.w3.org/2005/Atom\"></feed>", "").is_empty());
+    }
+
+    #[test]
+    fn matches_requested_ids_against_the_version_arxiv_answers_with() {
+        assert_eq!(arxiv_id_base("1706.03762v7"), "1706.03762");
+        assert_eq!(arxiv_id_base("1706.03762"), "1706.03762");
+        assert_eq!(arxiv_id_base("cond-mat.stat-mech/0112017v3"), "cond-mat.stat-mech/0112017");
+        assert_eq!(arxiv_id_base("cs/0112017"), "cs/0112017");
+        // A bare trailing "v" is not a version marker.
+        assert_eq!(arxiv_id_base("1706.03762v"), "1706.03762v");
+    }
+
+    // arXiv answers a bad lookup with an entry titled "Error"; the id check in
+    // fetch_arxiv_by_id must reject it rather than mint a paper from it.
+    #[test]
+    fn error_entries_do_not_match_a_requested_id() {
+        let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom">
+          <entry>
+            <id>https://arxiv.org/api/errors#incorrect_id_format_for_abc</id>
+            <title>Error</title>
+            <summary>incorrect id format for abc</summary>
+          </entry>
+        </feed>"#;
+
+        let results = parse_arxiv_feed(xml, "");
+        assert!(!results.iter().any(|entry| arxiv_id_base(&entry.arxiv_id) == arxiv_id_base("1706.03762")));
     }
 }

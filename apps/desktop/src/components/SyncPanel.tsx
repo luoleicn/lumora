@@ -3,7 +3,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Annotation, ArxivMetadata, FileAsset, Paper } from "@lumora/shared";
 import { invoke } from "@tauri-apps/api/core";
 import { searchArxivMetadata, type SyncSettings } from "../lib/syncClient";
-import { formatFileSize, type ArxivDownloadProgress } from "../lib/arxivFiles";
+import { arxivMetadataToPaperPatch, formatFileSize, type ArxivDownloadProgress } from "../lib/arxivFiles";
 import type { FileStorageSettings } from "../lib/fileStorage";
 
 type SyncPanelProps = {
@@ -430,22 +430,6 @@ function DetailsTab({
       )}
     </div>
   );
-}
-
-function arxivMetadataToPaperPatch(metadata: ArxivMetadata): Partial<Paper> {
-  return {
-    arxiv: metadata.arxivId,
-    title: metadata.title,
-    authors: metadata.authors,
-    year: metadata.year,
-    venue: metadata.venue ?? "arXiv",
-    doi: metadata.doi,
-    abstract: metadata.abstract,
-    url: metadata.url,
-    documentType: "preprint",
-    keywords: metadata.categories ?? [],
-    needsReview: false
-  };
 }
 
 function parseAuthors(value: string) {

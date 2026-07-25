@@ -74,6 +74,7 @@ pub fn run() {
             system::reveal_file_in_folder,
             youdao::translate_with_youdao,
             arxiv::search_arxiv_by_title,
+            arxiv::fetch_arxiv_by_id,
             file_storage::store_pdf,
             file_storage::list_stored_pdfs,
             file_storage::read_stored_pdf,

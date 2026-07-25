@@ -1,5 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
-import type { FileAsset, LibraryState, Paper } from "@lumora/shared";
+import type { ArxivMetadata, FileAsset, LibraryState, Paper } from "@lumora/shared";
 import { createId } from "./id";
 import { putFileBlob } from "./localStore";
 import {
@@ -52,6 +52,39 @@ export function normalizeArxivId(value: string): string | undefined {
   return /^(?:\d{4}\.\d{4,5}|[A-Za-z-]+(?:\.[A-Za-z-]+)?\/\d{7})(?:v\d+)?$/.test(trimmed)
     ? trimmed
     : undefined;
+}
+
+export function arxivMetadataToPaperPatch(metadata: ArxivMetadata): Partial<Paper> {
+  return {
+    arxiv: metadata.arxivId,
+    title: metadata.title,
+    authors: metadata.authors,
+    year: metadata.year,
+    venue: metadata.venue ?? "arXiv",
+    doi: metadata.doi,
+    abstract: metadata.abstract,
+    url: metadata.url,
+    documentType: "preprint",
+    keywords: metadata.categories ?? [],
+    needsReview: false
+  };
+}
+
+export function buildArxivPaper(metadata: ArxivMetadata, now: string): Paper {
+  const patch = arxivMetadataToPaperPatch(metadata);
+  return {
+    ...patch,
+    id: createId("paper"),
+    // Paper.title is required, so keep the id as a readable last resort.
+    title: patch.title?.trim() || `arXiv:${metadata.arxivId}`,
+    authors: patch.authors ?? [],
+    source: "manual",
+    favorite: false,
+    needsReview: false,
+    unread: true,
+    createdAt: now,
+    updatedAt: now
+  };
 }
 
 export async function downloadMissingArxivFiles(

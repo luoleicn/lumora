@@ -24,7 +24,7 @@ vi.mock("./fileStorage", () => ({
 }));
 vi.mock("./localStore", () => ({ putFileBlob: (...args: unknown[]) => putFileBlobMock(...args) }));
 
-import { syncLibrary } from "./syncClient";
+import { fetchArxivMetadataById, syncLibrary } from "./syncClient";
 
 const now = "2026-07-12T00:00:00.000Z";
 const oldHash = "a".repeat(64);
@@ -60,6 +60,26 @@ function networkStats() {
     downloadedBytes: 0
   };
 }
+
+describe("fetchArxivMetadataById", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it("passes the id through and returns the entry", async () => {
+    invokeMock.mockResolvedValue({ arxivId: "1706.03762v7", title: "Attention Is All You Need", authors: [] });
+
+    const metadata = await fetchArxivMetadataById("1706.03762v7");
+
+    expect(invokeMock).toHaveBeenCalledWith("fetch_arxiv_by_id", { arxivId: "1706.03762v7" });
+    expect(metadata?.title).toBe("Attention Is All You Need");
+  });
+
+  it("maps an empty backend result to undefined", async () => {
+    invokeMock.mockResolvedValue(null);
+    await expect(fetchArxivMetadataById("2999.99999")).resolves.toBeUndefined();
+  });
+});
 
 describe("syncLibrary arXiv boundary", () => {
   beforeEach(() => {

@@ -13,6 +13,7 @@ import {
 import { FileText, X } from "lucide-react";
 import { AppToolbar } from "./components/AppToolbar";
 import { ArxivDownloadToast } from "./components/ArxivDownloadToast";
+import { ArxivImportModal } from "./components/ArxivImportModal";
 import { CollectionModal, DeleteCollectionModal, RenameCollectionModal } from "./components/CollectionModal";
 import { LibrarySidebar } from "./components/LibrarySidebar";
 import { ManualReferenceModal, type ManualReferenceDraft } from "./components/ManualReferenceModal";
@@ -74,7 +75,8 @@ import {
   type PaperSearchMeta,
   type SearchHit
 } from "./lib/searchIndex";
-import { formatFileSize } from "./lib/arxivFiles";
+import { buildArxivPaper, formatFileSize, normalizeArxivId } from "./lib/arxivFiles";
+import { fetchArxivMetadataById } from "./lib/syncClient";
 import { defaultProxySettings, loadProxySettings, saveProxySettings, type ProxySettings } from "./lib/proxySettings";
 import { AppUpdater, initialAppUpdateState, type AppUpdateState } from "./lib/appUpdater";
 import { useLibraryStore } from "./hooks/useLibraryStore";
@@ -230,6 +232,10 @@ export default function App() {
   const [aboutOpen, setAboutOpen] = useState(false);
   const [collectionModalParentId, setCollectionModalParentId] = useState<string | undefined>();
   const [collectionModalOpen, setCollectionModalOpen] = useState(false);
+  const [arxivImportOpen, setArxivImportOpen] = useState(false);
+  const [arxivImportCollectionId, setArxivImportCollectionId] = useState<string | undefined>();
+  const [arxivImportBusy, setArxivImportBusy] = useState(false);
+  const [arxivImportError, setArxivImportError] = useState<string>();
   const [deleteCollectionId, setDeleteCollectionId] = useState<string | undefined>();
   const [renameCollectionId, setRenameCollectionId] = useState<string | undefined>();
   const [appUpdateState, setAppUpdateState] = useState<AppUpdateState>(initialAppUpdateState);
@@ -1026,6 +1032,72 @@ export default function App() {
     fileInputRef.current?.click();
   }
 
+  function handleAddArxivToCollection(collectionId: string) {
+    setArxivImportCollectionId(collectionId);
+    setArxivImportError(undefined);
+    setArxivImportOpen(true);
+  }
+
+  async function handleImportArxivId(rawId: string) {
+    const arxivId = normalizeArxivId(rawId);
+    if (!arxivId) {
+      setArxivImportError(`Invalid arXiv identifier: ${rawId}`);
+      return;
+    }
+
+    const current = libraryRef.current ?? library;
+    const existing = current.papers.find((paper) =>
+      !paper.deletedAt && paper.arxiv && normalizeArxivId(paper.arxiv) === arxivId
+    );
+    if (existing) {
+      setArxivImportOpen(false);
+      setArxivImportCollectionId(undefined);
+      setSelectedPaperId(existing.id);
+      setStatus(`arXiv:${arxivId} is already in your library.`);
+      return;
+    }
+
+    const targetCollectionId = arxivImportCollectionId ?? "collection_inbox";
+    setArxivImportBusy(true);
+    setArxivImportError(undefined);
+    try {
+      const metadata = await fetchArxivMetadataById(arxivId);
+      if (!metadata) {
+        setArxivImportError(`No arXiv entry found for ${arxivId}.`);
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const paper = buildArxivPaper(metadata, now);
+      setLibrary((state) => ({
+        ...state,
+        papers: [paper, ...state.papers],
+        paperCollections: [
+          {
+            id: canonicalPaperCollectionId(paper.id, targetCollectionId),
+            paperId: paper.id,
+            collectionId: targetCollectionId,
+            membershipVersion: nextMembershipVersion(state),
+            createdAt: now,
+            updatedAt: now
+          },
+          ...state.paperCollections
+        ]
+      }));
+      setArxivImportOpen(false);
+      setArxivImportCollectionId(undefined);
+      setSelectedCollectionId(targetCollectionId === "collection_inbox" ? "all" : targetCollectionId);
+      setSelectedAuthor(undefined);
+      setSelectedTag(undefined);
+      setSelectedPaperId(paper.id);
+      setStatus(`Added arXiv:${arxivId} — ${paper.title}.`);
+    } catch (error) {
+      setArxivImportError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setArxivImportBusy(false);
+    }
+  }
+
   function handleSaveCollection(name: string) {
     const parent = collectionModalParentId
       ? library.collections.find((collection) => collection.id === collectionModalParentId && !collection.deletedAt)
@@ -1665,6 +1737,7 @@ export default function App() {
               onDeleteCollection={handleRequestDeleteCollection}
               onAddPaperToCollection={handleAddPaperToCollection}
               onAddPdfToCollection={handleAddPdfToCollection}
+              onAddArxivToCollection={handleAddArxivToCollection}
               onEmptyTrash={() => void handleEmptyTrash()}
               onSync={cloudSync.sync}
               syncBusy={cloudSync.activity?.state === "running"}
@@ -1798,6 +1871,19 @@ export default function App() {
           onDismiss={arxivDownloads.dismissBatchToast}
         />
       )}
+
+      <ArxivImportModal
+        open={arxivImportOpen}
+        targetCollectionName={library.collections.find((collection) => collection.id === arxivImportCollectionId)?.name}
+        busy={arxivImportBusy}
+        error={arxivImportError}
+        onClose={() => {
+          setArxivImportOpen(false);
+          setArxivImportCollectionId(undefined);
+          setArxivImportError(undefined);
+        }}
+        onSubmit={(arxivId) => void handleImportArxivId(arxivId)}
+      />
 
       <ManualReferenceModal
         open={manualModalOpen}

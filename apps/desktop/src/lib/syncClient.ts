@@ -720,3 +720,7 @@ export async function syncLibrary(
 export async function searchArxivMetadata(_settings: SyncSettings, title: string): Promise<ArxivMetadata[]> {
   return invoke<ArxivMetadata[]>("search_arxiv_by_title", { title });
 }
+
+export async function fetchArxivMetadataById(arxivId: string): Promise<ArxivMetadata | undefined> {
+  return (await invoke<ArxivMetadata | null>("fetch_arxiv_by_id", { arxivId })) ?? undefined;
+}

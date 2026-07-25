@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { LibraryState } from "@lumora/shared";
+import type { ArxivMetadata, LibraryState } from "@lumora/shared";
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -19,7 +19,7 @@ vi.mock("./fileStorage", () => ({
   storePdfToDisk: mocks.storePdfToDisk
 }));
 
-import { downloadMissingArxivFiles, normalizeArxivId } from "./arxivFiles";
+import { buildArxivPaper, downloadMissingArxivFiles, normalizeArxivId } from "./arxivFiles";
 
 const now = "2026-07-11T00:00:00.000Z";
 const state = (): LibraryState => ({
@@ -36,6 +36,55 @@ describe("normalizeArxivId", () => {
     expect(normalizeArxivId("arXiv:1706.03762v5")).toBe("1706.03762v5");
     expect(normalizeArxivId("https://arxiv.org/pdf/hep-th/9901001v2.pdf")).toBe("hep-th/9901001v2");
     expect(normalizeArxivId("not-an-id")).toBeUndefined();
+  });
+});
+
+describe("buildArxivPaper", () => {
+  const metadata = (overrides: Partial<ArxivMetadata> = {}): ArxivMetadata => ({
+    arxivId: "1706.03762v7",
+    title: "Attention Is All You Need",
+    authors: [{ fullName: "Ashish Vaswani" }],
+    year: 2017,
+    abstract: "The dominant sequence transduction models...",
+    doi: "10.48550/arXiv.1706.03762",
+    url: "https://arxiv.org/abs/1706.03762v7",
+    venue: "arXiv",
+    categories: ["cs.CL", "cs.LG"],
+    ...overrides
+  });
+
+  it("maps arXiv metadata onto a new paper", () => {
+    const paper = buildArxivPaper(metadata(), now);
+
+    expect(paper).toEqual(expect.objectContaining({
+      arxiv: "1706.03762v7",
+      title: "Attention Is All You Need",
+      authors: [{ fullName: "Ashish Vaswani" }],
+      year: 2017,
+      venue: "arXiv",
+      doi: "10.48550/arXiv.1706.03762",
+      url: "https://arxiv.org/abs/1706.03762v7",
+      documentType: "preprint",
+      keywords: ["cs.CL", "cs.LG"],
+      source: "manual",
+      favorite: false,
+      needsReview: false,
+      unread: true,
+      createdAt: now,
+      updatedAt: now
+    }));
+    expect(paper.id).toMatch(/^paper/);
+  });
+
+  it("falls back to the id when arXiv returns a blank title", () => {
+    expect(buildArxivPaper(metadata({ title: "   " }), now).title).toBe("arXiv:1706.03762v7");
+  });
+
+  it("defaults venue and authors when arXiv omits them", () => {
+    const paper = buildArxivPaper(metadata({ venue: undefined, authors: [], categories: undefined }), now);
+    expect(paper.venue).toBe("arXiv");
+    expect(paper.authors).toEqual([]);
+    expect(paper.keywords).toEqual([]);
   });
 });
 

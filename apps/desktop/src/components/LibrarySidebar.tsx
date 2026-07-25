@@ -42,6 +42,7 @@ type LibrarySidebarProps = {
   onDeleteCollection: (collectionId: string) => void;
   onAddPaperToCollection: (paperId: string, collectionId: string) => void;
   onAddPdfToCollection: (collectionId: string) => void;
+  onAddArxivToCollection: (collectionId: string) => void;
   onEmptyTrash: () => void;
   onSync: () => void;
   syncBusy: boolean;
@@ -82,6 +83,7 @@ export function LibrarySidebar({
   onDeleteCollection,
   onAddPaperToCollection,
   onAddPdfToCollection,
+  onAddArxivToCollection,
   onEmptyTrash,
   onSync,
   syncBusy,
@@ -416,6 +418,17 @@ export function LibrarySidebar({
           >
             <FilePlus size={15} />
             <span>Add PDF...</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setContextMenu(undefined);
+              onAddArxivToCollection(contextMenu.collectionId);
+            }}
+          >
+            <Hash size={15} />
+            <span>Add by arXiv ID...</span>
           </button>
           <button
             type="button"
