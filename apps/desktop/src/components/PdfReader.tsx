@@ -6,6 +6,7 @@ import type { PDFDocumentProxy } from "pdfjs-dist";
 import { Languages, MessageSquare, StickyNote, Trash2, X } from "lucide-react";
 import type { Annotation, FileAsset, Paper } from "@lumora/shared";
 import { clamp01, mergeNearbyRects, normalizeRect } from "@lumora/shared";
+import { NativePdfLinkLayer } from "./NativePdfLinkLayer";
 import { NativePdfPage } from "./NativePdfPage";
 import { NativePdfTextLayer } from "./NativePdfTextLayer";
 import { createId } from "../lib/id";
@@ -1064,6 +1065,16 @@ function PdfReaderComponent({
     void handlePdfDestination(pageIndex, dest, navigationRevision);
   }, [handlePdfDestination]);
 
+  const handleNativePdfInternalLink = useCallback((pageIndex: number) => {
+    const element = scrollRef.current;
+    const metrics = pageMetricsRef.current;
+    if (!element || pageIndex < 0 || pageIndex >= metrics.heights.length) {
+      return;
+    }
+    linkReturnControllerRef.current!.beginLink(element.scrollTop);
+    scrollToPdfOffset(pageOffset(metrics, pageIndex), "smooth");
+  }, []);
+
   function scheduleZoom(nextZoom: number) {
     if (!pdfRenderPolicy.debounceZoom) {
       // zoomRef only syncs post-render; update it now so wheel events landing
@@ -1261,6 +1272,10 @@ function PdfReaderComponent({
                     page={nativeRenderer.document.pages[index]}
                     cssHeight={pageMetrics.heights[index]}
                     onReady={refreshVisibleSearchHighlights}
+                  />
+                  <NativePdfLinkLayer
+                    links={nativeRenderer.document.pages[index].links}
+                    onInternalLink={handleNativePdfInternalLink}
                   />
                   <AnnotationOverlay
                     annotations={visibleAnnotations.filter((annotation) => annotation.pageIndex === index)}

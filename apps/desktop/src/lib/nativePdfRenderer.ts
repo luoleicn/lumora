@@ -5,11 +5,24 @@ import type { PdfSearchTarget } from "./pdfSearch";
 export type NativePdfPageInfo = {
   width: number;
   height: number;
+  links: NativePdfLink[];
 };
 
 export type NativePdfDocumentInfo = {
   sessionId: string;
   pages: NativePdfPageInfo[];
+};
+
+export type NativePdfLinkTarget =
+  | { kind: "internal"; pageIndex: number }
+  | { kind: "external"; url: string };
+
+export type NativePdfLink = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  target: NativePdfLinkTarget;
 };
 
 const pendingPageRenders = new Map<string, Promise<Uint8Array>>();

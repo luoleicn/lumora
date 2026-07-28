@@ -54,7 +54,7 @@ docs                # 项目主页与同步协议文档
   > `libsecret`（配合 GNOME Keyring / KWallet 等 Secret Service 后端）用于安全保存云同步密钥；桌面会话未运行 Secret Service 时，密钥读写会失败。
 - 无需 Docker，无需自建后端
 
-> 当前阶段优先级：**macOS 优先，Linux 其次，iPhone 最后**。目前主力开发与验证在 macOS。
+> 当前阶段的主力产品是 **macOS 与 Linux 桌面端**，两端的功能、架构与发布质量需要共同维护；iPhone 作为后续平台推进。
 
 ## 安装依赖
 
@@ -156,6 +156,5 @@ cd apps/desktop/src-tauri && cargo check
 
 - 随功能演进保持架构自洽：优先做**边界清晰、可复用的领域模块**，而不是一次性的 UI 补丁。
 - 对行为变更保持有意义的测试覆盖，尤其是共享逻辑、数据完整性、同步、批注与跨端集成路径。
-- 本项目目标是跨平台产品，路线：macOS → Linux → iPhone；iPhone 目前仅体现为 Tauri 兼容的前端架构，尚无移动端构建。
-
+- 本项目目标是跨平台产品，当前主力平台为 macOS + Linux，后续扩展至 iPhone；iPhone 目前仅体现为 Tauri 兼容的前端架构，尚无移动端构建。
 

@@ -1644,6 +1644,23 @@ body.paper-pointer-dragging * {
   transform-origin: 0 0;
 }
 
+.native-pdf-link-layer {
+  position: absolute;
+  z-index: 3;
+  inset: 0;
+  pointer-events: none;
+}
+
+.native-pdf-link-layer > a {
+  position: absolute;
+  pointer-events: auto;
+}
+
+.native-pdf-link-layer > a:hover {
+  background: rgba(255, 230, 0, 0.2);
+  box-shadow: 0 1px 6px rgba(255, 200, 0, 0.55);
+}
+
 .native-pdf-page-status {
   position: absolute;
   z-index: 1;
