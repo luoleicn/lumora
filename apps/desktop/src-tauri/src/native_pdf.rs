@@ -24,6 +24,7 @@ const MAX_PDF_LINK_PARSE_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) struct NativePdfPageInfo {
     width: f64,
     height: f64,
+    #[cfg(target_os = "linux")]
     links: Vec<NativePdfLink>,
 }
 
@@ -42,6 +43,7 @@ pub(crate) struct NativePdfSearchTarget {
     key: String,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NativePdfLink {
@@ -52,6 +54,7 @@ pub(crate) struct NativePdfLink {
     target: NativePdfLinkTarget,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub(crate) enum NativePdfLinkTarget {
@@ -296,9 +299,10 @@ fn open_pdf_bytes(bytes: &[u8]) -> Result<NativePdfDocumentInfo, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let mut pages = parse_pages(&String::from_utf8_lossy(&output.stdout))?;
+    let pages = parse_pages(&String::from_utf8_lossy(&output.stdout))?;
     #[cfg(target_os = "linux")]
-    {
+    let pages = {
+        let mut pages = pages;
         match extract_document_links(bytes, &pages) {
             Ok(page_links) => {
                 for (page, links) in pages.iter_mut().zip(page_links) {
@@ -309,7 +313,8 @@ fn open_pdf_bytes(bytes: &[u8]) -> Result<NativePdfDocumentInfo, String> {
                 eprintln!("Native PDF link extraction unavailable for {session_id}: {error}");
             }
         }
-    }
+        pages
+    };
     Ok(NativePdfDocumentInfo { session_id, pages })
 }
 
@@ -341,6 +346,7 @@ fn parse_pages(output: &str) -> Result<Vec<NativePdfPageInfo>, String> {
         .map(|_| NativePdfPageInfo {
             width: 612.0,
             height: 792.0,
+            #[cfg(target_os = "linux")]
             links: Vec::new(),
         })
         .collect::<Vec<_>>();
@@ -367,6 +373,7 @@ fn parse_pages(output: &str) -> Result<Vec<NativePdfPageInfo>, String> {
                 *page = NativePdfPageInfo {
                     width,
                     height,
+                    #[cfg(target_os = "linux")]
                     links: Vec::new(),
                 };
                 parsed_sizes += 1;
