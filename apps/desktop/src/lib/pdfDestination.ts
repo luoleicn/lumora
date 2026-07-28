@@ -35,6 +35,22 @@ export async function resolvePdfDestinationOffset(
   return pageTop + boundedY;
 }
 
+export function resolveNativePdfDestinationOffset(
+  metrics: PdfPageMetrics,
+  pageIndex: number,
+  normalizedTop?: number
+): number {
+  const pageTop = pageOffset(metrics, pageIndex);
+  if (typeof normalizedTop !== "number" || !Number.isFinite(normalizedTop)) {
+    return pageTop;
+  }
+  const pageHeight = metrics.heights[pageIndex];
+  if (typeof pageHeight !== "number" || !Number.isFinite(pageHeight) || pageHeight <= 0) {
+    return pageTop;
+  }
+  return pageTop + Math.min(Math.max(normalizedTop, 0), 1) * pageHeight;
+}
+
 function destinationPosition(destination: unknown[]): { x: number; y: number } | undefined {
   const mode = (destination[1] as PdfDestinationMode | undefined)?.name;
   switch (mode) {

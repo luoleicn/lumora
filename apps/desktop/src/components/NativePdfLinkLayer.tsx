@@ -1,9 +1,12 @@
 import { memo } from "react";
-import type { NativePdfLink } from "../lib/nativePdfRenderer";
+import type {
+  NativePdfInternalLinkTarget,
+  NativePdfLink
+} from "../lib/nativePdfRenderer";
 
 type NativePdfLinkLayerProps = {
   links: NativePdfLink[];
-  onInternalLink: (pageIndex: number) => void;
+  onInternalLink: (target: NativePdfInternalLinkTarget) => void;
 };
 
 export const NativePdfLinkLayer = memo(function NativePdfLinkLayer({
@@ -22,16 +25,13 @@ export const NativePdfLinkLayer = memo(function NativePdfLinkLayer({
         if (link.target.kind === "internal") {
           const target = link.target;
           return (
-            <a
+            <button
+              type="button"
               key={`${index}-internal-${target.pageIndex}`}
-              href={`#page=${target.pageIndex + 1}`}
               data-internal-link
               aria-label={`Go to page ${target.pageIndex + 1}`}
               style={style}
-              onClick={(event) => {
-                event.preventDefault();
-                onInternalLink(target.pageIndex);
-              }}
+              onClick={() => onInternalLink(target)}
             />
           );
         }

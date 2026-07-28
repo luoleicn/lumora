@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { resolvePdfDestinationOffset } from "./pdfDestination";
+import {
+  resolveNativePdfDestinationOffset,
+  resolvePdfDestinationOffset
+} from "./pdfDestination";
 
 const metrics = {
   offsets: [0, 820, 1640],
@@ -50,5 +53,16 @@ describe("resolvePdfDestinationOffset", () => {
       document as never, metrics, 800, 1, [0, { name: "Fit" }]
     )).resolves.toBe(820);
     expect(document.getPage).not.toHaveBeenCalled();
+  });
+
+  it("maps a native normalized destination into the virtual page scroll space", () => {
+    expect(resolveNativePdfDestinationOffset(metrics, 1, 0.375)).toBe(1120);
+    expect(resolveNativePdfDestinationOffset(metrics, 1)).toBe(820);
+  });
+
+  it("bounds malformed native destination positions to the target page", () => {
+    expect(resolveNativePdfDestinationOffset(metrics, 2, -0.5)).toBe(1640);
+    expect(resolveNativePdfDestinationOffset(metrics, 0, 1.5)).toBe(800);
+    expect(resolveNativePdfDestinationOffset(metrics, 1, Number.NaN)).toBe(820);
   });
 });

@@ -78,6 +78,16 @@ describe("mendeleyDocumentToPaper", () => {
     expect(merged.favorite).toBe(true);
     expect(merged.mendeleyId).toBe("md-1");
   });
+
+  it("round-trips the personal note through Mendeley user_context", () => {
+    const paper = mendeleyDocumentToPaper({
+      ...remoteDocument,
+      user_context: "First line\nSecond line"
+    });
+
+    expect(paper.userContext).toBe("First line\nSecond line");
+    expect(paperToMendeleyDocument(paper).user_context).toBe("First line\nSecond line");
+  });
 });
 
 describe("Mendeley annotations", () => {

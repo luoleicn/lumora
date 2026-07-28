@@ -15,7 +15,8 @@ import {
   openNativePdfPath,
   findInNativePdfText,
   shouldUseNativePdfRenderer,
-  type NativePdfDocumentInfo
+  type NativePdfDocumentInfo,
+  type NativePdfInternalLinkTarget
 } from "../lib/nativePdfRenderer";
 import {
   findInPageTextLayer,
@@ -43,7 +44,15 @@ import { getStoredPdfMetadata, readPdfFromDisk } from "../lib/fileStorage";
 import { createLocalPdfRangeTransport, localPdfRangeChunkSize } from "../lib/pdfRangeTransport";
 import { resolvePdfExitViewState, type PdfViewState } from "../lib/pdfViewState";
 import { externalWebUrlFromTarget } from "../lib/externalWebLinks";
-import { resolvePdfDestinationOffset } from "../lib/pdfDestination";
+import {
+  resolveNativePdfDestinationOffset,
+  resolvePdfDestinationOffset
+} from "../lib/pdfDestination";
+import {
+  PdfScrollCoordinator,
+  planPdfScroll,
+  type PdfScrollIntent
+} from "../lib/pdfNavigation";
 import { PdfLinkReturnController } from "../lib/pdfLinkReturn";
 import { isLegacyWebKit } from "../lib/webkitPolyfills";
 import { browserPrepareAppExitEvent } from "../lib/appExit";
@@ -164,8 +173,8 @@ function PdfReaderComponent({
   const scrollRef = useRef<HTMLDivElement>(null);
   const pageJumpInputRef = useRef<HTMLInputElement>(null);
   const pageRefs = useRef<Array<HTMLDivElement | null>>([]);
-  const pendingScrollRestoreRef = useRef<number | undefined>(undefined);
-  const restoringScrollRef = useRef(false);
+  const initialScrollRestoreRef = useRef(viewState?.scrollTop ?? 0);
+  const scrollCoordinatorRef = useRef(new PdfScrollCoordinator());
   const gestureStartZoomRef = useRef(1);
   const pendingZoomRef = useRef<number | undefined>(undefined);
   const zoomCommitTimerRef = useRef<number | undefined>(undefined);
@@ -181,6 +190,7 @@ function PdfReaderComponent({
   const [nativeRenderer, setNativeRenderer] = useState<NativePdfRendererState>(() => (
     nativePdfEnabled ? { status: "loading" } : { status: "disabled" }
   ));
+  const [pendingScrollIntent, setPendingScrollIntent] = useState<PdfScrollIntent>();
   const useNativePageRenderer = nativePdfEnabled;
   const nativePdfSessionId = nativeRenderer.status === "ready" ? nativeRenderer.document.sessionId : undefined;
   const [numPages, setNumPages] = useState(0);
@@ -407,8 +417,9 @@ function PdfReaderComponent({
     setLoadError(undefined);
     setPageJumpOpen(false);
     setPageJumpValue("");
-    pendingScrollRestoreRef.current = viewState?.scrollTop ?? 0;
-    restoringScrollRef.current = true;
+    initialScrollRestoreRef.current = viewState?.scrollTop ?? 0;
+    scrollCoordinatorRef.current.resetForDocument();
+    setPendingScrollIntent(undefined);
     setHasExplicitZoom(viewState?.zoom !== undefined);
     hasExplicitZoomRef.current = viewState?.zoom !== undefined;
     setZoom(viewState?.zoom ?? 1);
@@ -435,8 +446,8 @@ function PdfReaderComponent({
   useEffect(() => {
     zoomRef.current = zoom;
     onViewStateChange?.({
-      scrollTop: restoringScrollRef.current
-        ? pendingScrollRestoreRef.current ?? viewState?.scrollTop ?? 0
+      scrollTop: scrollCoordinatorRef.current.isRestoring
+        ? initialScrollRestoreRef.current
         : scrollRef.current?.scrollTop ?? viewState?.scrollTop ?? 0,
       zoom: hasExplicitZoom ? zoom : undefined
     });
@@ -447,12 +458,36 @@ function PdfReaderComponent({
       return;
     }
 
-    pendingScrollRestoreRef.current = viewState?.scrollTop ?? 0;
-    restoringScrollRef.current = true;
-    const frame = restorePendingScroll();
+    queuePdfScroll(initialScrollRestoreRef.current, "auto", "restore");
+  }, [effectiveFileData, hasStoredPdfPath, numPages, paper?.id]);
+
+  useLayoutEffect(() => {
+    if (!pendingScrollIntent) {
+      return;
+    }
+
+    // The target virtual page range has been committed by this point. Defer
+    // one frame so WebKit finishes layout/scroll anchoring before the single
+    // scroll owner writes the final destination.
+    const frame = requestAnimationFrame(() => {
+      const coordinator = scrollCoordinatorRef.current;
+      const element = scrollRef.current;
+      if (!element || !coordinator.isCurrent(pendingScrollIntent.revision)) {
+        return;
+      }
+
+      element.scrollTo({
+        top: pendingScrollIntent.top,
+        behavior: pendingScrollIntent.behavior
+      });
+      coordinator.complete(pendingScrollIntent);
+      setPendingScrollIntent((current) => (
+        current?.revision === pendingScrollIntent.revision ? undefined : current
+      ));
+    });
 
     return () => cancelAnimationFrame(frame);
-  }, [effectiveFileData, hasStoredPdfPath, numPages, paper?.id]);
+  }, [pendingScrollIntent]);
 
   useEffect(() => {
     pageRefs.current = pageRefs.current.slice(0, numPages);
@@ -917,7 +952,7 @@ function PdfReaderComponent({
   function handleReaderScroll() {
     const scrollTop = scrollRef.current?.scrollTop ?? 0;
     updatePageRange(scrollTop);
-    if (restoringScrollRef.current) {
+    if (scrollCoordinatorRef.current.isRestoring) {
       return;
     }
 
@@ -977,33 +1012,40 @@ function PdfReaderComponent({
   }
 
   function scrollToPage(pageIndex: number, behavior: ScrollBehavior = "auto") {
-    const element = scrollRef.current;
-    if (!element) {
-      return;
-    }
-    const top = pageOffset(pageMetrics, pageIndex);
-    element.scrollTo({ top, behavior });
-    updatePageRange(top);
+    queuePdfScroll(pageOffset(pageMetricsRef.current, pageIndex), behavior);
   }
 
   function scrollToPdfOffset(top: number, behavior: ScrollBehavior = "auto") {
-    const element = scrollRef.current;
-    if (!element) {
+    queuePdfScroll(top, behavior);
+  }
+
+  function queuePdfScroll(
+    top: number,
+    behavior: ScrollBehavior,
+    kind: PdfScrollIntent["kind"] = "navigation"
+  ) {
+    if (!scrollRef.current) {
       return;
     }
 
     const metrics = pageMetricsRef.current;
-    element.scrollTo({ top, behavior });
-    const nextRange = findPdfPageRange(
+    const plan = planPdfScroll(
       metrics,
       top,
       viewportHeightRef.current,
-      pdfOverscanPagesRef.current
+      pdfOverscanPagesRef.current,
+      behavior
     );
-    setPageRange((current) => current.start === nextRange.start && current.end === nextRange.end
+    const coordinator = scrollCoordinatorRef.current;
+    const intent = kind === "restore"
+      ? coordinator.beginRestore(plan)
+      : coordinator.beginNavigation(plan);
+
+    setPageRange((current) => current.start === plan.range.start && current.end === plan.range.end
       ? current
-      : nextRange
+      : plan.range
     );
+    setPendingScrollIntent(intent);
   }
 
   function handleBackToLinkOrigin() {
@@ -1011,7 +1053,7 @@ function PdfReaderComponent({
     if (top === undefined) {
       return;
     }
-    scrollToPdfOffset(top, "smooth");
+    scrollToPdfOffset(top, "auto");
   }
 
   const handlePdfDestination = useCallback(async (
@@ -1047,7 +1089,7 @@ function PdfReaderComponent({
       || !linkReturnControllerRef.current!.isCurrent(navigationRevision)) {
       return;
     }
-    scrollToPdfOffset(top, "smooth");
+    scrollToPdfOffset(top, "auto");
   }, []);
 
   const handlePdfItemClick = useCallback(({
@@ -1065,14 +1107,18 @@ function PdfReaderComponent({
     void handlePdfDestination(pageIndex, dest, navigationRevision);
   }, [handlePdfDestination]);
 
-  const handleNativePdfInternalLink = useCallback((pageIndex: number) => {
+  const handleNativePdfInternalLink = useCallback((target: NativePdfInternalLinkTarget) => {
     const element = scrollRef.current;
     const metrics = pageMetricsRef.current;
+    const { pageIndex } = target;
     if (!element || pageIndex < 0 || pageIndex >= metrics.heights.length) {
       return;
     }
     linkReturnControllerRef.current!.beginLink(element.scrollTop);
-    scrollToPdfOffset(pageOffset(metrics, pageIndex), "smooth");
+    scrollToPdfOffset(
+      resolveNativePdfDestinationOffset(metrics, pageIndex, target.top),
+      "auto"
+    );
   }, []);
 
   function scheduleZoom(nextZoom: number) {
@@ -1109,30 +1155,6 @@ function PdfReaderComponent({
     hasExplicitZoomRef.current = explicit;
     setHasExplicitZoom(explicit);
     setZoom(clamp(nextZoom, minZoom, maxZoom));
-  }
-
-  function restorePendingScroll() {
-    if (!restoringScrollRef.current && pendingScrollRestoreRef.current === undefined) {
-      return 0;
-    }
-
-    return requestAnimationFrame(() => {
-      const scrollTop = pendingScrollRestoreRef.current ?? 0;
-      if (scrollRef.current) {
-        scrollRef.current.scrollTop = scrollTop;
-      }
-      updatePageRange(scrollTop);
-
-      requestAnimationFrame(() => {
-        const nextScrollTop = pendingScrollRestoreRef.current ?? scrollTop;
-        if (scrollRef.current) {
-          scrollRef.current.scrollTop = nextScrollTop;
-        }
-        updatePageRange(nextScrollTop);
-        pendingScrollRestoreRef.current = undefined;
-        restoringScrollRef.current = false;
-      });
-    });
   }
 
   async function handleTranslate(quote: string) {
@@ -1263,7 +1285,6 @@ function PdfReaderComponent({
                         pageAspectRatios[index] ?? defaultPdfPageAspectRatio,
                         pdfRenderPolicy
                       )}
-                      onLoad={restorePendingScroll}
                     />
                   </div>
                   <NativePdfTextLayer
@@ -1345,7 +1366,6 @@ function PdfReaderComponent({
                           : { ...current, [index]: ratio }
                         );
                       }}
-                      onRenderSuccess={restorePendingScroll}
                       onRenderTextLayerSuccess={refreshVisibleSearchHighlights}
                     />
                     <AnnotationOverlay

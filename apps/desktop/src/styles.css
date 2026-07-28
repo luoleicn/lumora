@@ -1546,6 +1546,10 @@ body.paper-pointer-dragging * {
 .pdf-page-list {
   position: relative;
   width: 100%;
+  /* The list owns a fixed virtual height and swaps absolute page windows.
+     Browser scroll anchoring must not reinterpret those swaps as content
+     movement and overwrite an explicit PDF destination. */
+  overflow-anchor: none;
 }
 
 .page-shell.virtualized {
@@ -1651,12 +1655,19 @@ body.paper-pointer-dragging * {
   pointer-events: none;
 }
 
-.native-pdf-link-layer > a {
+.native-pdf-link-layer > :is(a, button) {
   position: absolute;
   pointer-events: auto;
 }
 
-.native-pdf-link-layer > a:hover {
+.native-pdf-link-layer > button {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+}
+
+.native-pdf-link-layer > :is(a, button):hover {
   background: rgba(255, 230, 0, 0.2);
   box-shadow: 0 1px 6px rgba(255, 200, 0, 0.55);
 }
@@ -2458,6 +2469,34 @@ body.paper-pointer-dragging * {
   margin: 0;
   color: #59636f;
   font-size: 12px;
+  line-height: 1.5;
+}
+
+.paper-notes-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.paper-personal-note {
+  border: 1px solid #d5dee6;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 10px;
+}
+
+.paper-personal-note label {
+  gap: 8px;
+}
+
+.paper-personal-note strong {
+  color: #303b45;
+  font-size: 12px;
+}
+
+.sync-panel .paper-personal-note textarea {
+  min-height: 120px;
+  resize: vertical;
   line-height: 1.5;
 }
 

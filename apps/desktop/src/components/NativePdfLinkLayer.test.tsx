@@ -12,7 +12,7 @@ describe("NativePdfLinkLayer", () => {
             y: 0.2,
             width: 0.3,
             height: 0.04,
-            target: { kind: "internal", pageIndex: 7 }
+            target: { kind: "internal", pageIndex: 7, top: 0.42 }
           },
           {
             x: 0.5,
@@ -26,11 +26,12 @@ describe("NativePdfLinkLayer", () => {
       />
     );
 
-    expect(markup).toContain('href="#page=8"');
+    expect(markup).toContain('<button type="button"');
     expect(markup).toContain('data-internal-link="true"');
     expect(markup).toContain('aria-label="Go to page 8"');
     expect(markup).toContain('href="https://example.com/paper?section=2"');
     expect(markup).toContain("left:10.0000%");
-    expect(markup.match(/<a /g)).toHaveLength(2);
+    expect(markup.match(/<a /g)).toHaveLength(1);
+    expect(markup.match(/<button /g)).toHaveLength(1);
   });
 });

@@ -13,8 +13,14 @@ export type NativePdfDocumentInfo = {
   pages: NativePdfPageInfo[];
 };
 
+export type NativePdfInternalLinkTarget = {
+  kind: "internal";
+  pageIndex: number;
+  top?: number;
+};
+
 export type NativePdfLinkTarget =
-  | { kind: "internal"; pageIndex: number }
+  | NativePdfInternalLinkTarget
   | { kind: "external"; url: string };
 
 export type NativePdfLink = {

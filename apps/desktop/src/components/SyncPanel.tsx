@@ -1,10 +1,11 @@
-import { DatabaseZap, Download, ExternalLink, FileSearch, FolderOpen, GraduationCap, Search, Send, Trash2 } from "lucide-react";
+import { DatabaseZap, Download, ExternalLink, FileSearch, FolderOpen, GraduationCap, Search, Send } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Annotation, ArxivMetadata, FileAsset, Paper } from "@lumora/shared";
 import { invoke } from "@tauri-apps/api/core";
 import { searchArxivMetadata, type SyncSettings } from "../lib/syncClient";
 import { arxivMetadataToPaperPatch, formatFileSize, type ArxivDownloadProgress } from "../lib/arxivFiles";
 import type { FileStorageSettings } from "../lib/fileStorage";
+import { PaperNotesTab } from "./PaperNotesTab";
 
 type SyncPanelProps = {
   settings: SyncSettings;
@@ -66,7 +67,14 @@ export function SyncPanel({
           onDownloadArxiv={onDownloadArxiv}
         />
       )}
-      {activeTab === "notes" && <NotesTab annotations={visibleAnnotations} onDeleteAnnotation={onDeleteAnnotation} />}
+      {activeTab === "notes" && (
+        <PaperNotesTab
+          paper={paper}
+          annotations={visibleAnnotations}
+          onUpdatePaper={onUpdatePaper}
+          onDeleteAnnotation={onDeleteAnnotation}
+        />
+      )}
       {activeTab === "deepseek" && <DeepSeekTab paper={paper} />}
     </aside>
   );
@@ -461,41 +469,6 @@ function formatAuthorPreview(authors: string[]) {
   }
 
   return `${authors.slice(0, 3).join(", ")} et al.`;
-}
-
-function NotesTab({
-  annotations,
-  onDeleteAnnotation
-}: {
-  annotations: Annotation[];
-  onDeleteAnnotation: (annotation: Annotation) => void;
-}) {
-  if (annotations.length === 0) {
-    return <p className="inspector-empty">No notes or highlights for this document.</p>;
-  }
-
-  return (
-    <div className="inspector-notes">
-      {annotations.map((annotation) => (
-        <article key={annotation.id}>
-          <header>
-            <span style={{ backgroundColor: annotation.color }} />
-            <strong>Page {annotation.pageIndex + 1}</strong>
-            <button
-              className="icon-button small"
-              type="button"
-              onClick={() => onDeleteAnnotation(annotation)}
-              aria-label="Delete annotation"
-            >
-              <Trash2 size={14} />
-            </button>
-          </header>
-          {annotation.quote && <p>{annotation.quote}</p>}
-          {annotation.comment && <blockquote>{annotation.comment}</blockquote>}
-        </article>
-      ))}
-    </div>
-  );
 }
 
 function DeepSeekTab({ paper }: { paper?: Paper }) {

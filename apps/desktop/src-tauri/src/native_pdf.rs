@@ -55,7 +55,11 @@ pub(crate) struct NativePdfLink {
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub(crate) enum NativePdfLinkTarget {
-    Internal { page_index: usize },
+    Internal {
+        page_index: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        top: Option<f64>,
+    },
     External { url: String },
 }
 
@@ -388,6 +392,18 @@ pub(super) struct PdfPageGeometry {
     pub(super) rotation: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ResolvedInternalDestination {
+    page_index: usize,
+    position: Option<PdfDestinationPosition>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PdfDestinationPosition {
+    x: Option<f64>,
+    y: Option<f64>,
+}
+
 pub(super) fn extract_document_links(
     bytes: &[u8],
     page_infos: &[NativePdfPageInfo],
@@ -438,7 +454,7 @@ fn extract_links_from_pdf(
     let mut result = vec![Vec::new(); page_infos.len()];
     let mut document_link_count = 0;
 
-    for (page_index, page_id) in page_ids.into_iter().enumerate() {
+    for (page_index, page_id) in page_ids.iter().copied().enumerate() {
         let Some(page_info) = page_infos.get(page_index) else {
             break;
         };
@@ -457,7 +473,8 @@ fn extract_links_from_pdf(
                 document,
                 annotation,
                 page_index,
-                page_infos.len(),
+                page_infos,
+                &page_ids,
                 &page_indexes,
                 &named_destinations,
             ) else {
@@ -520,7 +537,8 @@ fn annotation_target(
     document: &PdfDocument,
     annotation: &PdfDictionary,
     source_page_index: usize,
-    page_count: usize,
+    page_infos: &[NativePdfPageInfo],
+    page_ids: &[PdfObjectId],
     page_indexes: &HashMap<PdfObjectId, usize>,
     named_destinations: &HashMap<Vec<u8>, PdfObject>,
 ) -> Option<NativePdfLinkTarget> {
@@ -532,7 +550,9 @@ fn annotation_target(
             named_destinations,
             0,
         )
-        .map(|page_index| NativePdfLinkTarget::Internal { page_index });
+        .and_then(|destination| {
+            native_internal_link_target(document, destination, page_ids, page_infos)
+        });
     }
 
     let action = annotation
@@ -565,7 +585,9 @@ fn annotation_target(
             named_destinations,
             0,
         )
-        .map(|page_index| NativePdfLinkTarget::Internal { page_index }),
+        .and_then(|destination| {
+            native_internal_link_target(document, destination, page_ids, page_infos)
+        }),
         b"Named" => {
             let name = action
                 .get_deref(b"N", document)
@@ -573,15 +595,40 @@ fn annotation_target(
                 .and_then(pdf_object_bytes)?;
             let page_index = match name {
                 b"FirstPage" => 0,
-                b"LastPage" => page_count.checked_sub(1)?,
-                b"NextPage" => (source_page_index + 1).min(page_count.checked_sub(1)?),
+                b"LastPage" => page_infos.len().checked_sub(1)?,
+                b"NextPage" => {
+                    (source_page_index + 1).min(page_infos.len().checked_sub(1)?)
+                }
                 b"PrevPage" => source_page_index.saturating_sub(1),
                 _ => return None,
             };
-            Some(NativePdfLinkTarget::Internal { page_index })
+            Some(NativePdfLinkTarget::Internal {
+                page_index,
+                top: None,
+            })
         }
         _ => None,
     }
+}
+
+fn native_internal_link_target(
+    document: &PdfDocument,
+    destination: ResolvedInternalDestination,
+    page_ids: &[PdfObjectId],
+    page_infos: &[NativePdfPageInfo],
+) -> Option<NativePdfLinkTarget> {
+    let page_id = *page_ids.get(destination.page_index)?;
+    let page_info = page_infos.get(destination.page_index)?;
+    let top = destination
+        .position
+        .and_then(|position| normalize_pdf_destination_top(
+            position,
+            page_geometry(document, page_id, page_info),
+        ));
+    Some(NativePdfLinkTarget::Internal {
+        page_index: destination.page_index,
+        top,
+    })
 }
 
 fn resolve_internal_destination(
@@ -590,20 +637,26 @@ fn resolve_internal_destination(
     page_indexes: &HashMap<PdfObjectId, usize>,
     named_destinations: &HashMap<Vec<u8>, PdfObject>,
     depth: usize,
-) -> Option<usize> {
+) -> Option<ResolvedInternalDestination> {
     if depth >= 16 {
         return None;
     }
     let (_, destination) = document.dereference(destination).ok()?;
     match destination {
-        PdfObject::Array(items) => match items.first()? {
-            PdfObject::Reference(page_id) => page_indexes.get(page_id).copied(),
-            PdfObject::Integer(page_index) if *page_index >= 0 => {
-                let page_index = *page_index as usize;
-                (page_index < page_indexes.len()).then_some(page_index)
-            }
-            _ => None,
-        },
+        PdfObject::Array(items) => {
+            let page_index = match items.first()? {
+                PdfObject::Reference(page_id) => page_indexes.get(page_id).copied(),
+                PdfObject::Integer(page_index) if *page_index >= 0 => {
+                    let page_index = *page_index as usize;
+                    (page_index < page_indexes.len()).then_some(page_index)
+                }
+                _ => None,
+            }?;
+            Some(ResolvedInternalDestination {
+                page_index,
+                position: destination_position(items),
+            })
+        }
         PdfObject::Dictionary(dictionary) => resolve_internal_destination(
             document,
             dictionary.get(b"D").ok()?,
@@ -620,6 +673,30 @@ fn resolve_internal_destination(
         ),
         _ => None,
     }
+}
+
+fn destination_position(items: &[PdfObject]) -> Option<PdfDestinationPosition> {
+    let mode = items.get(1)?.as_name().ok()?;
+    let position = match mode {
+        b"XYZ" => PdfDestinationPosition {
+            x: items.get(2).and_then(pdf_object_number),
+            y: items.get(3).and_then(pdf_object_number),
+        },
+        b"FitH" | b"FitBH" => PdfDestinationPosition {
+            x: None,
+            y: items.get(2).and_then(pdf_object_number),
+        },
+        b"FitV" | b"FitBV" => PdfDestinationPosition {
+            x: items.get(2).and_then(pdf_object_number),
+            y: None,
+        },
+        b"FitR" => PdfDestinationPosition {
+            x: items.get(2).and_then(pdf_object_number),
+            y: items.get(5).and_then(pdf_object_number),
+        },
+        _ => return None,
+    };
+    (position.x.is_some() || position.y.is_some()).then_some(position)
 }
 
 fn collect_named_destinations(document: &PdfDocument) -> HashMap<Vec<u8>, PdfObject> {
@@ -853,6 +930,25 @@ pub(super) fn normalize_pdf_rect(
     Some(normalized)
 }
 
+fn normalize_pdf_destination_top(
+    position: PdfDestinationPosition,
+    geometry: PdfPageGeometry,
+) -> Option<f64> {
+    let page_width = geometry.right - geometry.left;
+    let page_height = geometry.top - geometry.bottom;
+    if page_width <= 0.0 || page_height <= 0.0 {
+        return None;
+    }
+
+    let top = match geometry.rotation {
+        90 => (position.x? - geometry.left) / page_width,
+        180 => (position.y? - geometry.bottom) / page_height,
+        270 => (geometry.right - position.x?) / page_width,
+        _ => (geometry.top - position.y?) / page_height,
+    };
+    top.is_finite().then(|| top.clamp(0.0, 1.0))
+}
+
 fn pdf_object_number(object: &PdfObject) -> Option<f64> {
     object.as_float().ok().map(f64::from).filter(|value| value.is_finite())
 }
@@ -964,7 +1060,13 @@ mod tests {
             "Type" => "Annot",
             "Subtype" => "Link",
             "Rect" => vec![60.into(), 650.into(), 200.into(), 680.into()],
-            "Dest" => vec![second_page_id.into(), "Fit".into()],
+            "Dest" => vec![
+                second_page_id.into(),
+                "XYZ".into(),
+                60.into(),
+                600.into(),
+                Object::Null,
+            ],
         });
         let blank_region_id = document.add_object(dictionary! {
             "Type" => "Annot",
@@ -979,7 +1081,22 @@ mod tests {
             "Type" => "Annot",
             "Subtype" => "Link",
             "Rect" => vec![60.into(), 550.into(), 200.into(), 580.into()],
-            "Dest" => Object::Name(b"chapter".to_vec()),
+            "A" => dictionary! {
+                "S" => "GoTo",
+                "D" => Object::string_literal("chapter"),
+            },
+        });
+        let first_page_position_id = document.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Link",
+            "Rect" => vec![60.into(), 650.into(), 200.into(), 680.into()],
+            "Dest" => vec![
+                first_page_id.into(),
+                "XYZ".into(),
+                60.into(),
+                200.into(),
+                Object::Null,
+            ],
         });
         let unsafe_id = document.add_object(dictionary! {
             "Type" => "Annot",
@@ -1012,6 +1129,7 @@ mod tests {
                 "Type" => "Page",
                 "Parent" => pages_id,
                 "MediaBox" => vec![0.into(), 0.into(), 600.into(), 800.into()],
+                "Annots" => vec![first_page_position_id.into()],
             }
             .into(),
         );
@@ -1024,11 +1142,19 @@ mod tests {
             }
             .into(),
         );
+        let destination_name_tree_id = document.add_object(dictionary! {
+            "Names" => vec![
+                Object::string_literal("chapter"),
+                dictionary! {
+                    "D" => vec![second_page_id.into(), "FitH".into(), 400.into()],
+                }.into(),
+            ],
+        });
         let catalog_id = document.add_object(dictionary! {
             "Type" => "Catalog",
             "Pages" => pages_id,
-            "Dests" => dictionary! {
-                "chapter" => vec![second_page_id.into(), "Fit".into()],
+            "Names" => dictionary! {
+                "Dests" => destination_name_tree_id,
             },
         });
         document.trailer.set("Root", catalog_id);
@@ -1057,7 +1183,10 @@ mod tests {
         ));
         assert!(matches!(
             links[0][1].target,
-            NativePdfLinkTarget::Internal { page_index: 1 }
+            NativePdfLinkTarget::Internal {
+                page_index: 1,
+                top: Some(top),
+            } if (top - 0.25).abs() < 1e-9
         ));
         assert!(matches!(
             &links[0][2].target,
@@ -1066,12 +1195,21 @@ mod tests {
         ));
         assert!(matches!(
             links[0][3].target,
-            NativePdfLinkTarget::Internal { page_index: 1 }
+            NativePdfLinkTarget::Internal {
+                page_index: 1,
+                top: Some(top),
+            } if (top - 0.5).abs() < 1e-9
         ));
         assert!((links[0][0].x - 0.1).abs() < 1e-9);
         assert!((links[0][0].y - 0.0875).abs() < 1e-9);
         assert!((links[0][2].width - 0.3).abs() < 1e-9);
-        assert!(links[1].is_empty());
+        assert!(matches!(
+            links[1][0].target,
+            NativePdfLinkTarget::Internal {
+                page_index: 0,
+                top: Some(top),
+            } if (top - 0.75).abs() < 1e-9
+        ));
     }
 
     #[test]
@@ -1088,4 +1226,5 @@ mod tests {
 
         assert_eq!(rect, (0.75, 0.1, 0.125, 0.2));
     }
+
 }

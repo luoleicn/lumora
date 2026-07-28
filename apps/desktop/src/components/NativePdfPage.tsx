@@ -6,15 +6,13 @@ type NativePdfPageProps = {
   pageNumber: number;
   cssWidth: number;
   devicePixelRatio: number;
-  onLoad?: () => void;
 };
 
 export const NativePdfPage = memo(function NativePdfPage({
   sessionId,
   pageNumber,
   cssWidth,
-  devicePixelRatio,
-  onLoad
+  devicePixelRatio
 }: NativePdfPageProps) {
   const [source, setSource] = useState<string>();
   const [error, setError] = useState<string>();
@@ -59,7 +57,6 @@ export const NativePdfPage = memo(function NativePdfPage({
       src={source}
       alt=""
       draggable={false}
-      onLoad={onLoad}
     />
   );
 });
