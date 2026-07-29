@@ -65,4 +65,10 @@ describe("resolvePdfDestinationOffset", () => {
     expect(resolveNativePdfDestinationOffset(metrics, 0, 1.5)).toBe(800);
     expect(resolveNativePdfDestinationOffset(metrics, 1, Number.NaN)).toBe(820);
   });
+
+  it("rejects malformed native page indexes instead of falling back to page one", () => {
+    expect(resolveNativePdfDestinationOffset(metrics, Number.NaN, 0.5)).toBeUndefined();
+    expect(resolveNativePdfDestinationOffset(metrics, -1, 0.5)).toBeUndefined();
+    expect(resolveNativePdfDestinationOffset(metrics, 3, 0.5)).toBeUndefined();
+  });
 });

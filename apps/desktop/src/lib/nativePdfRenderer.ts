@@ -62,14 +62,52 @@ export async function openNativePdfDocument(bytes: Uint8Array): Promise<NativePd
       }
     });
   }
-  return invoke<NativePdfDocumentInfo>("native_pdf_open_upload", { uploadId });
+  return decodeNativePdfDocumentInfo(
+    await invoke<unknown>("native_pdf_open_upload", { uploadId })
+  );
 }
 
-export function openNativePdfPath(directory: string, fileName: string): Promise<NativePdfDocumentInfo> {
-  return invoke<NativePdfDocumentInfo>("native_pdf_open_path", {
+export async function openNativePdfPath(
+  directory: string,
+  fileName: string
+): Promise<NativePdfDocumentInfo> {
+  return decodeNativePdfDocumentInfo(await invoke<unknown>("native_pdf_open_path", {
     dir: directory,
     fileName
+  }));
+}
+
+/**
+ * Runtime boundary for the Rust -> TypeScript native PDF contract.
+ *
+ * A generic passed to `invoke` is only a compile-time assertion. Validate the
+ * actual JSON here so a renamed/missing destination field cannot silently
+ * degrade into page zero navigation.
+ */
+export function decodeNativePdfDocumentInfo(value: unknown): NativePdfDocumentInfo {
+  if (!isRecord(value) || typeof value.sessionId !== "string" || !Array.isArray(value.pages)) {
+    throw new Error("Native PDF metadata has an invalid document shape.");
+  }
+
+  const pageCount = value.pages.length;
+  const pages = value.pages.map((page, pageIndex) => {
+    if (!isRecord(page)
+      || !isPositiveFiniteNumber(page.width)
+      || !isPositiveFiniteNumber(page.height)) {
+      throw new Error(`Native PDF metadata has invalid dimensions for page ${pageIndex + 1}.`);
+    }
+
+    const rawLinks = Array.isArray(page.links) ? page.links : [];
+    return {
+      width: page.width,
+      height: page.height,
+      links: rawLinks
+        .map((link) => decodeNativePdfLink(link, pageCount))
+        .filter((link): link is NativePdfLink => link !== undefined)
+    };
   });
+
+  return { sessionId: value.sessionId, pages };
 }
 
 export async function renderNativePdfPage(
@@ -132,4 +170,55 @@ function schedulePageRender<T>(task: () => Promise<T>): Promise<T> {
       pageRenderQueue.push(run);
     }
   });
+}
+
+function decodeNativePdfLink(value: unknown, pageCount: number): NativePdfLink | undefined {
+  if (!isRecord(value)
+    || !isFiniteNumber(value.x)
+    || !isFiniteNumber(value.y)
+    || !isPositiveFiniteNumber(value.width)
+    || !isPositiveFiniteNumber(value.height)
+    || !isRecord(value.target)) {
+    return undefined;
+  }
+
+  const target = value.target;
+  let decodedTarget: NativePdfLinkTarget;
+  if (target.kind === "internal") {
+    if (!Number.isInteger(target.pageIndex)
+      || (target.pageIndex as number) < 0
+      || (target.pageIndex as number) >= pageCount
+      || (target.top !== undefined && !isFiniteNumber(target.top))) {
+      return undefined;
+    }
+    decodedTarget = {
+      kind: "internal",
+      pageIndex: target.pageIndex as number,
+      ...(target.top === undefined ? {} : { top: target.top as number })
+    };
+  } else if (target.kind === "external" && typeof target.url === "string") {
+    decodedTarget = { kind: "external", url: target.url };
+  } else {
+    return undefined;
+  }
+
+  return {
+    x: value.x,
+    y: value.y,
+    width: value.width,
+    height: value.height,
+    target: decodedTarget
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isPositiveFiniteNumber(value: unknown): value is number {
+  return isFiniteNumber(value) && value > 0;
 }

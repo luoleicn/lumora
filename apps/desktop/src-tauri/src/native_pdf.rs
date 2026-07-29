@@ -59,6 +59,10 @@ pub(crate) struct NativePdfLink {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub(crate) enum NativePdfLinkTarget {
     Internal {
+        // `rename_all` on an enum renames variants, not fields inside struct
+        // variants. Keep the IPC contract explicit so TypeScript receives the
+        // same `pageIndex` field used by the macOS/PDF.js navigation model.
+        #[serde(rename = "pageIndex")]
         page_index: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
         top: Option<f64>,
@@ -1234,4 +1238,21 @@ mod tests {
         assert_eq!(rect, (0.75, 0.1, 0.125, 0.2));
     }
 
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn serializes_internal_link_target_with_the_frontend_contract() {
+        let target = NativePdfLinkTarget::Internal {
+            page_index: 7,
+            top: Some(0.25),
+        };
+
+        assert_eq!(
+            serde_json::to_value(target).unwrap(),
+            serde_json::json!({
+                "kind": "internal",
+                "pageIndex": 7,
+                "top": 0.25,
+            })
+        );
+    }
 }

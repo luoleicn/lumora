@@ -39,7 +39,16 @@ export function resolveNativePdfDestinationOffset(
   metrics: PdfPageMetrics,
   pageIndex: number,
   normalizedTop?: number
-): number {
+): number | undefined {
+  // `pageOffset` intentionally clamps UI input, but PDF destinations come from
+  // an IPC contract. Invalid contract data must fail closed instead of being
+  // converted to the first page.
+  if (!Number.isInteger(pageIndex)
+    || pageIndex < 0
+    || pageIndex >= metrics.offsets.length
+    || pageIndex >= metrics.heights.length) {
+    return undefined;
+  }
   const pageTop = pageOffset(metrics, pageIndex);
   if (typeof normalizedTop !== "number" || !Number.isFinite(normalizedTop)) {
     return pageTop;

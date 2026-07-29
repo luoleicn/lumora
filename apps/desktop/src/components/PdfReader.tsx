@@ -1111,14 +1111,15 @@ function PdfReaderComponent({
     const element = scrollRef.current;
     const metrics = pageMetricsRef.current;
     const { pageIndex } = target;
-    if (!element || pageIndex < 0 || pageIndex >= metrics.heights.length) {
+    if (!element || !Number.isInteger(pageIndex)) {
+      return;
+    }
+    const destinationTop = resolveNativePdfDestinationOffset(metrics, pageIndex, target.top);
+    if (destinationTop === undefined) {
       return;
     }
     linkReturnControllerRef.current!.beginLink(element.scrollTop);
-    scrollToPdfOffset(
-      resolveNativePdfDestinationOffset(metrics, pageIndex, target.top),
-      "auto"
-    );
+    scrollToPdfOffset(destinationTop, "auto");
   }, []);
 
   function scheduleZoom(nextZoom: number) {
