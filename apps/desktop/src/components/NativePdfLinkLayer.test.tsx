@@ -23,6 +23,7 @@ describe("NativePdfLinkLayer", () => {
           }
         ]}
         onInternalLink={vi.fn()}
+        onExternalLink={vi.fn()}
       />
     );
 
@@ -33,5 +34,29 @@ describe("NativePdfLinkLayer", () => {
     expect(markup).toContain("left:10.0000%");
     expect(markup.match(/<a /g)).toHaveLength(1);
     expect(markup.match(/<button /g)).toHaveLength(1);
+  });
+
+  it("keeps external link regions from becoming WebKit drag sources", () => {
+    const markup = renderToStaticMarkup(
+      <NativePdfLinkLayer
+        links={[
+          {
+            x: 0.5,
+            y: 0.6,
+            width: 0.2,
+            height: 0.05,
+            target: { kind: "external", url: "https://example.com/image-link" }
+          }
+        ]}
+        onInternalLink={vi.fn()}
+        onExternalLink={vi.fn()}
+      />
+    );
+
+    // An empty anchor is a WebKit drag source: without this the press starts a
+    // link drag and no click ever reaches the reader.
+    expect(markup).toContain('draggable="false"');
+    // The href stays so the region keeps link affordances (cursor, tooltip).
+    expect(markup).toContain('href="https://example.com/image-link"');
   });
 });

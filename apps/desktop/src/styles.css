@@ -1658,6 +1658,14 @@ body.paper-pointer-dragging * {
 .native-pdf-link-layer > :is(a, button) {
   position: absolute;
   pointer-events: auto;
+  /* These hit regions carry no content, so WebKit's default link/text drag
+     turns a slightly imprecise press into a drag and swallows the click. */
+  -webkit-user-drag: none;
+  user-select: none;
+}
+
+.native-pdf-link-layer > a {
+  cursor: pointer;
 }
 
 .native-pdf-link-layer > button {
@@ -1867,6 +1875,23 @@ body.paper-pointer-dragging * {
     linear-gradient(135deg, rgba(48, 180, 143, 0.1), rgba(40, 125, 101, 0)),
     #f4f5f7;
   flex: 1;
+}
+
+.pdf-link-error {
+  position: absolute;
+  z-index: 40;
+  right: 16px;
+  bottom: 16px;
+  max-width: 420px;
+  padding: 10px 14px;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  background: #fef2f2;
+  box-shadow: 0 6px 18px rgba(29, 41, 57, 0.18);
+  color: #9a3412;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .pdf-status {

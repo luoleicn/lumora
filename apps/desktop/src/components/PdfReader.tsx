@@ -16,7 +16,8 @@ import {
   findInNativePdfText,
   shouldUseNativePdfRenderer,
   type NativePdfDocumentInfo,
-  type NativePdfInternalLinkTarget
+  type NativePdfInternalLinkTarget,
+  type NativePdfLink
 } from "../lib/nativePdfRenderer";
 import {
   findInPageTextLayer,
@@ -209,6 +210,11 @@ function PdfReaderComponent({
   const [pageJumpOpen, setPageJumpOpen] = useState(false);
   const [pageJumpValue, setPageJumpValue] = useState("");
   const [loadError, setLoadError] = useState<string>();
+  // A link that fails to reach the system browser is otherwise silent: release
+  // builds have no console, so the reader reports it inline.
+  const [pdfLinkError, setPdfLinkError] = useState<string>();
+  // Plain-text URLs recovered from each page's text layer, by page index.
+  const [textLinks, setTextLinks] = useState<Record<number, NativePdfLink[]>>({});
   const [storedPdfSize, setStoredPdfSize] = useState<number>();
   const [rangeFallbackFileData, setRangeFallbackFileData] = useState<Uint8Array>();
   const [findMatches, setFindMatches] = useState<PdfSearchMatch[]>([]);
@@ -286,6 +292,28 @@ function PdfReaderComponent({
     ),
     [annotations, fileAsset?.sha256]
   );
+
+  useEffect(() => {
+    if (!pdfLinkError) {
+      return;
+    }
+    const timer = window.setTimeout(() => setPdfLinkError(undefined), 6000);
+    return () => window.clearTimeout(timer);
+  }, [pdfLinkError]);
+
+  useEffect(() => {
+    setTextLinks({});
+  }, [nativePdfSessionId]);
+
+  const linksByPage = useMemo(() => {
+    if (nativeRenderer.status !== "ready") {
+      return [];
+    }
+    return nativeRenderer.document.pages.map((page, index) => {
+      const detected = textLinks[index];
+      return detected?.length ? [...page.links, ...detected] : page.links;
+    });
+  }, [nativeRenderer, textLinks]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1122,6 +1150,25 @@ function PdfReaderComponent({
     scrollToPdfOffset(destinationTop, "auto");
   }, []);
 
+  const registerTextLinks = useCallback((pageNumber: number, links: NativePdfLink[]) => {
+    setTextLinks((current) => {
+      const existing = current[pageNumber - 1];
+      if (existing === undefined ? links.length === 0 : sameTextLinks(existing, links)) {
+        // Re-parsing a page must not hand back a fresh array forever: that would
+        // re-render the link layer on every text load.
+        return current;
+      }
+      return { ...current, [pageNumber - 1]: links };
+    });
+  }, []);
+
+  const handleNativePdfExternalLink = useCallback((url: string) => {
+    void invoke("open_external_url", { url }).catch((error) => {
+      setPdfLinkError(`Failed to open ${url} in the default browser.`);
+      console.error("Failed to open PDF link in the default browser.", error);
+    });
+  }, []);
+
   function scheduleZoom(nextZoom: number) {
     if (!pdfRenderPolicy.debounceZoom) {
       // zoomRef only syncs post-render; update it now so wheel events landing
@@ -1203,9 +1250,7 @@ function PdfReaderComponent({
 
     event.preventDefault();
     event.stopPropagation();
-    void invoke("open_external_url", { url }).catch((error) => {
-      console.error("Failed to open PDF link in the default browser.", error);
-    });
+    handleNativePdfExternalLink(url);
   }
 
   if (!paper) {
@@ -1238,6 +1283,11 @@ function PdfReaderComponent({
       onClickCapture={handlePdfLinkClick}
     >
       <div className="reader-body">
+        {pdfLinkError && (
+          <div className="pdf-link-error" role="alert">
+            {pdfLinkError}
+          </div>
+        )}
         <div
           ref={scrollRef}
           className="pdf-scroll"
@@ -1294,10 +1344,12 @@ function PdfReaderComponent({
                     page={nativeRenderer.document.pages[index]}
                     cssHeight={pageMetrics.heights[index]}
                     onReady={refreshVisibleSearchHighlights}
+                    onTextLinks={registerTextLinks}
                   />
                   <NativePdfLinkLayer
-                    links={nativeRenderer.document.pages[index].links}
+                    links={linksByPage[index] ?? nativeRenderer.document.pages[index].links}
                     onInternalLink={handleNativePdfInternalLink}
+                    onExternalLink={handleNativePdfExternalLink}
                   />
                   <AnnotationOverlay
                     annotations={visibleAnnotations.filter((annotation) => annotation.pageIndex === index)}
@@ -1521,6 +1573,19 @@ function annotationsEqual(previous: Annotation[], next: Annotation[]) {
       && annotation.pageIndex === nextAnnotation.pageIndex
       && annotation.rects === nextAnnotation.rects
       && annotation.notePosition === nextAnnotation.notePosition;
+  });
+}
+
+function sameTextLinks(previous: NativePdfLink[], next: NativePdfLink[]) {
+  return previous.length === next.length && previous.every((link, index) => {
+    const nextLink = next[index];
+    return link.x === nextLink.x
+      && link.y === nextLink.y
+      && link.width === nextLink.width
+      && link.target.kind === nextLink.target.kind
+      && (link.target.kind !== "external"
+        || nextLink.target.kind !== "external"
+        || link.target.url === nextLink.target.url);
   });
 }
 

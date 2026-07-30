@@ -7,11 +7,13 @@ import type {
 type NativePdfLinkLayerProps = {
   links: NativePdfLink[];
   onInternalLink: (target: NativePdfInternalLinkTarget) => void;
+  onExternalLink: (url: string) => void;
 };
 
 export const NativePdfLinkLayer = memo(function NativePdfLinkLayer({
   links,
-  onInternalLink
+  onInternalLink,
+  onExternalLink
 }: NativePdfLinkLayerProps) {
   return (
     <div className="native-pdf-link-layer" aria-hidden={links.length === 0}>
@@ -35,13 +37,25 @@ export const NativePdfLinkLayer = memo(function NativePdfLinkLayer({
             />
           );
         }
+        const url = link.target.url;
         return (
           <a
-            key={`${index}-external-${link.target.url}`}
-            href={link.target.url}
-            aria-label={`Open ${link.target.url}`}
-            title={link.target.url}
+            key={`${index}-external-${url}`}
+            href={url}
+            aria-label={`Open ${url}`}
+            title={url}
             style={style}
+            // WebKit treats every anchor as a native drag source, and these hit
+            // regions are empty boxes: pressing one and moving a pixel starts a
+            // link drag instead of producing a click, so the link reads as dead.
+            draggable={false}
+            // Open through the handler rather than relying only on the reader's
+            // delegated capture listener, which is shared with the PDF.js path.
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onExternalLink(url);
+            }}
           />
         );
       })}

@@ -223,11 +223,28 @@ pub(crate) async fn native_pdf_page_text(
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        String::from_utf8(output.stdout)
-            .map_err(|error| format!("Native PDF text is not valid UTF-8: {error}"))
+        let text = String::from_utf8(output.stdout)
+            .map_err(|error| format!("Native PDF text is not valid UTF-8: {error}"))?;
+        Ok(strip_non_xml_characters(&text))
     })
     .await
     .map_err(|error| format!("Native PDF text task failed: {error}"))?
+}
+
+/// A glyph with no Unicode mapping — common in the maths fonts papers use — is
+/// copied straight through by pdftotext, so `-bbox-layout` can emit a raw
+/// control character such as U+0001 inside a `<word>`. XML 1.0 forbids those,
+/// and a strict DOM parser stops at the first one and keeps only the prefix it
+/// already built: every later word silently disappears from the text layer.
+fn strip_non_xml_characters(value: &str) -> String {
+    value.chars().filter(|character| is_xml_character(*character)).collect()
+}
+
+fn is_xml_character(character: char) -> bool {
+    matches!(character, '\u{9}' | '\u{A}' | '\u{D}')
+        || matches!(character, '\u{20}'..='\u{D7FF}')
+        || matches!(character, '\u{E000}'..='\u{FFFD}')
+        || matches!(character, '\u{10000}'..='\u{10FFFF}')
 }
 
 #[tauri::command]
@@ -1042,6 +1059,20 @@ mod tests {
         assert_eq!(pages[0].height, 792.0);
         assert_eq!(pages[1].width, 841.89);
         assert_eq!(pages[1].height, 595.276);
+    }
+
+    #[test]
+    fn strips_only_the_characters_xml_cannot_carry() {
+        // The word body is what pdftotext produced for an unmapped maths glyph.
+        assert_eq!(
+            super::strip_non_xml_characters("<word xMin=\"1\">\u{1}</word>\n<word>ok</word>"),
+            "<word xMin=\"1\"></word>\n<word>ok</word>"
+        );
+        assert_eq!(
+            super::strip_non_xml_characters("tab\there\r\nnewline \u{fffe} ok"),
+            "tab\there\r\nnewline  ok"
+        );
+        assert_eq!(super::strip_non_xml_characters("émoji 🙂 ✓"), "émoji 🙂 ✓");
     }
 
     #[test]
