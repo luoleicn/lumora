@@ -10,6 +10,7 @@ import { NativePdfLinkLayer } from "./NativePdfLinkLayer";
 import { NativePdfPage } from "./NativePdfPage";
 import { NativePdfTextLayer } from "./NativePdfTextLayer";
 import { createId } from "../lib/id";
+import { resolveNoteDraft } from "../lib/annotationNotes";
 import {
   openNativePdfDocument,
   openNativePdfPath,
@@ -95,13 +96,18 @@ type ExistingAnnotationContextMenu = {
   x: number;
   y: number;
   annotation: Annotation;
-  mode: "actions" | "note" | "viewNote" | "translate";
+  mode: "actions" | "note" | "translate";
   noteText: string;
   selectionBased?: boolean;
   translation?: TranslationState;
 };
 
 type AnnotationContextMenu = NewAnnotationContextMenu | ExistingAnnotationContextMenu;
+
+type NotePopoverSize = {
+  width: number;
+  height: number;
+};
 
 export type PdfSearchState = {
   totalMatches: number;
@@ -207,6 +213,9 @@ function PdfReaderComponent({
   const hasExplicitZoomRef = useRef(viewState?.zoom !== undefined);
   const [color, setColor] = useState(colors[0]);
   const [contextMenu, setContextMenu] = useState<AnnotationContextMenu>();
+  // Note editors are per page, but the size the user drags one to belongs to
+  // the reader: the next note opens at that size, whichever page it is on.
+  const notePopoverSizeRef = useRef<NotePopoverSize>(undefined);
   const [pageJumpOpen, setPageJumpOpen] = useState(false);
   const [pageJumpValue, setPageJumpValue] = useState("");
   const [loadError, setLoadError] = useState<string>();
@@ -421,9 +430,18 @@ function PdfReaderComponent({
       }
     };
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setContextMenu(undefined);
+      if (event.key !== "Escape") {
+        return;
       }
+
+      // Escape leaves the note editor the way clicking outside does: the text
+      // typed so far is saved rather than dropped.
+      if (contextMenu.mode === "note") {
+        saveContextMenuNote(contextMenu, contextMenu.noteText);
+        return;
+      }
+
+      setContextMenu(undefined);
     };
 
     window.addEventListener("pointerdown", closeMenu);
@@ -919,19 +937,27 @@ function PdfReaderComponent({
     setContextMenu(undefined);
   }
 
-  function updateAnnotationWithNote(annotation: Annotation, comment: string) {
-    const trimmed = comment.trim();
-    if (!trimmed) {
-      setContextMenu(undefined);
+  function saveContextMenuNote(menu: AnnotationContextMenu, noteText: string) {
+    if (menu.kind === "existing") {
+      updateAnnotationWithNote(menu.annotation, noteText);
       return;
     }
 
-    onCreateAnnotation({
-      ...annotation,
-      kind: "note",
-      comment: trimmed,
-      updatedAt: new Date().toISOString()
-    });
+    if (noteText.trim()) {
+      createAnnotation("note", menu.selection, noteText);
+      return;
+    }
+
+    window.getSelection()?.removeAllRanges();
+    setContextMenu(undefined);
+  }
+
+  function updateAnnotationWithNote(annotation: Annotation, comment: string) {
+    const updated = resolveNoteDraft(annotation, comment);
+    if (updated) {
+      onCreateAnnotation(updated);
+    }
+
     setContextMenu(undefined);
   }
 
@@ -1354,6 +1380,8 @@ function PdfReaderComponent({
                   <AnnotationOverlay
                     annotations={visibleAnnotations.filter((annotation) => annotation.pageIndex === index)}
                     onMoveAnnotation={(annotation, position) => onCreateAnnotation(moveNoteMarker(annotation, position))}
+                    noteSizeRef={notePopoverSizeRef}
+                    onUpdateNote={onCreateAnnotation}
                     onOpenAnnotationMenu={(annotation, event) => {
                       event.preventDefault();
                       event.stopPropagation();
@@ -1424,6 +1452,8 @@ function PdfReaderComponent({
                     <AnnotationOverlay
                       annotations={visibleAnnotations.filter((annotation) => annotation.pageIndex === index)}
                       onMoveAnnotation={(annotation, position) => onCreateAnnotation(moveNoteMarker(annotation, position))}
+                      noteSizeRef={notePopoverSizeRef}
+                      onUpdateNote={onCreateAnnotation}
                       onOpenAnnotationMenu={(annotation, event) => {
                         event.preventDefault();
                         event.stopPropagation();
@@ -1475,9 +1505,6 @@ function PdfReaderComponent({
             onClose={() => setContextMenu(undefined)}
             onChangeNote={(noteText) => setContextMenu((current) => current ? { ...current, noteText } : current)}
             onStartNote={() => setContextMenu((current) => current ? { ...current, mode: "note" } : current)}
-            onShowNote={() => setContextMenu((current) =>
-              current?.kind === "existing" ? { ...current, mode: "viewNote" } : current
-            )}
             onHighlight={() => {
               if (contextMenu.kind === "new") {
                 createAnnotation("highlight", contextMenu.selection);
@@ -1491,16 +1518,7 @@ function PdfReaderComponent({
               setContextMenu(undefined);
             }}
             onDeleteNote={removeNoteFromAnnotation}
-            onSaveNote={(noteText) => {
-              if (contextMenu.kind === "existing") {
-                updateAnnotationWithNote(contextMenu.annotation, noteText);
-              } else if (noteText.trim()) {
-                createAnnotation("note", contextMenu.selection, noteText);
-              } else {
-                window.getSelection()?.removeAllRanges();
-                setContextMenu(undefined);
-              }
-            }}
+            onSaveNote={(noteText) => saveContextMenuNote(contextMenu, noteText)}
           />
         )}
         {pageJumpOpen && (
@@ -1591,14 +1609,21 @@ function sameTextLinks(previous: NativePdfLink[], next: NativePdfLink[]) {
 
 function AnnotationOverlay({
   annotations,
+  noteSizeRef,
   onMoveAnnotation,
+  onUpdateNote,
   onOpenAnnotationMenu
 }: {
   annotations: Annotation[];
+  /** Last size the user dragged a note editor to, shared by every page so the
+   * next note opens at the size they picked instead of snapping back. */
+  noteSizeRef: MutableRefObject<NotePopoverSize | undefined>;
   onMoveAnnotation: (annotation: Annotation, position: NonNullable<Annotation["notePosition"]>) => void;
+  onUpdateNote: (annotation: Annotation) => void;
   onOpenAnnotationMenu: (annotation: Annotation, event: React.MouseEvent) => void;
 }) {
   const [openNoteId, setOpenNoteId] = useState<string>();
+  const [noteDraft, setNoteDraft] = useState("");
   // Visual position of the marker being dragged. Kept local so a drag never
   // touches the library state (whose every update re-renders the app and
   // enqueues a whole-library diff + SQLite write); the move is committed once
@@ -1621,11 +1646,26 @@ function AnnotationOverlay({
     lastPosition?: NonNullable<Annotation["notePosition"]>;
   } | undefined>(undefined);
   const suppressClickRef = useRef<string | undefined>(undefined);
+  const overlayRef = useRef<HTMLDivElement>(null);
   const notePopoverRef = useRef<HTMLElement>(null);
+  const noteTextareaRef = useRef<HTMLTextAreaElement>(null);
   const openNote = annotations.find((annotation) => annotation.id === openNoteId && annotation.kind === "note");
   const openNotePosition = openNote
     ? dragPosition?.annotationId === openNote.id ? dragPosition : getNoteMarkerPosition(openNote)
     : undefined;
+
+  // The open note is edited in place, so every way of leaving it (outside
+  // click, close button, Escape, the page scrolling out of the virtual window)
+  // has to save the draft. The commit goes through a ref so those callers —
+  // including effect cleanups that captured an older render — always see the
+  // latest draft.
+  const commitNoteDraftRef = useRef(() => {});
+  commitNoteDraftRef.current = () => {
+    const updated = openNote && resolveNoteDraft(openNote, noteDraft);
+    if (updated) {
+      onUpdateNote(updated);
+    }
+  };
 
   // The commit round-trips through the app state; keep showing the local drag
   // position until the updated annotation arrives so the marker never snaps
@@ -1637,18 +1677,67 @@ function AnnotationOverlay({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [annotations]);
 
+  useEffect(() => () => commitNoteDraftRef.current(), []);
+
+  // Opening a note hands it straight to the keyboard, caret after the existing
+  // text. `preventScroll` matters: the reader is a virtualized scroller, and a
+  // focus-driven scroll would drag the page out from under the click.
+  useEffect(() => {
+    const textarea = noteTextareaRef.current;
+    if (!textarea) {
+      return;
+    }
+
+    textarea.focus({ preventScroll: true });
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+  }, [openNoteId]);
+
+  // Remember the size the user drags the editor to. Written through a ref
+  // rather than state: a resize must not re-render the page list mid-drag.
+  useEffect(() => {
+    const popover = notePopoverRef.current;
+    if (!popover) {
+      return undefined;
+    }
+
+    const observer = new ResizeObserver(() => {
+      noteSizeRef.current = { width: popover.offsetWidth, height: popover.offsetHeight };
+    });
+    observer.observe(popover);
+    return () => observer.disconnect();
+  }, [openNoteId, noteSizeRef]);
+
   useEffect(() => {
     if (!openNote) return;
     const handlePointerDown = (event: PointerEvent) => {
       if (!(event.target instanceof Element)) return;
-      // Keep open when clicking inside the popover or on a note marker.
+      // Keep open when clicking inside the popover or on one of this page's
+      // markers; a marker on another page opens its own editor, so this one
+      // saves and closes.
       if (notePopoverRef.current?.contains(event.target)) return;
-      if (event.target.closest(".note-marker")) return;
+      const marker = event.target.closest(".note-marker");
+      if (marker && overlayRef.current?.contains(marker)) return;
+      commitNoteDraftRef.current();
       setOpenNoteId(undefined);
     };
     window.addEventListener("pointerdown", handlePointerDown);
     return () => window.removeEventListener("pointerdown", handlePointerDown);
   }, [openNote]);
+
+  function openNoteEditor(annotation: Annotation) {
+    if (openNoteId === annotation.id) {
+      return;
+    }
+
+    commitNoteDraftRef.current();
+    setNoteDraft(annotation.comment ?? "");
+    setOpenNoteId(annotation.id);
+  }
+
+  function closeNoteEditor() {
+    commitNoteDraftRef.current();
+    setOpenNoteId(undefined);
+  }
 
   function handleMarkerPointerDown(annotation: Annotation, event: React.PointerEvent<HTMLButtonElement>) {
     if (event.button !== 0) {
@@ -1713,14 +1802,14 @@ function AnnotationOverlay({
       if (drag.lastPosition) {
         onMoveAnnotation(drag.annotation, drag.lastPosition);
       }
-      setOpenNoteId(drag.annotation.id);
+      openNoteEditor(drag.annotation);
     }
 
     markerDragRef.current = undefined;
   }
 
   return (
-    <div className="annotation-overlay">
+    <div className="annotation-overlay" ref={overlayRef}>
       {annotations.flatMap((annotation) =>
         annotation.rects.map((rect, rectIndex) => (
           <span
@@ -1761,15 +1850,20 @@ function AnnotationOverlay({
                 return;
               }
 
-              setOpenNoteId((current) => current === annotation.id ? undefined : annotation.id);
+              if (openNoteId === annotation.id) {
+                closeNoteEditor();
+                return;
+              }
+
+              openNoteEditor(annotation);
             }}
             onPointerDown={(event) => handleMarkerPointerDown(annotation, event)}
             onPointerMove={handleMarkerPointerMove}
             onPointerUp={handleMarkerPointerUp}
             onPointerCancel={handleMarkerPointerUp}
             onContextMenu={(event) => onOpenAnnotationMenu(annotation, event)}
-            aria-label="Show note"
-            title="Drag to move note"
+            aria-label="Edit note"
+            title="Click to edit, drag to move"
           >
             <MessageSquare size={12} />
           </button>
@@ -1781,16 +1875,40 @@ function AnnotationOverlay({
           className="note-popover"
           style={{
             left: `${Math.min(0.84, openNotePosition.x) * 100}%`,
-            top: `${Math.min(0.92, openNotePosition.y + 0.035) * 100}%`
+            top: `${Math.min(0.92, openNotePosition.y + 0.035) * 100}%`,
+            ...noteSizeRef.current
           }}
+          // The reader turns pointer-ups into selection menus and right-clicks
+          // into annotation menus; inside the editor both belong to the text.
+          onPointerUp={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.stopPropagation()}
         >
           <header>
             <span>Note</span>
-            <button type="button" onClick={() => setOpenNoteId(undefined)} aria-label="Close note">
+            <button
+              type="button"
+              onPointerDown={(event) => event.preventDefault()}
+              onClick={closeNoteEditor}
+              aria-label="Close note"
+            >
               <X size={13} />
             </button>
           </header>
-          <p>{openNote.comment}</p>
+          <textarea
+            ref={noteTextareaRef}
+            value={noteDraft}
+            onChange={(event) => setNoteDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                event.stopPropagation();
+                closeNoteEditor();
+              }
+            }}
+            placeholder="Add a note"
+            aria-label="Note text"
+          />
+          <span className="note-popover-hint">Click outside to save</span>
         </aside>
       )}
     </div>
@@ -1827,7 +1945,6 @@ function AnnotationContextMenu({
   onClose,
   onChangeNote,
   onStartNote,
-  onShowNote,
   onHighlight,
   onTranslate,
   onOpenDictionaryPage,
@@ -1841,7 +1958,6 @@ function AnnotationContextMenu({
   onClose: () => void;
   onChangeNote: (noteText: string) => void;
   onStartNote: () => void;
-  onShowNote: () => void;
   onHighlight: () => void;
   onTranslate: (quote: string) => void;
   onOpenDictionaryPage: (url: string) => void;
@@ -1910,22 +2026,12 @@ function AnnotationContextMenu({
               <Languages size={16} />
             </button>
           )}
+          <button type="button" onClick={onStartNote} aria-label="Edit note" title="Edit note">
+            <MessageSquare size={16} />
+          </button>
           <button type="button" className="danger text-action" onClick={() => onDeleteNote(menu.annotation)}>
             <Trash2 size={16} />
             Delete Note
-          </button>
-        </div>
-      ) : menu.mode === "viewNote" && menu.kind === "existing" ? (
-        <div className="context-note-view">
-          <blockquote>{menu.annotation.comment || "No note content."}</blockquote>
-          {quote && (
-            <button type="button" onClick={() => onTranslate(quote)} aria-label="Translate" title="Translate">
-              <Languages size={16} />
-            </button>
-          )}
-          <button type="button" className="danger" onClick={() => onDeleteAnnotation(menu.annotation)}>
-            <Trash2 size={16} />
-            Delete Annotation
           </button>
         </div>
       ) : menu.kind === "existing" ? (
@@ -1935,17 +2041,10 @@ function AnnotationContextMenu({
               <Languages size={16} />
             </button>
           )}
-          {menu.annotation.kind === "note" ? (
-            <button type="button" onClick={onShowNote}>
-              <MessageSquare size={16} />
-              Show Note
-            </button>
-          ) : (
-            <button type="button" onClick={onStartNote}>
-              <MessageSquare size={16} />
-              {menu.selectionBased ? "Note" : "Add Note"}
-            </button>
-          )}
+          <button type="button" onClick={onStartNote}>
+            <MessageSquare size={16} />
+            {menu.annotation.kind === "note" ? "Edit Note" : menu.selectionBased ? "Note" : "Add Note"}
+          </button>
           <button type="button" className="danger" onClick={() => onDeleteAnnotation(menu.annotation)}>
             <Trash2 size={16} />
             {menu.selectionBased ? "Delete Highlight" : "Delete Annotation"}
@@ -2021,15 +2120,11 @@ function getContextMenuTitle(menu: AnnotationContextMenu) {
   }
 
   if (menu.mode === "note") {
-    return "Add note to highlight";
+    return menu.annotation.kind === "note" ? "Note" : "Add note to highlight";
   }
 
   if (menu.mode === "translate") {
     return "Translation";
-  }
-
-  if (menu.mode === "viewNote") {
-    return "Note";
   }
 
   return menu.annotation.kind === "note" ? "Note annotation" : "Highlight annotation";

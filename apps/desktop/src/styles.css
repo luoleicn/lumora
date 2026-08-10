@@ -1753,9 +1753,21 @@ body.paper-pointer-dragging * {
 }
 
 .note-popover {
+  display: flex;
   position: absolute;
   z-index: 7;
   width: 240px;
+  min-width: 190px;
+  max-width: 560px;
+  /* Header + a full-height textarea + the hint; below this the frame would
+     start clipping its own content. */
+  min-height: 164px;
+  max-height: 80vh;
+  flex-direction: column;
+  /* The corner grip resizes the whole editor; the textarea grows with it.
+     `resize` only applies when overflow is not visible. */
+  resize: both;
+  overflow: hidden;
   transform: translate(8px, 2px);
   border: 1px solid #b9c4ce;
   border-radius: 8px;
@@ -1767,6 +1779,7 @@ body.paper-pointer-dragging * {
 
 .note-popover header {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
@@ -1791,12 +1804,30 @@ body.paper-pointer-dragging * {
   background: #edf2f5;
 }
 
-.note-popover p {
-  margin: 8px 0 0;
+.note-popover textarea {
+  display: block;
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 84px;
+  /* The popover frame carries the resize grip, so the textarea just fills it. */
+  resize: none;
+  margin-top: 8px;
+  border: 1px solid #d3dbe3;
+  border-radius: 7px;
+  background: #ffffff;
   color: #30363d;
+  padding: 8px;
   font-size: 12px;
   line-height: 1.45;
-  overflow-wrap: anywhere;
+}
+
+.note-popover .note-popover-hint {
+  display: block;
+  flex: 0 0 auto;
+  /* Clears the corner grip so the hint never sits underneath it. */
+  margin: 6px 12px 0 0;
+  color: #68727d;
+  font-size: 11px;
 }
 
 .context-swatches {
@@ -1989,23 +2020,6 @@ body.paper-pointer-dragging * {
   padding: 8px;
 }
 
-.context-note-view {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.context-note-view blockquote {
-  margin: 0;
-  border-left: 3px solid #d8dee5;
-  color: #30363d;
-  font-size: 12px;
-  line-height: 1.45;
-  padding-left: 9px;
-  overflow-wrap: anywhere;
-}
-
-.context-note-view button,
 .pdf-context-menu .button-row button {
   display: inline-flex;
   align-items: center;
@@ -2095,7 +2109,6 @@ body.paper-pointer-dragging * {
   background: #eef6f3;
 }
 
-.context-note-view button:hover,
 .pdf-context-menu .button-row button:hover {
   background: #eef6f3;
 }
