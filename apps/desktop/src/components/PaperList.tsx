@@ -3,6 +3,7 @@ import type { FileAsset, LibraryState, Paper } from "@lumora/shared";
 import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import { resolveVirtualListRange } from "../lib/listVirtualization";
 import { getCollectionOptions, type CollectionOption } from "../lib/libraryActions";
+import type { PaperSelectionMode } from "../lib/paperSelection";
 import { collapseCjkSpaces, splitSnippet, type PaperSearchMeta, type SearchMatchedField } from "../lib/searchIndex";
 
 const matchedFieldLabels: Record<SearchMatchedField, string> = {
@@ -66,8 +67,10 @@ type PaperListProps = {
   papers: Paper[];
   searchMeta?: Map<string, PaperSearchMeta>;
   selectedPaperId?: string;
+  selectedPaperIds: ReadonlySet<string>;
   selectedCollectionId: string;
-  onSelectPaper: (id: string) => void;
+  onSelectPaper: (id: string, mode?: PaperSelectionMode) => void;
+  onSelectAllPapers: () => void;
   onOpenPaper: (id: string) => void;
   onUpdatePaper: (paper: Paper) => void;
   onPaperDragStart: (paperId: string) => void;
@@ -86,8 +89,10 @@ export function PaperList({
   papers,
   searchMeta,
   selectedPaperId,
+  selectedPaperIds,
   selectedCollectionId,
   onSelectPaper,
+  onSelectAllPapers,
   onOpenPaper,
   onUpdatePaper,
   onPaperDragStart,
@@ -184,6 +189,28 @@ export function PaperList({
     };
   }, [contextMenu]);
 
+  useEffect(() => {
+    const handleSelectAllKeyDown = (event: KeyboardEvent) => {
+      const target = event.target instanceof Element ? event.target : undefined;
+      const isEditingText = Boolean(target?.closest("input, textarea, select, [contenteditable='true']"));
+      if (
+        event.key.toLowerCase() !== "a"
+        || (!event.metaKey && !event.ctrlKey)
+        || event.altKey
+        || event.shiftKey
+        || isEditingText
+      ) {
+        return;
+      }
+
+      event.preventDefault();
+      onSelectAllPapers();
+    };
+
+    window.addEventListener("keydown", handleSelectAllKeyDown);
+    return () => window.removeEventListener("keydown", handleSelectAllKeyDown);
+  }, [onSelectAllPapers]);
+
   function handleSort(nextSortKey: SortKey) {
     if (searchMeta) {
       setSearchSortOverride(true);
@@ -255,7 +282,9 @@ export function PaperList({
 
   function handlePaperContextMenu(event: React.MouseEvent<HTMLTableRowElement>, paperId: string) {
     event.preventDefault();
-    onSelectPaper(paperId);
+    if (!selectedPaperIds.has(paperId)) {
+      onSelectPaper(paperId);
+    }
     setContextMenu({ paperId, x: event.clientX, y: event.clientY });
   }
 
@@ -265,6 +294,7 @@ export function PaperList({
     }
 
     event.preventDefault();
+    tableWrapRef.current?.focus({ preventScroll: true });
     internalPaperDragRef.current?.cleanup();
 
     const previousUserSelect = document.body.style.userSelect;
@@ -333,12 +363,17 @@ export function PaperList({
     <section className="paper-list">
       <header className="paper-table-title">
         <h2>Documents</h2>
-        <span>{papers.length} shown</span>
+        <span>
+          {selectedPaperIds.size > 0 && `${selectedPaperIds.size} selected · `}
+          {papers.length} shown
+        </span>
       </header>
 
       <div
         ref={tableWrapRef}
         className={resizingColumn ? "paper-table-wrap resizing-columns" : "paper-table-wrap"}
+        tabIndex={0}
+        aria-label="Documents list"
         onScroll={(event) => {
           const scrollTop = event.currentTarget.scrollTop;
           setTableViewport((current) => current.scrollTop === scrollTop ? current : { ...current, scrollTop });
@@ -350,7 +385,12 @@ export function PaperList({
             <p>{searchMeta ? "No matches in library." : "No papers in this collection."}</p>
           </div>
         ) : (
-          <table className={resizingColumn ? "paper-table resizing-columns" : "paper-table"} style={{ minWidth: tableMinWidth }}>
+          <table
+            className={resizingColumn ? "paper-table resizing-columns" : "paper-table"}
+            style={{ minWidth: tableMinWidth }}
+            role="grid"
+            aria-multiselectable="true"
+          >
             <colgroup>
               {paperColumns.map((column) => (
                 <col key={column.key} style={{ width: columnWidths[column.key] }} />
@@ -402,8 +442,14 @@ export function PaperList({
                     searchMeta={searchMeta?.get(paper.id)}
                     fileAsset={anyPdf}
                     pdfState={pdfState}
-                    active={paper.id === selectedPaperId}
-                    onClick={() => onSelectPaper(paper.id)}
+                    active={selectedPaperIds.has(paper.id)}
+                    primary={paper.id === selectedPaperId}
+                    onClick={(event) => onSelectPaper(
+                      paper.id,
+                      event.shiftKey
+                        ? event.metaKey || event.ctrlKey ? "add-range" : "range"
+                        : event.metaKey || event.ctrlKey ? "toggle" : "replace"
+                    )}
                     onDoubleClick={() => onOpenPaper(paper.id)}
                     onUpdatePaper={onUpdatePaper}
                     onPointerDown={(event) => handlePaperPointerDown(event, paper.id)}
@@ -518,6 +564,7 @@ function PaperRow({
   fileAsset,
   pdfState,
   active,
+  primary,
   onClick,
   onDoubleClick,
   onUpdatePaper,
@@ -529,7 +576,8 @@ function PaperRow({
   fileAsset?: FileAsset;
   pdfState: PdfState;
   active: boolean;
-  onClick: () => void;
+  primary: boolean;
+  onClick: (event: React.MouseEvent<HTMLTableRowElement>) => void;
   onDoubleClick: () => void;
   onUpdatePaper: (paper: Paper) => void;
   onPointerDown: (event: React.PointerEvent<HTMLTableRowElement>) => void;
@@ -540,6 +588,8 @@ function PaperRow({
   return (
     <tr
       className={`${active ? "active " : ""}${paper.unread ? "unread" : ""}`}
+      aria-selected={active}
+      data-primary-selection={primary ? "true" : undefined}
       onClick={onClick}
       onDoubleClick={onDoubleClick}
       onPointerDown={onPointerDown}

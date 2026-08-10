@@ -11,6 +11,7 @@ const PDF_VIEW_BACK_TO_LINK_ORIGIN: &str = "pdf-view-back-to-link-origin";
 const PDF_VIEW_ZOOM_PREFIX: &str = "pdf-view-zoom-";
 pub(crate) const WORKSPACE_EVENT: &str = "lumora-workspace-command";
 const WORKSPACE_CLOSE_ACTIVE_TAB: &str = "workspace-close-active-tab";
+const WORKSPACE_SELECT_ALL: &str = "workspace-select-all";
 const HELP_KEYBOARD_SHORTCUTS: &str = "help-keyboard-shortcuts";
 const HELP_CHECK_FOR_UPDATES: &str = "help-check-for-updates";
 const APP_ABOUT: &str = "app-about";
@@ -36,6 +37,8 @@ pub(crate) fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::me
         let _ = app.emit(PDF_VIEW_EVENT, "back-to-link-origin");
     } else if id == WORKSPACE_CLOSE_ACTIVE_TAB {
         let _ = app.emit(WORKSPACE_EVENT, "close-active-tab");
+    } else if id == WORKSPACE_SELECT_ALL {
+        let _ = app.emit(WORKSPACE_EVENT, "select-all");
     } else if id == HELP_KEYBOARD_SHORTCUTS {
         let _ = app.emit(WORKSPACE_EVENT, "show-shortcuts-help");
     } else if id == HELP_CHECK_FOR_UPDATES {
@@ -129,7 +132,15 @@ pub(crate) fn build_menu<R: Runtime>(app_handle: &AppHandle<R>) -> tauri::Result
             &PredefinedMenuItem::cut(app_handle, None)?,
             &PredefinedMenuItem::copy(app_handle, None)?,
             &PredefinedMenuItem::paste(app_handle, None)?,
-            &PredefinedMenuItem::select_all(app_handle, None)?,
+            // A custom item lets the frontend select Documents rows when focus
+            // is outside an editor, while preserving text selection in inputs.
+            &MenuItem::with_id(
+                app_handle,
+                WORKSPACE_SELECT_ALL,
+                "Select All",
+                true,
+                Some("CmdOrCtrl+A"),
+            )?,
         ],
     )?;
 

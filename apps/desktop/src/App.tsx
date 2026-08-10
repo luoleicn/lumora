@@ -85,6 +85,13 @@ import { useMendeleySync } from "./hooks/useMendeleySync";
 import { useArxivDownloads } from "./hooks/useArxivDownloads";
 import { browserPrepareAppExitEvent, nativePrepareAppExitEvent } from "./lib/appExit";
 import {
+  createPaperSelection,
+  reconcilePaperSelection,
+  selectAllPapers,
+  updatePaperSelection,
+  type PaperSelectionMode
+} from "./lib/paperSelection";
+import {
   documentsTab,
   loadWorkspaceSession,
   reconcileWorkspaceSession,
@@ -152,6 +159,45 @@ function focusToolbarSearch() {
   input?.select();
 }
 
+function selectAllEditableContent(): boolean {
+  const activeElement = document.activeElement;
+  if (activeElement instanceof HTMLTextAreaElement) {
+    activeElement.select();
+    return true;
+  }
+  if (activeElement instanceof HTMLInputElement) {
+    const selectableInputTypes = new Set(["", "email", "number", "password", "search", "tel", "text", "url"]);
+    if (selectableInputTypes.has(activeElement.type)) {
+      activeElement.select();
+      return true;
+    }
+  }
+  if (activeElement instanceof HTMLElement && activeElement.isContentEditable) {
+    const selection = window.getSelection();
+    if (!selection) {
+      return false;
+    }
+    const range = document.createRange();
+    range.selectNodeContents(activeElement);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return true;
+  }
+  return false;
+}
+
+function selectAllActiveWorkspaceContent() {
+  const activePane = document.querySelector<HTMLElement>(".workspace-tab-pane.active");
+  const selection = window.getSelection();
+  if (!activePane || !selection) {
+    return;
+  }
+  const range = document.createRange();
+  range.selectNodeContents(activePane);
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
 // A PDF is locally available when it lives on disk. `localPath` is authoritative
 // — it is only ever set to a `.pdf` file we stored, so it stands on its own even
 // when a record's mime/fileName came from a source (e.g. Mendeley) that doesn't
@@ -200,7 +246,9 @@ export default function App() {
   const [selectedCollectionId, setSelectedCollectionId] = useState(initialWorkspaceSession.selectedCollectionId);
   const [selectedAuthor, setSelectedAuthor] = useState<string>();
   const [selectedTag, setSelectedTag] = useState<string>();
-  const [selectedPaperId, setSelectedPaperId] = useState<string | undefined>(initialWorkspaceSession.selectedPaperId);
+  const [paperSelection, setPaperSelection] = useState(() => createPaperSelection(initialWorkspaceSession.selectedPaperId));
+  const selectedPaperId = paperSelection.primaryId;
+  const selectedPaperIds = useMemo(() => new Set(paperSelection.selectedIds), [paperSelection.selectedIds]);
   const [workspaceTabs, setWorkspaceTabs] = useState<WorkspaceTab[]>(initialWorkspaceSession.tabs);
   const [activeWorkspaceTabId, setActiveWorkspaceTabId] = useState(initialWorkspaceSession.activeTabId);
   const [pdfViewStates, setPdfViewStates] = useState<Record<string, PdfReaderViewState>>(initialWorkspaceSession.pdfViewStates);
@@ -416,6 +464,12 @@ export default function App() {
       void handleRefreshLibrary();
     } else if (command === "focus-toolbar-search") {
       focusToolbarSearch();
+    } else if (command === "select-all") {
+      if (!selectAllEditableContent()) {
+        if (!handleSelectAllPapers()) {
+          selectAllActiveWorkspaceContent();
+        }
+      }
     }
   };
 
@@ -742,6 +796,16 @@ export default function App() {
   }
   const activeWorkspaceTab = workspaceTabs.find((tab) => tab.id === activeWorkspaceTabId) ?? documentsTab;
   const searchMode = activeWorkspaceTab.kind === "paper" ? "pdf" as const : "library" as const;
+
+  useEffect(() => {
+    if (activeWorkspaceTab.kind !== "documents") {
+      return;
+    }
+    setPaperSelection((current) => reconcilePaperSelection(
+      current,
+      filteredPapers.map((paper) => paper.id)
+    ));
+  }, [activeWorkspaceTab.kind, filteredPapers]);
 
   // Clear PDF search when switching away from a paper tab; carry the library
   // search query over to PDF find when opening a paper tab.
@@ -1267,9 +1331,7 @@ export default function App() {
     }
 
     setLibrary((current) => deletePaperFromLibrary(current, paperId));
-    if (selectedPaperId === paperId) {
-      setSelectedPaperId(undefined);
-    }
+    removePaperIdsFromSelection(new Set([paperId]));
     const deletedFileIds = library.fileAssets.filter((file) => file.paperId === paperId).map((file) => file.id);
     setFileDataById((current) => Object.fromEntries(
       Object.entries(current).filter(([fileId]) => !deletedFileIds.includes(fileId))
@@ -1305,7 +1367,7 @@ export default function App() {
     const memberships = library.paperCollections.filter((item) => item.paperId === paperId);
     const membershipResets = (library.paperCollectionResets ?? []).filter((item) => item.paperId === paperId);
     setLibrary((current) => permanentlyDeletePaperFromTrash(current, paperId));
-    if (selectedPaperId === paperId) setSelectedPaperId(undefined);
+    removePaperIdsFromSelection(new Set([paperId]));
     setFileDataById((current) => Object.fromEntries(
       Object.entries(current).filter(([fileId]) => !files.some((file) => file.id === fileId))
     ));
@@ -1363,7 +1425,7 @@ export default function App() {
 
     const { state: nextState } = permanentlyDeleteAllFromTrash(library);
     setLibrary(nextState);
-    if (selectedPaperId && trashedPaperIds.has(selectedPaperId)) setSelectedPaperId(undefined);
+    removePaperIdsFromSelection(trashedPaperIds);
     setFileDataById((current) => Object.fromEntries(
       Object.entries(current).filter(([fileId]) => !files.some((file) => file.id === fileId))
     ));
@@ -1400,8 +1462,24 @@ export default function App() {
     setLibrary((current) => markAnnotationDeleted(current, annotation));
   }
 
-  function handleSelectPaper(paperId: string) {
-    setSelectedPaperId(paperId);
+  function setSelectedPaperId(paperId?: string) {
+    setPaperSelection(createPaperSelection(paperId));
+  }
+
+  function removePaperIdsFromSelection(paperIds: ReadonlySet<string>) {
+    setPaperSelection((current) => reconcilePaperSelection(
+      current,
+      current.selectedIds.filter((paperId) => !paperIds.has(paperId))
+    ));
+  }
+
+  function handleSelectPaper(paperId: string, mode: PaperSelectionMode = "replace") {
+    setPaperSelection((current) => updatePaperSelection(
+      current,
+      paperId,
+      displayedPapers.map((paper) => paper.id),
+      mode
+    ));
     setLibrary((current) => {
       const paper = current.papers.find((item) => item.id === paperId);
       if (!paper?.unread) {
@@ -1415,6 +1493,18 @@ export default function App() {
         )
       };
     });
+  }
+
+  function handleSelectAllPapers(): boolean {
+    const activeTab = workspaceTabs.find((tab) => tab.id === activeWorkspaceTabId) ?? documentsTab;
+    if (activeTab.kind !== "documents") {
+      return false;
+    }
+    setPaperSelection((current) => selectAllPapers(
+      current,
+      filteredPapers.map((paper) => paper.id)
+    ));
+    return true;
   }
 
   function handleSelectCollection(collectionId: string) {
@@ -1783,6 +1873,7 @@ export default function App() {
                         filteredPapers={displayedPapers}
                         searchMeta={searchMetaByPaperId}
                         selectedPaperId={selectedPaperId}
+                        selectedPaperIds={selectedPaperIds}
                         selectedCollectionId={selectedCollectionId}
                         fileDataById={fileDataById}
                         fileStorageDirectory={fileStorageSettings.directory}
@@ -1791,6 +1882,7 @@ export default function App() {
                         onPdfSearchUpdate={tabActive ? setPdfSearchState : undefined}
                         pdfSearchNavRef={pdfSearchNavRef}
                         onSelectPaper={handleSelectPaper}
+                        onSelectAllPapers={handleSelectAllPapers}
                         onOpenPaper={handleOpenPaperTab}
                         onUpdatePaper={handleUpdatePaper}
                         onPaperDragStart={handlePaperDragStart}
@@ -1816,6 +1908,7 @@ export default function App() {
             <SyncPanel
               settings={cloudSync.settings}
               paper={selectedPaper}
+              selectedPaperCount={paperSelection.selectedIds.length}
               fileAsset={selectedFile}
               fileData={selectedFileData}
               onRequestFileData={requestSelectedFileData}
@@ -2224,6 +2317,7 @@ function WorkspaceTabContent({
   filteredPapers,
   searchMeta,
   selectedPaperId,
+  selectedPaperIds,
   selectedCollectionId,
   fileDataById,
   fileStorageDirectory,
@@ -2232,6 +2326,7 @@ function WorkspaceTabContent({
   onPdfSearchUpdate,
   pdfSearchNavRef,
   onSelectPaper,
+  onSelectAllPapers,
   onOpenPaper,
   onUpdatePaper,
   onPaperDragStart,
@@ -2253,6 +2348,7 @@ function WorkspaceTabContent({
   filteredPapers: Paper[];
   searchMeta?: Map<string, PaperSearchMeta>;
   selectedPaperId?: string;
+  selectedPaperIds: ReadonlySet<string>;
   selectedCollectionId: string;
   fileDataById: Record<string, Uint8Array>;
   fileStorageDirectory?: string;
@@ -2260,7 +2356,8 @@ function WorkspaceTabContent({
   pdfSearchQuery?: string;
   onPdfSearchUpdate?: (state: { totalMatches: number; activeMatchIndex: number }) => void;
   pdfSearchNavRef?: React.MutableRefObject<PdfSearchNavHandle | null>;
-  onSelectPaper: (paperId: string) => void;
+  onSelectPaper: (paperId: string, mode?: PaperSelectionMode) => void;
+  onSelectAllPapers: () => void;
   onOpenPaper: (paperId: string) => void;
   onUpdatePaper: (paper: Paper) => void;
   onPaperDragStart: (paperId: string) => void;
@@ -2283,8 +2380,10 @@ function WorkspaceTabContent({
         papers={filteredPapers}
         searchMeta={searchMeta}
         selectedPaperId={selectedPaperId}
+        selectedPaperIds={selectedPaperIds}
         selectedCollectionId={selectedCollectionId}
         onSelectPaper={onSelectPaper}
+        onSelectAllPapers={onSelectAllPapers}
         onOpenPaper={onOpenPaper}
         onUpdatePaper={onUpdatePaper}
         onPaperDragStart={onPaperDragStart}

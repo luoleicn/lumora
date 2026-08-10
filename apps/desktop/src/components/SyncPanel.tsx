@@ -1,4 +1,4 @@
-import { DatabaseZap, Download, ExternalLink, FileSearch, FolderOpen, GraduationCap, Search, Send } from "lucide-react";
+import { DatabaseZap, Download, ExternalLink, Files, FileSearch, FolderOpen, GraduationCap, Search, Send } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Annotation, ArxivMetadata, FileAsset, Paper } from "@lumora/shared";
 import { invoke } from "@tauri-apps/api/core";
@@ -10,6 +10,7 @@ import { PaperNotesTab } from "./PaperNotesTab";
 type SyncPanelProps = {
   settings: SyncSettings;
   paper?: Paper;
+  selectedPaperCount: number;
   fileAsset?: FileAsset;
   fileData?: Uint8Array;
   onRequestFileData: () => Promise<Uint8Array | undefined>;
@@ -25,6 +26,7 @@ type SyncPanelProps = {
 export function SyncPanel({
   settings,
   paper,
+  selectedPaperCount,
   fileAsset,
   fileData,
   onRequestFileData,
@@ -38,6 +40,8 @@ export function SyncPanel({
 }: SyncPanelProps) {
   const [activeTab, setActiveTab] = useState<"details" | "notes" | "deepseek">("details");
   const visibleAnnotations = annotations.filter((annotation) => !annotation.deletedAt);
+  const hasMultiplePapersSelected = selectedPaperCount > 1;
+  const inspectedPaper = hasMultiplePapersSelected ? undefined : paper;
 
   return (
     <aside className="sync-panel">
@@ -54,29 +58,46 @@ export function SyncPanel({
       </div>
 
       {activeTab === "details" && (
-        <DetailsTab
-          settings={settings}
-          paper={paper}
-          fileAsset={fileAsset}
-          fileData={fileData}
-          onRequestFileData={onRequestFileData}
-          hasLocalPdf={hasLocalPdf}
-          fileStorageSettings={fileStorageSettings}
-          onUpdatePaper={onUpdatePaper}
-          arxivDownloadBusy={arxivDownloadBusy}
-          onDownloadArxiv={onDownloadArxiv}
-        />
+        hasMultiplePapersSelected
+          ? <MultiplePaperSelection count={selectedPaperCount} />
+          : (
+              <DetailsTab
+                settings={settings}
+                paper={inspectedPaper}
+                fileAsset={fileAsset}
+                fileData={fileData}
+                onRequestFileData={onRequestFileData}
+                hasLocalPdf={hasLocalPdf}
+                fileStorageSettings={fileStorageSettings}
+                onUpdatePaper={onUpdatePaper}
+                arxivDownloadBusy={arxivDownloadBusy}
+                onDownloadArxiv={onDownloadArxiv}
+              />
+            )
       )}
       {activeTab === "notes" && (
         <PaperNotesTab
-          paper={paper}
+          paper={inspectedPaper}
           annotations={visibleAnnotations}
           onUpdatePaper={onUpdatePaper}
           onDeleteAnnotation={onDeleteAnnotation}
         />
       )}
-      {activeTab === "deepseek" && <DeepSeekTab paper={paper} />}
+      {activeTab === "deepseek" && <DeepSeekTab paper={inspectedPaper} />}
     </aside>
+  );
+}
+
+function MultiplePaperSelection({ count }: { count: number }) {
+  return (
+    <div className="details-tab">
+      <h3>Details</h3>
+      <div className="multiple-paper-selection" role="status" aria-live="polite">
+        <Files size={28} />
+        <strong>{count} documents selected</strong>
+        <p>Select a single document to view and edit its details.</p>
+      </div>
+    </div>
   );
 }
 

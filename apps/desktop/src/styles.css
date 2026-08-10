@@ -926,6 +926,11 @@ body.workspace-tab-pointer-dragging * {
 .paper-table-wrap {
   flex: 1;
   overflow: auto;
+  outline: none;
+}
+
+.paper-table-wrap:focus-visible {
+  box-shadow: inset 0 0 0 2px rgba(40, 125, 101, 0.3);
 }
 
 .paper-table-wrap.resizing-columns {
@@ -2152,6 +2157,36 @@ body.paper-pointer-dragging * {
   color: #202226;
   font-size: 15px;
   line-height: 1.3;
+}
+
+.multiple-paper-selection {
+  display: flex;
+  min-height: 150px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px dashed #c8d4da;
+  border-radius: 9px;
+  background: #f3f7f6;
+  color: #68727d;
+  padding: 20px;
+  text-align: center;
+}
+
+.multiple-paper-selection svg {
+  color: #287d65;
+}
+
+.multiple-paper-selection strong {
+  color: #26313a;
+  font-size: 14px;
+}
+
+.multiple-paper-selection p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .details-title-row {
