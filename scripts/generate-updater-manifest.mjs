@@ -8,6 +8,10 @@ const ARTIFACTS = {
   "darwin-x86_64": "lumora-{tag}-macos-x64.app.tar.gz",
   "linux-x86_64-appimage": "lumora-{tag}-linux-amd64.AppImage",
   "linux-x86_64-deb": "lumora-{tag}-linux-amd64.deb",
+  // Bare `{os}-{arch}` fallback: an updater client that cannot detect its Linux
+  // bundle type (a raw `target/release` binary, or a build whose bundler never
+  // stamped one) looks up this key, and installs whatever it finds as an AppImage.
+  "linux-x86_64": "lumora-{tag}-linux-amd64.AppImage",
   "windows-x86_64-nsis": "lumora-{tag}-windows-x64-setup.exe",
   "windows-x86_64-msi": "lumora-{tag}-windows-x64.msi",
 };

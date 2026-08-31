@@ -36,6 +36,7 @@ test("builds an installer-aware static updater manifest", () => {
       "darwin-x86_64",
       "linux-x86_64-appimage",
       "linux-x86_64-deb",
+      "linux-x86_64",
       "windows-x86_64-nsis",
       "windows-x86_64-msi",
     ]);
