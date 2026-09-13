@@ -4,6 +4,11 @@
 
 use tauri::AppHandle;
 
+mod abstract_page;
+
+const METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const USER_AGENT: &str = "lumora/0.1 desktop research library";
+
 #[derive(Clone, serde::Serialize)]
 #[serde(tag = "event", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub(crate) enum ArxivDownloadEvent {
@@ -72,42 +77,83 @@ pub(crate) async fn search_arxiv_by_title(app: AppHandle, title: String) -> Resu
     Ok(results)
 }
 
-// Metadata lookup for a known id. The title search above can only find papers
-// by name; adding a paper straight from its id needs the id_list endpoint.
+// Keep both metadata sources behind the same proxy-aware client on all platforms.
 #[tauri::command]
 pub(crate) async fn fetch_arxiv_by_id(app: AppHandle, arxiv_id: String) -> Result<Option<ArxivMetadata>, String> {
     let arxiv_id = validate_arxiv_id(&arxiv_id)?;
+    let client = crate::proxy::network_client(&app)?;
+    fetch_arxiv_metadata(&client, &arxiv_id, "https://export.arxiv.org/api/query", "https://arxiv.org/abs/").await
+}
 
-    let mut url = reqwest::Url::parse("https://export.arxiv.org/api/query")
-        .map_err(|error| error.to_string())?;
+async fn fetch_arxiv_metadata(
+    client: &reqwest::Client,
+    arxiv_id: &str,
+    api_url: &str,
+    abstract_base_url: &str,
+) -> Result<Option<ArxivMetadata>, String> {
+    let mut url = reqwest::Url::parse(api_url).map_err(|error| error.to_string())?;
     url.query_pairs_mut()
-        .append_pair("id_list", &arxiv_id)
+        .append_pair("id_list", arxiv_id)
         .append_pair("start", "0")
         .append_pair("max_results", "1");
 
-    let response = crate::proxy::network_client(&app)?
-        .get(url)
-        .header("accept", "application/atom+xml")
-        .send()
-        .await
-        .map_err(|error| format!("arXiv request failed: {error}"))?;
+    let response = client.get(url)
+        .header(reqwest::header::ACCEPT, "application/atom+xml")
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .timeout(METADATA_TIMEOUT)
+        .send().await;
 
-    if !response.status().is_success() {
-        return Err(format!("arXiv lookup failed for {arxiv_id} ({})", response.status()));
+    // Make one page request on transient API failures instead of repeatedly
+    // hitting the rate-limited API. A successful empty feed still means no match.
+    let api_error = match response {
+        Ok(response) if response.status().is_success() => {
+            match response.text().await {
+                Ok(xml) => return Ok(parse_arxiv_feed(&xml, "")
+                    .into_iter()
+                    .find(|entry| arxiv_id_matches(arxiv_id, &entry.arxiv_id))),
+                Err(error) => format!("Failed to read arXiv response: {error}"),
+            }
+        }
+        Ok(response) => {
+            let status = response.status();
+            let error = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                format!("arXiv API is temporarily rate limited (HTTP 429) for {arxiv_id}")
+            } else {
+                format!("arXiv lookup failed for {arxiv_id} ({status})")
+            };
+            if status != reqwest::StatusCode::TOO_MANY_REQUESTS && !status.is_server_error() {
+                return Err(error);
+            }
+            error
+        }
+        Err(error) => format!("arXiv request failed: {error}"),
+    };
+
+    let fallback = async {
+        let response = client.get(format!("{abstract_base_url}{arxiv_id}"))
+            .header(reqwest::header::ACCEPT, "text/html")
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .timeout(METADATA_TIMEOUT)
+            .send().await.map_err(|error| error.to_string())?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}", response.status()));
+        }
+        let html = response.text().await.map_err(|error| error.to_string())?;
+        abstract_page::parse(&html, arxiv_id).map(Some)
+    }.await;
+    fallback.map_err(|error| format!("{api_error}. The abstract page fallback also failed: {error}. Please try again later."))
+}
+
+fn arxiv_id_matches(requested: &str, actual: &str) -> bool {
+    // An explicit version must never silently import another revision.
+    if requested != arxiv_id_base(requested) {
+        requested == actual
+    } else {
+        arxiv_id_base(requested) == arxiv_id_base(actual)
     }
-
-    let xml = response
-        .text()
-        .await
-        .map_err(|error| format!("Failed to read arXiv response: {error}"))?;
-
-    // No query title to score against here; `score` stays 0.0 and is unused on
-    // this path (only the title-search popover ranks by it). An unknown id comes
-    // back as an empty feed, and the id check drops arXiv's `Error` entry shape
-    // so a failed lookup can never turn into a paper titled "Error".
-    Ok(parse_arxiv_feed(&xml, "")
-        .into_iter()
-        .find(|entry| arxiv_id_base(&entry.arxiv_id) == arxiv_id_base(&arxiv_id)))
 }
 
 #[tauri::command]
@@ -354,6 +400,94 @@ fn tokenize(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{arxiv_id_base, normalize_arxiv_id, parse_arxiv_feed, validate_arxiv_id};
+
+    // Exercise real HTTP responses through the production lookup orchestration.
+    // The local server also checks that fallback makes only one request and
+    // preserves the requested identifier, including its version.
+    fn lookup_with_responses(responses: Vec<(&str, &str)>) -> Result<Option<super::ArxivMetadata>, String> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let responses: Vec<_> = responses.into_iter().map(|(status, body)| (status.to_string(), body.to_string())).collect();
+        let server = std::thread::spawn(move || {
+            for (index, (status, body)) in responses.into_iter().enumerate() {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline, "expected request never arrived");
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|chunk| chunk == b"\r\n\r\n") {
+                    let mut buffer = [0; 1024];
+                    let length = stream.read(&mut buffer).unwrap();
+                    assert!(length > 0);
+                    request.extend_from_slice(&buffer[..length]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let expected = if index == 0 { "/api/query?id_list=2608.11739v1&start=0&max_results=1" } else { "/abs/2608.11739v1" };
+                assert!(request.starts_with(&format!("GET {expected} HTTP/1.1")), "{request}");
+                assert!(request.to_lowercase().contains("user-agent: lumora/"));
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let result = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            super::fetch_arxiv_metadata(&client, "2608.11739v1", &format!("http://{address}/api/query"), &format!("http://{address}/abs/")).await
+        });
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn imports_from_abstract_page_when_api_is_rate_limited_or_unavailable() {
+        for status in ["429 Too Many Requests", "503 Service Unavailable"] {
+            let paper = lookup_with_responses(vec![
+                (status, "temporarily unavailable"),
+                ("200 OK", include_str!("arxiv/fixtures/2608.11739.html")),
+            ]).unwrap().unwrap();
+            assert_eq!(paper.arxiv_id, "2608.11739v1");
+            assert_eq!(paper.authors.len(), 27);
+        }
+    }
+
+    #[test]
+    fn preserves_api_success_and_missing_entries_without_fallback() {
+        let feed = "<feed><entry><id>http://arxiv.org/abs/2608.11739v1</id><title>G0.5</title></entry></feed>";
+        assert_eq!(lookup_with_responses(vec![("200 OK", feed)]).unwrap().unwrap().title, "G0.5");
+        assert!(lookup_with_responses(vec![("200 OK", "<feed></feed>")]).unwrap().is_none());
+        assert!(lookup_with_responses(vec![("400 Bad Request", "invalid request")]).err().unwrap().contains("400"));
+    }
+
+    #[test]
+    fn fallback_distinguishes_missing_papers_from_service_errors() {
+        assert!(lookup_with_responses(vec![("429 Too Many Requests", ""), ("404 Not Found", "")]).unwrap().is_none());
+        for response in [("503 Service Unavailable", ""), ("200 OK", "<title>Error</title>")] {
+            let error = lookup_with_responses(vec![("429 Too Many Requests", ""), response]).err().unwrap();
+            assert!(error.contains("rate limited (HTTP 429)"));
+            assert!(error.contains("fallback also failed"));
+        }
+    }
+
+    #[test]
+    #[ignore = "live arXiv check; requires network access"]
+    fn live_lookup_2608_11739() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let client = reqwest::Client::new();
+            let paper = super::fetch_arxiv_metadata(&client, "2608.11739", "https://export.arxiv.org/api/query", "https://arxiv.org/abs/").await.unwrap().unwrap();
+            assert_eq!(arxiv_id_base(&paper.arxiv_id), "2608.11739");
+            assert!(paper.title.starts_with("G0.5:"));
+            assert_eq!(paper.authors.len(), 27);
+            println!("Imported {}: {} ({} authors)", paper.arxiv_id, paper.title, paper.authors.len());
+        });
+    }
 
     #[test]
     fn keeps_version_suffix_on_modern_ids() {
