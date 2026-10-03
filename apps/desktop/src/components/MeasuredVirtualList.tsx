@@ -30,6 +30,7 @@ export function MeasuredVirtualList<T extends { id: string }>({
   const nodesRef = useRef(new Map<string, HTMLDivElement>());
   const observerRef = useRef<ResizeObserver | undefined>(undefined);
   const frameRef = useRef<number | undefined>(undefined);
+  const tabDirectionRef = useRef(0);
   const heightsRef = useRef(new Map<string, { item: T; width: number; height: number }>());
   const widthRef = useRef(0);
   const itemsRef = useRef(items);
@@ -104,6 +105,25 @@ export function MeasuredVirtualList<T extends { id: string }>({
     } else nodesRef.current.delete(id);
   }, [scheduleMeasure]);
 
+  const focusItem = useCallback((index: number, backwards: boolean) => {
+    const item = itemsRef.current[index];
+    if (!item) return;
+    flushSync(() => setRetainedIds((current) => new Set([...current, item.id])));
+    const controls = nodesRef.current.get(item.id)?.querySelectorAll<HTMLElement>(focusableSelector);
+    const control = controls?.[backwards ? controls.length - 1 : 0];
+    if (!control) return;
+    const scroll = scrollRef.current;
+    const view = viewport();
+    const current = metricsRef.current;
+    const top = current.offsets[index];
+    const bottom = top + current.heights[index];
+    if (scroll && (top < view.top || bottom > view.top + view.height)) {
+      scroll.scrollTop = view.offset + (top < view.top ? top : bottom - view.height);
+      refreshRange();
+    }
+    control.focus({ preventScroll: true });
+  }, [refreshRange, viewport]);
+
   useLayoutEffect(() => {
     const root = rootRef.current!;
     const scroll = scrollContainerSelector ? root.closest<HTMLElement>(scrollContainerSelector) ?? root : root;
@@ -111,7 +131,12 @@ export function MeasuredVirtualList<T extends { id: string }>({
     const observer = new ResizeObserver(scheduleMeasure);
     observerRef.current = observer;
     observer.observe(root);
-    if (scroll !== root) observer.observe(scroll);
+    if (scroll !== root) {
+      observer.observe(scroll);
+      // The personal editor can be resized without changing the list's own
+      // height. Observe its shared parent to refresh the list's leading offset.
+      if (root.parentElement && root.parentElement !== scroll) observer.observe(root.parentElement);
+    }
     for (const node of nodesRef.current.values()) observer.observe(node);
     // Scroll events never scan the full dataset or measure every card.
     let scrollFrame: number | undefined;
@@ -135,26 +160,49 @@ export function MeasuredVirtualList<T extends { id: string }>({
       if (!selection || selection.isCollapsed || !root.contains(selection.anchorNode)) setSelectAll(false);
     };
     const prepareSelection = () => flushSync(() => setSelectAll(true));
+    const rememberTab = (event: KeyboardEvent) => {
+      tabDirectionRef.current = event.key === "Tab" && !event.altKey && !event.ctrlKey && !event.metaKey ? event.shiftKey ? -1 : 1 : 0;
+    };
+    const forgetTab = () => { tabDirectionRef.current = 0; };
+    const onDocumentFocus = (event: FocusEvent) => {
+      if (!root.contains(event.target as Node)) forgetTab();
+    };
+    const onFocus = (event: FocusEvent) => {
+      const direction = tabDirectionRef.current;
+      forgetTab();
+      // Tab entering from another control must visit the logical first/last
+      // card, even when scrolling has left those cards unmounted.
+      if (direction && !root.contains(event.relatedTarget as Node | null)) {
+        focusItem(direction < 0 ? itemsRef.current.length - 1 : 0, direction < 0);
+      }
+      retainInteraction();
+    };
     scroll.addEventListener("scroll", onScroll, { passive: true });
-    root.addEventListener("focusin", retainInteraction);
+    root.addEventListener("focusin", onFocus);
     root.addEventListener("focusout", retainInteraction);
     root.addEventListener(prepareVirtualListSelectionEvent, prepareSelection);
     document.addEventListener("selectionchange", retainInteraction);
+    document.addEventListener("keydown", rememberTab, true);
+    document.addEventListener("pointerdown", forgetTab, true);
+    document.addEventListener("focusin", onDocumentFocus, true);
     refreshRange();
     scheduleMeasure();
     return () => {
       observer.disconnect();
       observerRef.current = undefined;
       scroll.removeEventListener("scroll", onScroll);
-      root.removeEventListener("focusin", retainInteraction);
+      root.removeEventListener("focusin", onFocus);
       root.removeEventListener("focusout", retainInteraction);
       root.removeEventListener(prepareVirtualListSelectionEvent, prepareSelection);
       document.removeEventListener("selectionchange", retainInteraction);
+      document.removeEventListener("keydown", rememberTab, true);
+      document.removeEventListener("pointerdown", forgetTab, true);
+      document.removeEventListener("focusin", onDocumentFocus, true);
       if (scrollFrame !== undefined) cancelAnimationFrame(scrollFrame);
       if (frameRef.current !== undefined) cancelAnimationFrame(frameRef.current);
       frameRef.current = undefined;
     };
-  }, [refreshRange, scheduleMeasure, scrollContainerSelector]);
+  }, [focusItem, refreshRange, scheduleMeasure, scrollContainerSelector]);
 
   useLayoutEffect(() => {
     const anchor = anchorRef.current;
@@ -197,21 +245,7 @@ export function MeasuredVirtualList<T extends { id: string }>({
       const nextIndex = currentIndex + (event.shiftKey ? -1 : 1);
       if (nextIndex < 0 || nextIndex >= items.length) return;
       event.preventDefault();
-      const nextId = items[nextIndex].id;
-      flushSync(() => setRetainedIds((current) => new Set([...current, nextId])));
-      const nextRow = nodesRef.current.get(nextId);
-      const nextControls = nextRow?.querySelectorAll<HTMLElement>(focusableSelector);
-      const nextControl = nextControls?.[event.shiftKey ? nextControls.length - 1 : 0];
-      if (!nextControl) return;
-      const scroll = scrollRef.current;
-      const view = viewport();
-      const top = metrics.offsets[nextIndex];
-      const bottom = top + metrics.heights[nextIndex];
-      if (scroll && (top < view.top || bottom > view.top + view.height)) {
-        scroll.scrollTop = view.offset + (top < view.top ? top : bottom - view.height);
-        refreshRange();
-      }
-      nextControl.focus({ preventScroll: true });
+      focusItem(nextIndex, event.shiftKey);
     }}>
       <div ref={contentRef} data-virtual-content="" style={{ position: "relative", height: metrics.totalHeight, overflowAnchor: "none" }}>
         {indexes.map((index) => (

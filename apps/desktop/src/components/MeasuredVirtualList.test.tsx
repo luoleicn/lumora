@@ -17,10 +17,11 @@ const annotations: Annotation[] = Array.from({ length: 4172 }, (_, index) => ({
 
 class TestResizeObserver {
   static instances: TestResizeObserver[] = [];
+  observed = new Set<Element>();
   constructor(private callback: ResizeObserverCallback) { TestResizeObserver.instances.push(this); }
-  observe() {}
-  unobserve() {}
-  disconnect() {}
+  observe(element: Element) { this.observed.add(element); }
+  unobserve(element: Element) { this.observed.delete(element); }
+  disconnect() { this.observed.clear(); }
   fire() { this.callback([], this as unknown as ResizeObserver); }
 }
 
@@ -29,6 +30,7 @@ describe("measured virtual list interactions", () => {
   let root: Root;
   let width: number;
   let rowHeight: number;
+  let leadingHeight: number;
   let heights: Map<string, number>;
 
   beforeEach(() => {
@@ -38,15 +40,15 @@ describe("measured virtual list interactions", () => {
     vi.stubGlobal("cancelAnimationFrame", clearTimeout);
     vi.stubGlobal("ResizeObserver", TestResizeObserver);
     TestResizeObserver.instances = [];
-    width = 800; rowHeight = 100; heights = new Map();
+    width = 800; rowHeight = 100; leadingHeight = 0; heights = new Map();
     vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(700);
     vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
       const content = this.querySelector<HTMLElement>("[data-virtual-content]");
-      return content ? Number.parseFloat(content.style.height) : 700;
+      return content ? Number.parseFloat(content.style.height) + (this.matches(".sync-panel") ? leadingHeight : 0) : 700;
     });
     vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
       const scroller = this.closest<HTMLElement>(".sync-panel") ?? this.closest<HTMLElement>("[data-virtual-list]");
-      const top = this.hasAttribute("data-virtual-content") ? -(scroller?.scrollTop ?? 0) : 0;
+      const top = this.hasAttribute("data-virtual-content") ? (scroller?.matches(".sync-panel") ? leadingHeight : 0) - (scroller?.scrollTop ?? 0) : 0;
       const height = this.hasAttribute("data-virtual-item") ? heights.get(this.dataset.virtualItem!) ?? rowHeight : 700;
       return { x: 0, y: top, top, bottom: top + height, left: 0, right: width, width, height, toJSON() {} };
     });
@@ -133,6 +135,23 @@ describe("measured virtual list interactions", () => {
     expect(host.querySelectorAll("article").length).toBeLessThan(100);
   });
 
+  it("enters the logical first/last card when tabbing into a scrolled list", () => {
+    act(() => root.render(<><button id="before">Before</button><MeasuredVirtualList items={annotations} renderItem={(item) => <article><button>{item.quote}</button></article>} /><button id="after">After</button></>)); settle();
+    scrollTo(8_000);
+    act(() => {
+      const before = host.querySelector<HTMLButtonElement>("#before")!;
+      before.focus(); before.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true }));
+      host.querySelector<HTMLButtonElement>("article button")!.focus();
+    }); settle();
+    expect(document.activeElement?.textContent).toBe("Quote 0");
+    act(() => {
+      const after = host.querySelector<HTMLButtonElement>("#after")!;
+      after.focus(); after.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true }));
+      [...host.querySelectorAll<HTMLButtonElement>("article button")].at(-1)!.focus();
+    }); settle();
+    expect(document.activeElement?.textContent).toBe("Quote 4171");
+  });
+
   it("remeasures changed content and width while keeping the visible anchor", () => {
     renderList(); scrollTo(750);
     const scroll = host.querySelector<HTMLElement>("[data-virtual-list]")!;
@@ -157,5 +176,10 @@ describe("measured virtual list interactions", () => {
     act(() => { const scroll = host.querySelector<HTMLElement>("aside")!; scroll.scrollTop = 20_000; scroll.dispatchEvent(new Event("scroll")); }); settle();
     expect(host.querySelector("textarea")).toBe(editor);
     expect(host.querySelectorAll("article").length).toBeLessThan(100);
+    expect(TestResizeObserver.instances[0].observed.has(host.querySelector(".paper-notes-tab")!)).toBe(true);
+    const firstBeforeResize = Number(host.querySelector<HTMLElement>("[data-virtual-item]")!.dataset.virtualItem);
+    leadingHeight = 2_000;
+    act(() => TestResizeObserver.instances.forEach((observer) => observer.fire())); settle();
+    expect(Number(host.querySelector<HTMLElement>("[data-virtual-item]")!.dataset.virtualItem)).toBeLessThan(firstBeforeResize);
   });
 });
