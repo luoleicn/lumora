@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { FileAsset, LibraryState, Paper } from "@lumora/shared";
-import { deleteFileBlob, getFileBytes, importPdfFile, putFileBlob, type ImportedPdf } from "./localStore";
+import { deleteFileBlob, getFileBytes, importPdfFile, listFileBlobIds, putFileBlob, type ImportedPdf } from "./localStore";
 import { createId } from "./id";
 import { persistEntities } from "./libraryDb";
 
@@ -361,6 +361,10 @@ export async function reconcileFileStorage(
   const paperById = new Map(current.papers.map((paper) => [paper.id, paper]));
   const changed = new Map<string, FileAsset>();
   const now = () => new Date().toISOString();
+  // Most libraries have already migrated every Blob to disk. One key read
+  // avoids opening IndexedDB for each attachment just to discover it is empty.
+  // Failure must not look like an empty store: retain the legacy read path.
+  const blobIds = await listFileBlobIds().catch(() => undefined);
 
   // Pass 1: drain any bytes still living in IndexedDB onto disk. Crash-safe
   // ordering — write to disk, then delete the blob only after.
@@ -368,6 +372,7 @@ export async function reconcileFileStorage(
     if (fileAsset.deletedAt) continue;
     const paper = paperById.get(fileAsset.paperId);
     if (!paper || paper.deletedAt) continue;
+    if (blobIds && !blobIds.has(fileAsset.id)) continue;
 
     const blob = await getFileBytes(fileAsset.id);
     if (!blob) continue;

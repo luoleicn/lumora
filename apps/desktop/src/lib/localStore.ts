@@ -207,6 +207,27 @@ export async function getFileBlob(fileAssetId: string): Promise<Blob | undefined
   return blob;
 }
 
+/** Enumerate keys without loading attachment bytes; close even on an aborted read. */
+export async function listFileBlobIds(): Promise<Set<string>> {
+  const db = await openFilesDb();
+  try {
+    return await new Promise<Set<string>>((resolve, reject) => {
+      const transaction = db.transaction(fileStoreName, "readonly");
+      const request = transaction.objectStore(fileStoreName).getAllKeys();
+      let ids = new Set<string>();
+      request.onsuccess = () => {
+        ids = new Set(request.result.filter((key): key is string => typeof key === "string"));
+      };
+      request.onerror = () => reject(request.error);
+      transaction.oncomplete = () => resolve(ids);
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error ?? new Error("Attachment key enumeration was aborted."));
+    });
+  } finally {
+    db.close();
+  }
+}
+
 export async function getFileObjectUrl(fileAssetId: string): Promise<string | undefined> {
   const blob = await getFileBlob(fileAssetId);
   return blob ? URL.createObjectURL(blob) : undefined;
