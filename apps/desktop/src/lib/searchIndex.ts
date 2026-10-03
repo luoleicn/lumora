@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { FileAsset, LibraryState, Paper } from "@lumora/shared";
+import { getFileIndex } from "./libraryIndexes";
 
 // Frontend half of the library full-text search: invoke wrappers for the FTS5
 // commands, PDF body extraction (pdf.js), and pure helpers for the backfill
@@ -93,25 +94,18 @@ export async function extractPdfBodyText(
   }
 }
 
-function isLocalPdf(fileAsset: FileAsset): boolean {
-  return (
-    !fileAsset.deletedAt
-    && fileAsset.downloadState === "local"
-    && (fileAsset.mime === "application/pdf" || /\.pdf$/i.test(fileAsset.fileName))
-  );
-}
-
 // Papers whose local PDF has never been extracted, or whose PDF changed since
 // (sha mismatch). Recently updated papers first so fresh imports index early.
 export function planBodyBackfill(state: LibraryState, status: BodyIndexStatus[]): BodyBackfillItem[] {
   const indexedShaByPaperId = new Map(status.map((item) => [item.paperId, item.bodySha]));
+  const localPdfByPaperId = getFileIndex(state.fileAssets).searchPdfByPaperId;
   const items: Array<BodyBackfillItem & { updatedAt: string }> = [];
 
   for (const paper of state.papers) {
     if (paper.deletedAt) {
       continue;
     }
-    const fileAsset = state.fileAssets.find((item) => item.paperId === paper.id && isLocalPdf(item));
+    const fileAsset = localPdfByPaperId.get(paper.id);
     if (!fileAsset?.sha256 || indexedShaByPaperId.get(paper.id) === fileAsset.sha256) {
       continue;
     }

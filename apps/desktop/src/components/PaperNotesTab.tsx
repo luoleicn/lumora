@@ -1,5 +1,6 @@
 import { Trash2 } from "lucide-react";
 import type { Annotation, Paper } from "@lumora/shared";
+import { MeasuredVirtualList } from "./MeasuredVirtualList";
 
 type PaperNotesTabProps = {
   paper?: Paper;
@@ -58,8 +59,11 @@ export function PaperNotesTab({
       {annotations.length === 0 ? (
         <p className="inspector-empty">No notes or highlights for this document.</p>
       ) : (
-        <div className="inspector-notes">
-          {annotations.map((annotation) => (
+        <MeasuredVirtualList
+          className="inspector-notes"
+          scrollContainerSelector=".sync-panel"
+          items={annotations}
+          renderItem={(annotation) => (
             <article key={annotation.id}>
               <header>
                 <span style={{ backgroundColor: annotation.color }} />
@@ -76,8 +80,8 @@ export function PaperNotesTab({
               {annotation.quote && <p>{annotation.quote}</p>}
               {annotation.comment && <blockquote>{annotation.comment}</blockquote>}
             </article>
-          ))}
-        </div>
+          )}
+        />
       )}
     </div>
   );

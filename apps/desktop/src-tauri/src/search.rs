@@ -23,7 +23,7 @@ const SEARCH_INDEX_VERSION_META_KEY: &str = "searchIndexVersion";
 const SEARCH_RESULT_LIMIT: u32 = 200;
 const SEARCH_BODY_MAX_CHARS: usize = 1_000_000;
 
-#[derive(serde::Serialize)]
+#[derive(Debug, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SearchHit {
     paper_id: String,
@@ -276,34 +276,37 @@ fn search_library_rows(connection: &rusqlite::Connection, query: &str, limit: u3
 
     // Strict tiering: a paper's tier is its highest-priority matching column
     // (title > body > authors > notes); bm25 only orders within a tier. The
-    // bare `score`/`snip` columns follow the MIN(tier) row per SQLite's
-    // documented bare-column-with-MIN semantics, so the snippet always comes
-    // from the best-tier column. Snippet segments are delimited by \u{1}/\u{2}
-    // control chars (char(1)/char(2)) that the frontend splits on.
+    // bare `score`/`fts_rowid` columns follow the MIN(tier) row per SQLite's
+    // documented bare-column-with-MIN semantics. Defer expensive snippets until
+    // after LIMIT: common terms otherwise generate snippets for the entire
+    // library, although only a small result window is returned.
     // Body hits live in search_body, which has no deleted flag of its own; the
     // IN-subquery (materialized once per query) scopes them to live papers.
-    let sql = "WITH hits(paper_id, tier, score, snip) AS (
-         SELECT paper_id, 1, bm25(search_index), snippet(search_index, 1, char(1), char(2), '…', 14)
+    let sql = "WITH hits(paper_id, tier, score, fts_rowid) AS (
+         SELECT paper_id, 1, bm25(search_index), rowid
            FROM search_index WHERE search_index MATCH :q_title AND deleted = 0
          UNION ALL
-         SELECT paper_id, 2, bm25(search_body), snippet(search_body, 1, char(1), char(2), '…', 14)
+         SELECT paper_id, 2, bm25(search_body), rowid
            FROM search_body WHERE search_body MATCH :q_body
              AND paper_id IN (SELECT paper_id FROM search_index WHERE deleted = 0)
          UNION ALL
-         SELECT paper_id, 3, bm25(search_index), snippet(search_index, 2, char(1), char(2), '…', 14)
+         SELECT paper_id, 3, bm25(search_index), rowid
            FROM search_index WHERE search_index MATCH :q_authors AND deleted = 0
          UNION ALL
-         SELECT paper_id, 4, bm25(search_index), snippet(search_index, 3, char(1), char(2), '…', 14)
+         SELECT paper_id, 4, bm25(search_index), rowid
            FROM search_index WHERE search_index MATCH :q_notes AND deleted = 0
        )
-       SELECT paper_id, MIN(tier) AS tier, score, snip, SUM(1 << tier) AS matched_mask
+       SELECT paper_id, MIN(tier) AS tier, score, fts_rowid, SUM(1 << tier) AS matched_mask
        FROM hits
        GROUP BY paper_id
        ORDER BY tier ASC, score ASC
        LIMIT :limit";
 
-    let mut statement = connection.prepare(sql).map_err(|error| error.to_string())?;
-    let hits = statement
+    // Both stages must see the same WAL snapshot, including during background
+    // sync. A rowid can otherwise be deleted or reused between rank and snippet.
+    let transaction = connection.unchecked_transaction().map_err(|error| error.to_string())?;
+    let mut statement = transaction.prepare_cached(sql).map_err(|error| error.to_string())?;
+    let ranked = statement
         .query_map(
             rusqlite::named_params! {
                 ":q_title": q_title,
@@ -313,18 +316,46 @@ fn search_library_rows(connection: &rusqlite::Connection, query: &str, limit: u3
                 ":limit": limit,
             },
             |row| {
-                Ok(SearchHit {
-                    paper_id: row.get(0)?,
-                    tier: row.get::<_, i64>(1)? as u8,
-                    score: row.get(2)?,
-                    matched_fields: decode_matched_mask(row.get::<_, i64>(4)?),
-                    snippet: row.get(3)?,
-                })
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
             },
         )
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
+    drop(statement);
+
+    let mut hits = Vec::with_capacity(ranked.len());
+    for (paper_id, tier, score, rowid, matched_mask) in ranked {
+        let (snippet_sql, column_query) = match tier {
+            1 => ("SELECT snippet(search_index, 1, char(1), char(2), '…', 14)
+                   FROM search_index WHERE rowid = ?1 AND search_index MATCH ?2", &q_title),
+            2 => ("SELECT snippet(search_body, 1, char(1), char(2), '…', 14)
+                   FROM search_body WHERE rowid = ?1 AND search_body MATCH ?2", &q_body),
+            3 => ("SELECT snippet(search_index, 2, char(1), char(2), '…', 14)
+                   FROM search_index WHERE rowid = ?1 AND search_index MATCH ?2", &q_authors),
+            _ => ("SELECT snippet(search_index, 3, char(1), char(2), '…', 14)
+                   FROM search_index WHERE rowid = ?1 AND search_index MATCH ?2", &q_notes),
+        };
+        let snippet = transaction
+            .prepare_cached(snippet_sql)
+            .map_err(|error| error.to_string())?
+            .query_row(rusqlite::params![rowid, column_query], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        hits.push(SearchHit {
+            paper_id,
+            tier: tier as u8,
+            score,
+            matched_fields: decode_matched_mask(matched_mask),
+            snippet,
+        });
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
     Ok(hits)
 }
 
@@ -561,6 +592,98 @@ mod tests {
             .into_iter()
             .map(|hit| hit.paper_id)
             .collect()
+    }
+
+    // Frozen pre-optimization query: compare the complete public result, not
+    // just IDs, so ranking, snippets and highlight markers cannot drift.
+    fn eager_snippet_search(connection: &rusqlite::Connection, query: &str, limit: u32) -> Vec<super::SearchHit> {
+        let queries: Option<Vec<String>> = ["title", "body", "authors", "notes"]
+            .iter().map(|column| build_fts_column_query(query, column)).collect();
+        let Some(queries) = queries else { return Vec::new(); };
+        let sql = "WITH hits(paper_id, tier, score, snip) AS (
+             SELECT paper_id, 1, bm25(search_index), snippet(search_index, 1, char(1), char(2), '…', 14)
+               FROM search_index WHERE search_index MATCH :q_title AND deleted = 0
+             UNION ALL
+             SELECT paper_id, 2, bm25(search_body), snippet(search_body, 1, char(1), char(2), '…', 14)
+               FROM search_body WHERE search_body MATCH :q_body
+                 AND paper_id IN (SELECT paper_id FROM search_index WHERE deleted = 0)
+             UNION ALL
+             SELECT paper_id, 3, bm25(search_index), snippet(search_index, 2, char(1), char(2), '…', 14)
+               FROM search_index WHERE search_index MATCH :q_authors AND deleted = 0
+             UNION ALL
+             SELECT paper_id, 4, bm25(search_index), snippet(search_index, 3, char(1), char(2), '…', 14)
+               FROM search_index WHERE search_index MATCH :q_notes AND deleted = 0
+           )
+           SELECT paper_id, MIN(tier) AS tier, score, snip, SUM(1 << tier) AS matched_mask
+           FROM hits GROUP BY paper_id ORDER BY tier ASC, score ASC LIMIT :limit";
+        let mut statement = connection.prepare(sql).unwrap();
+        let hits = statement.query_map(rusqlite::named_params! {
+            ":q_title": queries[0], ":q_body": queries[1],
+            ":q_authors": queries[2], ":q_notes": queries[3], ":limit": limit,
+        }, |row| Ok(super::SearchHit {
+            paper_id: row.get(0)?, tier: row.get::<_, i64>(1)? as u8,
+            score: row.get(2)?, snippet: row.get(3)?,
+            matched_fields: super::decode_matched_mask(row.get(4)?),
+        })).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        hits
+    }
+
+    fn populate_search_fixture(connection: &rusqlite::Connection, count: usize, body_repeats: usize) {
+        for index in 0..count {
+            let id = format!("fixture-{index}");
+            let title = if index % 4 == 0 { "Learning robot control 机器学习" } else { "Research survey" };
+            let author = if index % 3 == 0 { "Attention Learning" } else { "Researcher" };
+            upsert_entity(connection, "paper", &id, &paper_json(&id, title, &[author]),
+                (index % 19 == 0).then_some("2026-01-02T00:00:00Z"));
+            let body = format!("{} {index}", "robot learning control attention 机器学习与控制 ".repeat(body_repeats));
+            index_paper_body(connection, &id, &format!("sha-{index}"), &body).unwrap();
+            upsert_entity(connection, "annotation", &format!("note-{index}"),
+                &annotation_json(&format!("note-{index}"), &id, "robot control", "机器学习 attention"), None);
+        }
+    }
+
+    #[test]
+    fn deferred_snippets_preserve_every_field_order_and_result_limit() {
+        let connection = test_connection();
+        populate_search_fixture(&connection, 37, 9);
+        for query in ["learning", "rob", "robot control", "机器学习", "控制", "attention", "absent", "- * ( )"] {
+            for limit in [0, 1, 20, 200] {
+                assert_eq!(search_library_rows(&connection, query, limit).unwrap(),
+                    eager_snippet_search(&connection, query, limit), "query={query}, limit={limit}");
+                assert!(connection.is_autocommit(), "search must release its snapshot");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual performance comparison; optionally set LUMORA_BENCHMARK_DB to a read-only library"]
+    fn benchmark_deferred_snippets() {
+        let connection = match std::env::var("LUMORA_BENCHMARK_DB") {
+            Ok(path) => rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap(),
+            Err(_) => {
+                let connection = test_connection();
+                populate_search_fixture(&connection, 637, 1_500);
+                connection
+            }
+        };
+        connection.execute_batch("PRAGMA query_only = ON").unwrap();
+        for query in ["learning", "robot", "control", "attention"] {
+            let expected = eager_snippet_search(&connection, query, 200);
+            assert_eq!(search_library_rows(&connection, query, 200).unwrap(), expected);
+            let mut eager = Vec::new();
+            let mut deferred = Vec::new();
+            for _ in 0..7 {
+                let start = std::time::Instant::now();
+                eager_snippet_search(&connection, query, 200);
+                eager.push(start.elapsed());
+                let start = std::time::Instant::now();
+                search_library_rows(&connection, query, 200).unwrap();
+                deferred.push(start.elapsed());
+            }
+            eager.sort(); deferred.sort();
+            eprintln!("{query}: eager={:.2} ms, deferred={:.2} ms, equal results={}",
+                eager[3].as_secs_f64() * 1_000.0, deferred[3].as_secs_f64() * 1_000.0, expected.len());
+        }
     }
 
     #[test]

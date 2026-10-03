@@ -3,12 +3,14 @@ import type { FileAsset, LibraryState, Paper } from "@lumora/shared";
 
 const invokeMock = vi.fn();
 const getFileBytesMock = vi.fn();
+const listFileBlobIdsMock = vi.fn();
 const deleteFileBlobMock = vi.fn();
 const persistEntitiesMock = vi.fn();
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
 vi.mock("./localStore", () => ({
   getFileBytes: (...args: unknown[]) => getFileBytesMock(...args),
+  listFileBlobIds: (...args: unknown[]) => listFileBlobIdsMock(...args),
   deleteFileBlob: (...args: unknown[]) => deleteFileBlobMock(...args),
   putFileBlob: vi.fn(),
   importPdfFile: vi.fn()
@@ -126,6 +128,9 @@ describe("reconcileFileStorage", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     getFileBytesMock.mockReset().mockResolvedValue(undefined);
+    // Existing cases continue to exercise the legacy fallback unless a case
+    // explicitly supplies the enumerated key set.
+    listFileBlobIdsMock.mockReset().mockRejectedValue(new Error("Enumeration unavailable"));
     deleteFileBlobMock.mockReset().mockResolvedValue(undefined);
     persistEntitiesMock.mockReset().mockResolvedValue(undefined);
   });
@@ -162,6 +167,42 @@ describe("reconcileFileStorage", () => {
     // both localPath and fileName are pinned to it.
     expect(next.fileAssets[0].localPath).toBe("stored.pdf");
     expect(next.fileAssets[0].fileName).toBe("stored.pdf");
+  });
+
+  it("enumerates an empty Blob store once and skips every per-file read", async () => {
+    withDisk(["Attention Is All You Need-2017-Vaswani.pdf"]);
+    listFileBlobIdsMock.mockResolvedValue(new Set());
+    const state = library(Array.from({ length: 1152 }, (_, index) => fileAsset({ id: `file-${index}` })));
+    await reconcileFileStorage(state, settings);
+    expect(listFileBlobIdsMock).toHaveBeenCalledOnce();
+    expect(getFileBytesMock).not.toHaveBeenCalled();
+    expect(deleteFileBlobMock).not.toHaveBeenCalled();
+  });
+
+  it("reads and drains only enumerated legacy attachments", async () => {
+    withDisk([]);
+    listFileBlobIdsMock.mockResolvedValue(new Set(["file-b"]));
+    getFileBytesMock.mockResolvedValue(new Uint8Array([1, 2, 3]));
+    const state = library([fileAsset(), fileAsset({ id: "file-b" })]);
+    await reconcileFileStorage(state, settings);
+    expect(getFileBytesMock).toHaveBeenCalledExactlyOnceWith("file-b");
+    expect(deleteFileBlobMock).toHaveBeenCalledExactlyOnceWith("file-b");
+    expect(invokeMock.mock.invocationCallOrder[1]).toBeLessThan(deleteFileBlobMock.mock.invocationCallOrder[0]);
+  });
+
+  it("falls back to the original per-file reads when enumeration fails", async () => {
+    withDisk([]);
+    await reconcileFileStorage(library([fileAsset(), fileAsset({ id: "file-b" })]), settings);
+    expect(getFileBytesMock.mock.calls).toEqual([["file-a"], ["file-b"]]);
+  });
+
+  it("retains the legacy Blob when writing to disk fails", async () => {
+    listFileBlobIdsMock.mockResolvedValue(new Set(["file-a"]));
+    getFileBytesMock.mockResolvedValue(new Uint8Array([1]));
+    invokeMock.mockImplementation((command) => command === "list_stored_pdfs" ? Promise.resolve([]) : Promise.reject(new Error("Disk full")));
+    await expect(reconcileFileStorage(library([fileAsset()]), settings)).rejects.toThrow("Disk full");
+    expect(deleteFileBlobMock).not.toHaveBeenCalled();
+    expect(persistEntitiesMock).not.toHaveBeenCalled();
   });
 
   it("clears a stale local flag when the file is gone and no blob remains", async () => {

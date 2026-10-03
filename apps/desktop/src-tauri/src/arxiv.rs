@@ -423,6 +423,9 @@ mod tests {
                         Err(error) => panic!("{error}"),
                     }
                 };
+                // macOS can inherit O_NONBLOCK from the listening socket.
+                // The mock server relies on a blocking read with a timeout.
+                stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
                 let mut request = Vec::new();
                 while !request.windows(4).any(|chunk| chunk == b"\r\n\r\n") {

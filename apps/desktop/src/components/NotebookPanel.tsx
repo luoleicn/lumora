@@ -1,6 +1,7 @@
 import { BookOpen, FileText, Search } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { Annotation, Paper } from "@lumora/shared";
+import { MeasuredVirtualList } from "./MeasuredVirtualList";
 
 type NotebookPanelProps = {
   papers: Paper[];
@@ -10,9 +11,9 @@ type NotebookPanelProps = {
 
 export function NotebookPanel({ papers, annotations, onOpenPaper }: NotebookPanelProps) {
   const [query, setQuery] = useState("");
-  const activeAnnotations = annotations.filter((annotation) => !annotation.deletedAt);
+  const activeAnnotations = useMemo(() => annotations.filter((annotation) => !annotation.deletedAt), [annotations]);
   const paperById = useMemo(() => new Map(papers.map((paper) => [paper.id, paper])), [papers]);
-  const visibleAnnotations = activeAnnotations.filter((annotation) => {
+  const visibleAnnotations = useMemo(() => activeAnnotations.filter((annotation) => {
     const lowerQuery = query.trim().toLowerCase();
     if (!lowerQuery) {
       return true;
@@ -20,7 +21,7 @@ export function NotebookPanel({ papers, annotations, onOpenPaper }: NotebookPane
 
     const paper = paperById.get(annotation.paperId);
     return `${paper?.title ?? ""} ${annotation.quote ?? ""} ${annotation.comment ?? ""}`.toLowerCase().includes(lowerQuery);
-  });
+  }), [activeAnnotations, paperById, query]);
 
   return (
     <section className="notebook-panel">
@@ -44,8 +45,7 @@ export function NotebookPanel({ papers, annotations, onOpenPaper }: NotebookPane
           </div>
         </div>
       ) : (
-        <div className="notebook-list">
-          {visibleAnnotations.map((annotation) => {
+        <MeasuredVirtualList className="notebook-list" items={visibleAnnotations} renderItem={(annotation) => {
             const paper = paperById.get(annotation.paperId);
             return (
               <article key={annotation.id} className="notebook-item">
@@ -63,8 +63,7 @@ export function NotebookPanel({ papers, annotations, onOpenPaper }: NotebookPane
                 </div>
               </article>
             );
-          })}
-        </div>
+          }} />
       )}
     </section>
   );
