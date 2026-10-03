@@ -1,5 +1,5 @@
 import { DatabaseZap, Download, ExternalLink, Files, FileSearch, FolderOpen, GraduationCap, Search, Send } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { Annotation, ArxivMetadata, FileAsset, Paper } from "@lumora/shared";
 import { invoke } from "@tauri-apps/api/core";
 import { searchArxivMetadata, type SyncSettings } from "../lib/syncClient";
@@ -39,7 +39,7 @@ export function SyncPanel({
   onDeleteAnnotation
 }: SyncPanelProps) {
   const [activeTab, setActiveTab] = useState<"details" | "notes" | "deepseek">("details");
-  const visibleAnnotations = annotations.filter((annotation) => !annotation.deletedAt);
+  const visibleAnnotations = useMemo(() => annotations.filter((annotation) => !annotation.deletedAt), [annotations]);
   const hasMultiplePapersSelected = selectedPaperCount > 1;
   const inspectedPaper = hasMultiplePapersSelected ? undefined : paper;
 

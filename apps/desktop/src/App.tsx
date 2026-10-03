@@ -86,6 +86,10 @@ import { useArxivDownloads } from "./hooks/useArxivDownloads";
 import { browserPrepareAppExitEvent, nativePrepareAppExitEvent } from "./lib/appExit";
 import { prepareVirtualListSelection } from "./lib/virtualListSelection";
 import {
+  emptyAnnotations, emptyFileAssets, getCollectionPaperCounts, getLibraryIndexes,
+  isLocalPdfFile, isPdfFile, selectDetailsFile, selectReaderFile
+} from "./lib/libraryIndexes";
+import {
   createPaperSelection,
   reconcilePaperSelection,
   selectAllPapers,
@@ -143,10 +147,6 @@ const defaultWorkspaceLayout: WorkspaceLayout = {
 
 const panelOrder: MainPanelKey[] = ["library", "workspace", "sync"];
 
-function isPdfFile(fileAsset: FileAsset) {
-  return fileAsset.mime === "application/pdf" || /\.pdf$/i.test(fileAsset.fileName);
-}
-
 // Single resolver for "focus the toolbar search box" so every entry point — the
 // DOM keydown handler and the native Cmd+F event forwarded from Rust — agrees on
 // the target. The input is located by the semantic `data-search-input` marker
@@ -200,19 +200,6 @@ function selectAllActiveWorkspaceContent() {
   selection.addRange(range);
 }
 
-// A PDF is locally available when it lives on disk. `localPath` is authoritative
-// — it is only ever set to a `.pdf` file we stored, so it stands on its own even
-// when a record's mime/fileName came from a source (e.g. Mendeley) that doesn't
-// look PDF-ish. The startup reconcile keeps localPath in sync with the folder,
-// clearing it when the file is gone. `downloadState === "local"` is the legacy
-// fallback for records that predate localPath.
-function isLocalPdfFile(fileAsset: FileAsset): boolean {
-  if (fileAsset.localPath) {
-    return true;
-  }
-  return isPdfFile(fileAsset) && fileAsset.downloadState === "local";
-}
-
 export default function App() {
   const appUpdaterRef = useRef<AppUpdater | undefined>(undefined);
   if (!appUpdaterRef.current) {
@@ -238,6 +225,7 @@ export default function App() {
     reconcile: (state) => reconcileFileStorage(state, fileStorageSettings)
   });
   const { library, setLibrary, libraryRef, loadedRef: libraryLoadedRef, loaded: libraryLoaded, adoptFromDb } = libraryStore;
+  const { papers: paperIndex, files: fileIndex, annotations: annotationsByPaperId, memberships: membershipIndex } = getLibraryIndexes(library);
   const cloudSync = useCloudSync({
     store: libraryStore,
     onStatus: setStatus,
@@ -289,7 +277,7 @@ export default function App() {
   const [deleteCollectionId, setDeleteCollectionId] = useState<string | undefined>();
   const [renameCollectionId, setRenameCollectionId] = useState<string | undefined>();
   const [appUpdateState, setAppUpdateState] = useState<AppUpdateState>(initialAppUpdateState);
-  const collectionPaperCounts = useMemo(() => getCollectionPaperCounts(library), [library]);
+  const collectionPaperCounts = useMemo(() => getCollectionPaperCounts(library), [library.papers, library.collections, library.paperCollections]);
 
   useEffect(() => {
     void loadProxySettings()
@@ -585,6 +573,10 @@ export default function App() {
     };
   }, [resizeDrag]);
 
+  // Keep the time-dependent view current without invalidating every other
+  // collection when unrelated annotations or UI state change.
+  const recentlyAddedCutoff = selectedCollectionId === "recently_added"
+    ? new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString() : "";
   const filteredPapers = useMemo(() => {
     const selectedCollectionIds = getCollectionAndDescendantIds(library.collections, selectedCollectionId);
     const collectionPaperIds = new Set(
@@ -593,17 +585,10 @@ export default function App() {
         .map((item) => item.paperId)
     );
     const isTrash = selectedCollectionId === "trash";
-    const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     // One pass per lookup table so the per-paper filters below stay O(1)
     // instead of rescanning fileAssets/paperCollections for every paper.
-    const paperIdsWithLocalPdf = new Set(
-      library.fileAssets
-        .filter((fileAsset) => !fileAsset.deletedAt && isLocalPdfFile(fileAsset))
-        .map((fileAsset) => fileAsset.paperId)
-    );
-    const paperIdsInAnyCollection = new Set(
-      library.paperCollections.filter((item) => !item.deletedAt).map((item) => item.paperId)
-    );
+    const paperIdsWithLocalPdf = fileIndex.readerLocalPaperIds;
+    const paperIdsInAnyCollection = membershipIndex.paperIds;
 
     return library.papers
       .filter((paper) => isTrash ? Boolean(paper.deletedAt) : !paper.deletedAt)
@@ -612,7 +597,7 @@ export default function App() {
           case "all":
             return true;
           case "recently_added":
-            return paper.createdAt >= weekAgo;
+            return paper.createdAt >= recentlyAddedCutoff;
           case "no_arxiv":
             return !paper.arxiv;
           case "no_pdf":
@@ -648,7 +633,7 @@ export default function App() {
 
         return b.updatedAt.localeCompare(a.updatedAt);
       });
-  }, [library, selectedAuthor, selectedCollectionId, selectedTag]);
+  }, [library.papers, library.collections, library.paperCollections, fileIndex, membershipIndex, selectedAuthor, selectedCollectionId, selectedTag, recentlyAddedCutoff]);
 
   // A non-empty query searches the whole library via the FTS index; clearing it
   // restores the filtered view. Adding selectedCollectionId to the deps re-runs
@@ -772,19 +757,16 @@ export default function App() {
     };
   }, [fileStorageSettings, library.fileAssets]);
 
-  const selectedPaper = library.papers.find((paper) => paper.id === selectedPaperId && !paper.deletedAt);
-  const selectedFile = selectedPaper
-    ? (library.fileAssets.find((fileAsset) => fileAsset.paperId === selectedPaper.id && !fileAsset.deletedAt && isLocalPdfFile(fileAsset))
-      ?? library.fileAssets.find((fileAsset) => fileAsset.paperId === selectedPaper.id && !fileAsset.deletedAt))
-    : undefined;
+  const selectedPaper = paperIndex.activeById.get(selectedPaperId ?? "");
+  const selectedFiles = selectedPaper ? fileIndex.byPaperId.get(selectedPaper.id) ?? emptyFileAssets : emptyFileAssets;
+  const selectedFile = selectDetailsFile(selectedFiles);
   const selectedAnnotations = selectedPaper
-    ? library.annotations.filter((annotation) => annotation.paperId === selectedPaper.id)
-    : [];
+    ? annotationsByPaperId.get(selectedPaper.id) ?? emptyAnnotations
+    : emptyAnnotations;
   const selectedFileData = selectedFile ? fileDataById[selectedFile.id] : undefined;
   const selectedHasLocalPdf = selectedPaper
-    ? library.fileAssets.some((fileAsset) =>
-      fileAsset.paperId === selectedPaper.id
-      && !fileAsset.deletedAt
+    ? selectedFiles.some((fileAsset) =>
+      !fileAsset.deletedAt
       && isLocalPdfFile(fileAsset)
       && (Boolean(fileDataById[fileAsset.id]?.length)
         || Boolean(fileStorageSettings.directory && fileAsset.localPath))
@@ -826,16 +808,14 @@ export default function App() {
         return [];
       }
 
-      const paper = library.papers.find((item) => item.id === tab.paperId && !item.deletedAt);
+      const paper = paperIndex.activeById.get(tab.paperId);
       if (!paper) {
         return [];
       }
       // Prefer a fileAsset that is actually on disk or marked local, then fall
       // back to any non-deleted file for the paper. Without this a Mendeley
       // "remote" entry would shadow a local PDF that lives in the storage folder.
-      const fileAsset =
-        library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt && isLocalPdfFile(item))
-        ?? library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt && isPdfFile(item));
+      const fileAsset = selectReaderFile(fileIndex.byPaperId.get(paper.id) ?? emptyFileAssets);
       const opensFromStoragePath = Boolean(
         fileStorageSettings.directory && fileAsset?.localPath
       );
@@ -845,9 +825,8 @@ export default function App() {
     // The Details panel (Extract PDF, metadata preview) needs bytes for the
     // selected paper even when its reader tab isn't open.
     const selectedFileIds = selectedPaperId
-      ? library.fileAssets
-        .filter((item) => item.paperId === selectedPaperId
-          && !item.deletedAt
+      ? (fileIndex.byPaperId.get(selectedPaperId) ?? emptyFileAssets)
+        .filter((item) => !item.deletedAt
           && isPdfFile(item)
           && !(fileStorageSettings.directory && item.localPath))
         .map((item) => item.id)
@@ -859,7 +838,7 @@ export default function App() {
     }
 
     return fileIds;
-  }, [fileStorageSettings.directory, library.fileAssets, library.papers, selectedPaperId, workspaceTabs]);
+  }, [fileStorageSettings.directory, fileIndex, paperIndex, selectedPaperId, workspaceTabs]);
 
   // PDF bytes are large and each retained Uint8Array prevents the corresponding
   // document from being reclaimed. Disk-backed readers now open their native
@@ -883,7 +862,7 @@ export default function App() {
     }
 
     void Promise.all(missingFileIds.map(async (fileId): Promise<{ fileId: string; bytes?: Uint8Array; missingFileName?: string } | undefined> => {
-      const fileAsset = library.fileAssets.find((item) => item.id === fileId);
+      const fileAsset = fileIndex.byId.get(fileId);
       if (!fileAsset) {
         return undefined;
       }
@@ -932,9 +911,7 @@ export default function App() {
       return "";
     }
 
-    const papersById = new Map(
-      library.papers.filter((paper) => !paper.deletedAt).map((paper) => [paper.id, paper])
-    );
+    const papersById = paperIndex.activeById;
     return library.fileAssets
       .filter((fileAsset) => !fileAsset.deletedAt && fileAsset.localPath)
       .map((fileAsset) => {
@@ -2375,6 +2352,7 @@ function WorkspaceTabContent({
   onCreateAnnotation: (annotation: Annotation) => void;
   onDeleteAnnotation: (annotation: Annotation) => void;
 }) {
+  const indexes = getLibraryIndexes(library);
   if (tab.kind === "documents") {
     return (
       <PaperList
@@ -2404,22 +2382,19 @@ function WorkspaceTabContent({
   if (tab.kind === "notebook") {
     return (
       <NotebookPanel
-        papers={library.papers.filter((paper) => !paper.deletedAt)}
+        papers={indexes.papers.active}
         annotations={library.annotations}
         onOpenPaper={onOpenPaper}
       />
     );
   }
 
-  const paper = library.papers.find((item) => item.id === tab.paperId && !item.deletedAt);
-  const fileAsset = paper
-    ? library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt && isLocalPdfFile(item))
-      ?? library.fileAssets.find((item) => item.paperId === paper.id && !item.deletedAt && isPdfFile(item))
-    : undefined;
+  const paper = indexes.papers.activeById.get(tab.paperId);
+  const fileAsset = paper ? selectReaderFile(indexes.files.byPaperId.get(paper.id) ?? emptyFileAssets) : undefined;
   const fileData = fileAsset ? fileDataById[fileAsset.id] : undefined;
   const annotations = paper
-    ? library.annotations.filter((annotation) => annotation.paperId === paper.id)
-    : [];
+    ? indexes.annotations.get(paper.id) ?? emptyAnnotations
+    : emptyAnnotations;
 
   return (
     <PdfReader
@@ -2484,66 +2459,4 @@ function loadWorkspaceLayout(): WorkspaceLayout {
   } catch {
     return defaultWorkspaceLayout;
   }
-}
-
-// Single-pass version of the per-collection count: the naive form rebuilt the
-// active-paper set and rescanned every membership row once per collection,
-// which is O(collections × (papers + memberships)) on every library change.
-// Here the lookup tables are built once and each collection only unions the
-// member lists of its subtree.
-function getCollectionPaperCounts(state: LibraryState) {
-  const activeCollections = state.collections.filter((collection) => !collection.deletedAt);
-  const activePaperIds = new Set(
-    state.papers.filter((paper) => !paper.deletedAt).map((paper) => paper.id)
-  );
-
-  const directMemberIdsByCollection = new Map<string, string[]>();
-  for (const item of state.paperCollections) {
-    if (item.deletedAt || !activePaperIds.has(item.paperId)) {
-      continue;
-    }
-    const members = directMemberIdsByCollection.get(item.collectionId);
-    if (members) {
-      members.push(item.paperId);
-    } else {
-      directMemberIdsByCollection.set(item.collectionId, [item.paperId]);
-    }
-  }
-
-  const childIdsByParent = new Map<string, string[]>();
-  for (const collection of activeCollections) {
-    if (!collection.parentId) {
-      continue;
-    }
-    const children = childIdsByParent.get(collection.parentId);
-    if (children) {
-      children.push(collection.id);
-    } else {
-      childIdsByParent.set(collection.parentId, [collection.id]);
-    }
-  }
-
-  return Object.fromEntries(
-    activeCollections.map((collection) => {
-      // Walk the subtree iteratively; the visited set also guards against
-      // accidental parentId cycles.
-      const subtree = [collection.id];
-      const visited = new Set(subtree);
-      for (let cursor = 0; cursor < subtree.length; cursor += 1) {
-        for (const childId of childIdsByParent.get(subtree[cursor]) ?? []) {
-          if (!visited.has(childId)) {
-            visited.add(childId);
-            subtree.push(childId);
-          }
-        }
-      }
-      const countedPaperIds = new Set<string>();
-      for (const collectionId of subtree) {
-        for (const paperId of directMemberIdsByCollection.get(collectionId) ?? []) {
-          countedPaperIds.add(paperId);
-        }
-      }
-      return [collection.id, countedPaperIds.size];
-    })
-  );
 }

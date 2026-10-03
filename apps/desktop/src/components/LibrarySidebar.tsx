@@ -22,9 +22,10 @@ import {
   type LucideIcon
 } from "lucide-react";
 import type { Collection, LibraryState } from "@lumora/shared";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import lumoraLogoUrl from "../assets/lumora-logo-64.png";
 import { getActivePaperCollectionIds, sortCollectionsAlphabetically } from "../lib/libraryActions";
+import { getPaperIndex, getSidebarCounts } from "../lib/libraryIndexes";
 
 type LibrarySidebarProps = {
   state: LibraryState;
@@ -132,28 +133,15 @@ export function LibrarySidebar({
     };
   }, [contextMenu, trashContextMenu]);
   const visibleDragOverCollectionId = dragOverCollectionId ?? nativeDragOverCollectionId;
-  const collections = sortCollectionsAlphabetically(
+  const collections = useMemo(() => sortCollectionsAlphabetically(
     state.collections.filter((collection) => !collection.deletedAt)
-  );
-  const collectionTree = buildCollectionTree(collections);
-  const selectedPaperCollectionIds = getActivePaperCollectionIds(state, selectedPaperId);
-  const activePapers = state.papers.filter((paper) => !paper.deletedAt);
-  const deletedPapers = state.papers.filter((paper) => paper.deletedAt);
+  ), [state.collections]);
+  const collectionTree = useMemo(() => buildCollectionTree(collections), [collections]);
+  const selectedPaperCollectionIds = useMemo(() => getActivePaperCollectionIds(state, selectedPaperId), [state.collections, state.paperCollections, selectedPaperId]);
+  const { active: activePapers, deleted: deletedPapers, authors, tags, noArxivCount } = getPaperIndex(state.papers);
   const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
   const recentlyAddedCount = activePapers.filter((paper) => paper.createdAt >= weekAgo).length;
-  const unfiledPaperCount = activePapers.filter(
-    (paper) => !state.paperCollections.some((item) => item.paperId === paper.id && !item.deletedAt)
-  ).length;
-  const noArxivCount = activePapers.filter((paper) => !paper.arxiv).length;
-  const noPdfCount = activePapers.filter((paper) =>
-    !state.fileAssets.some((file) => file.paperId === paper.id && !file.deletedAt
-      && (file.mime === "application/pdf" || /\.pdf$/i.test(file.fileName))
-      && file.downloadState === "local")
-  ).length;
-  const authors = [...new Set(activePapers.flatMap((paper) => paper.authors.map((author) => author.fullName)).filter(Boolean))]
-    .sort((a, b) => a.localeCompare(b));
-  const tags = [...new Set(activePapers.flatMap((paper) => paper.tags ?? []).filter(Boolean))]
-    .sort((a, b) => a.localeCompare(b));
+  const { unfiledPaperCount, noPdfCount } = useMemo(() => getSidebarCounts(state), [state.papers, state.fileAssets, state.paperCollections]);
 
   return (
     <aside className="library-sidebar">
@@ -164,7 +152,7 @@ export function LibrarySidebar({
         <div>
           <h1>lumora</h1>
           <p>lumora — light up your literature.</p>
-          <small>{state.papers.filter((paper) => !paper.deletedAt).length} papers</small>
+          <small>{activePapers.length} papers</small>
         </div>
       </div>
 

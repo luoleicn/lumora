@@ -5,6 +5,7 @@ import { resolveVirtualListRange } from "../lib/listVirtualization";
 import { getCollectionOptions, type CollectionOption } from "../lib/libraryActions";
 import type { PaperSelectionMode } from "../lib/paperSelection";
 import { collapseCjkSpaces, splitSnippet, type PaperSearchMeta, type SearchMatchedField } from "../lib/searchIndex";
+import { emptyFileAssets, getFileIndex } from "../lib/libraryIndexes";
 
 const matchedFieldLabels: Record<SearchMatchedField, string> = {
   title: "Title",
@@ -52,6 +53,7 @@ const columnWidthsKey = "lumora:documents-column-widths";
 const paperRowHeight = 34;
 const paperTableHeaderHeight = 29;
 const paperRowOverscan = 12;
+const dateFormatter = new Intl.DateTimeFormat(undefined, { year: "2-digit", month: "2-digit", day: "2-digit" });
 
 const paperColumns: PaperColumn[] = [
   { key: "favorite", label: "Favorite", defaultWidth: 32, minWidth: 28, maxWidth: 72 },
@@ -106,6 +108,7 @@ export function PaperList({
   onBindLocalPdf
 }: PaperListProps) {
   const isTrash = selectedCollectionId === "trash";
+  const fileIndex = getFileIndex(state.fileAssets);
   const [sortKey, setSortKey] = useState<SortKey>("added");
   const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
   const [searchSortOverride, setSearchSortOverride] = useState(false);
@@ -430,10 +433,11 @@ export function PaperList({
                 // record with just a cloud reference is "remote" — it must not
                 // read as an available local file, which is exactly what shows up
                 // in the "No PDF" collection on a freshly synced device.
-                const localPdf = state.fileAssets.find(
+                const files = fileIndex.byPaperId.get(paper.id) ?? emptyFileAssets;
+                const localPdf = files.find(
                   (file) => isPaperPdf(file) && (Boolean(file.localPath) || file.downloadState === "local")
                 );
-                const anyPdf = localPdf ?? state.fileAssets.find(isPaperPdf);
+                const anyPdf = localPdf ?? files.find(isPaperPdf);
                 const pdfState: PdfState = localPdf ? "local" : anyPdf ? "remote" : "none";
                 return (
                   <PaperRow
@@ -804,11 +808,7 @@ function sortValue(paper: Paper, sortKey: SortKey) {
 }
 
 function formatDate(value: string) {
-  return new Intl.DateTimeFormat(undefined, {
-    year: "2-digit",
-    month: "2-digit",
-    day: "2-digit"
-  }).format(new Date(value));
+  return dateFormatter.format(new Date(value));
 }
 
 function getCollectionDropIdAtPoint(x: number, y: number) {
