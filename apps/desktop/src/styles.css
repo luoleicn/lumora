@@ -1401,6 +1401,11 @@ body.paper-pointer-dragging * {
   padding: 10px;
 }
 
+.notebook-list[data-virtual-list],
+.inspector-notes[data-virtual-list] {
+  display: block;
+}
+
 .notebook-item button {
   display: grid;
   grid-template-columns: 18px minmax(0, 1fr) auto;

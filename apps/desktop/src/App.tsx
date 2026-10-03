@@ -84,6 +84,7 @@ import { useCloudSync } from "./hooks/useCloudSync";
 import { useMendeleySync } from "./hooks/useMendeleySync";
 import { useArxivDownloads } from "./hooks/useArxivDownloads";
 import { browserPrepareAppExitEvent, nativePrepareAppExitEvent } from "./lib/appExit";
+import { prepareVirtualListSelection } from "./lib/virtualListSelection";
 import {
   createPaperSelection,
   reconcilePaperSelection,
@@ -192,6 +193,7 @@ function selectAllActiveWorkspaceContent() {
   if (!activePane || !selection) {
     return;
   }
+  prepareVirtualListSelection(activePane);
   const range = document.createRange();
   range.selectNodeContents(activePane);
   selection.removeAllRanges();
