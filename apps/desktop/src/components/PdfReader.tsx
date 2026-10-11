@@ -1971,7 +1971,7 @@ function AnnotationContextMenu({
 
   return (
     <div
-      className={compact ? "pdf-context-menu compact" : "pdf-context-menu"}
+      className={`pdf-context-menu${compact ? " compact" : menu.mode === "note" ? " note-editor" : ""}`}
       style={{ left: menu.x, top: menu.y }}
       onPointerDown={(event) => event.stopPropagation()}
       role="menu"

@@ -1979,6 +1979,16 @@ body.paper-pointer-dragging * {
   padding: 6px;
 }
 
+.pdf-context-menu.note-editor {
+  /* Let the frame follow the textarea's user-selected width. */
+  width: min-content;
+  max-width: calc(100vw - 28px);
+}
+
+.pdf-context-menu.note-editor p {
+  overflow-wrap: anywhere;
+}
+
 .pdf-context-menu header {
   display: flex;
   align-items: center;
@@ -2017,8 +2027,11 @@ body.paper-pointer-dragging * {
 }
 
 .pdf-context-menu textarea {
+  width: min(298px, calc(100vw - 50px));
+  min-width: min(168px, calc(100vw - 50px));
+  max-width: min(538px, calc(100vw - 50px));
   min-height: 82px;
-  resize: vertical;
+  resize: both;
   border: 1px solid #d3dbe3;
   border-radius: 7px;
   color: #202226;
