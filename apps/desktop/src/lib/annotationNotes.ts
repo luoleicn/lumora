@@ -1,15 +1,16 @@
-import type { Annotation } from "@lumora/shared";
+import { noteDraftsEqual, type Annotation, type NoteDraft } from "@lumora/shared";
 
 /** Attach note text to an annotation, promoting a highlight to a note. */
 function withNoteComment(
   annotation: Annotation,
-  comment: string,
+  draft: NoteDraft,
   updatedAt = new Date().toISOString()
 ): Annotation {
   return {
     ...annotation,
     kind: "note",
-    comment,
+    comment: draft.text,
+    commentContent: draft.content,
     updatedAt
   };
 }
@@ -24,14 +25,19 @@ function withNoteComment(
  */
 export function resolveNoteDraft(
   annotation: Annotation,
-  draft: string,
+  draft: string | NoteDraft,
   updatedAt = new Date().toISOString()
 ): Annotation | undefined {
-  const trimmed = draft.trim();
-  const unchanged = annotation.kind === "note" && trimmed === (annotation.comment ?? "");
-  if (!trimmed || unchanged) {
+  const value = typeof draft === "string" ? { text: draft.trim() } : {
+    ...draft,
+    text: draft.content ? draft.text : draft.text.trim()
+  };
+  const unchanged = annotation.kind === "note" && noteDraftsEqual(value, {
+    text: annotation.comment ?? "", content: annotation.commentContent
+  });
+  if ((!value.text.trim() && !value.content) || unchanged) {
     return undefined;
   }
 
-  return withNoteComment(annotation, trimmed, updatedAt);
+  return withNoteComment(annotation, value, updatedAt);
 }

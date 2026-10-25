@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
-import type { Annotation, Paper } from "@lumora/shared";
+import { noteDraft, type Annotation, type Paper } from "@lumora/shared";
 import {
   PaperNotesTab,
   updatePaperPersonalNote
@@ -72,5 +72,19 @@ describe("PaperNotesTab", () => {
       userContext: undefined
     });
     expect(updatePaperPersonalNote(paper, paper.userContext!)).toBe(paper);
+  });
+
+  it("renders and saves mixed personal notes and clears image payloads when emptied", () => {
+    const draft = noteDraft([
+      { type: "text", text: "A caption" },
+      { type: "image", dataUrl: "data:image/png;base64,YWJj", alt: "Figure" }
+    ]);
+    const updated = updatePaperPersonalNote(paper, draft);
+    expect(updated.userContextContent).toEqual(draft.content);
+    expect(updatePaperPersonalNote(updated, draft)).toBe(updated);
+    const markup = renderToStaticMarkup(<PaperNotesTab paper={updated} annotations={[]} onUpdatePaper={vi.fn()} onDeleteAnnotation={vi.fn()} />);
+    expect(markup).toContain('src="data:image/png;base64,YWJj"');
+    expect(markup).toContain("A caption");
+    expect(updatePaperPersonalNote(updated, "").userContextContent).toBeUndefined();
   });
 });

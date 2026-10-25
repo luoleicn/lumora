@@ -243,6 +243,8 @@ export function mendeleyDocumentToPaper(document: MendeleyDocument, existing?: P
     code: document.code ?? existing?.code,
     medium: document.medium ?? existing?.medium,
     userContext: document.user_context ?? existing?.userContext,
+    userContextContent: document.user_context === undefined || document.user_context === existing?.userContext
+      ? existing?.userContextContent : undefined,
     department: document.department ?? existing?.department,
     patentOwner: document.patent_owner ?? existing?.patentOwner,
     patentApplicationNumber: document.patent_application_number ?? existing?.patentApplicationNumber,
@@ -379,6 +381,7 @@ export function mendeleyAnnotationToLocal(
     rects,
     notePosition: sticky && rects[0] ? { x: rects[0].x, y: rects[0].y } : existing?.notePosition,
     comment: annotation.text || undefined,
+    commentContent: annotation.text === existing?.comment ? existing?.commentContent : undefined,
     mendeleyId: annotation.id ?? existing?.mendeleyId,
     mendeleyFileHash: annotation.filehash,
     mendeleyPrivacyLevel: annotation.privacy_level ?? "private",

@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import "./lib/webkitPolyfills";
 import App from "./App";
+import { NoteImagePreview } from "./components/NoteImagePreview";
 import { reportRuntimeError, RuntimeErrorBoundary } from "./components/RuntimeErrorBoundary";
 import "./styles.css";
 
@@ -17,6 +18,7 @@ createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <RuntimeErrorBoundary>
       <App />
+      <NoteImagePreview />
     </RuntimeErrorBoundary>
   </StrictMode>
 );

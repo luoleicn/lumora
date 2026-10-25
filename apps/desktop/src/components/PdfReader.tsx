@@ -4,13 +4,14 @@ import { listen } from "@tauri-apps/api/event";
 import { Document, Page, pdfjs } from "react-pdf";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { Languages, MessageSquare, StickyNote, Trash2, X } from "lucide-react";
-import type { Annotation, FileAsset, Paper } from "@lumora/shared";
+import type { Annotation, FileAsset, NoteContent, NoteDraft, Paper } from "@lumora/shared";
 import { clamp01, mergeNearbyRects, normalizeRect } from "@lumora/shared";
 import { NativePdfLinkLayer } from "./NativePdfLinkLayer";
 import { NativePdfPage } from "./NativePdfPage";
 import { NativePdfTextLayer } from "./NativePdfTextLayer";
 import { createId } from "../lib/id";
 import { resolveNoteDraft } from "../lib/annotationNotes";
+import { RichNoteEditor } from "./RichNoteEditor";
 import {
   openNativePdfDocument,
   openNativePdfPath,
@@ -83,11 +84,13 @@ type TranslationState =
 
 type NewAnnotationContextMenu = {
   kind: "new";
+  noteId: string;
   x: number;
   y: number;
   selection: PendingSelection;
   mode: "actions" | "note" | "translate";
   noteText: string;
+  noteContent?: NoteContent;
   translation?: TranslationState;
 };
 
@@ -98,6 +101,7 @@ type ExistingAnnotationContextMenu = {
   annotation: Annotation;
   mode: "actions" | "note" | "translate";
   noteText: string;
+  noteContent?: NoteContent;
   selectionBased?: boolean;
   translation?: TranslationState;
 };
@@ -437,7 +441,7 @@ function PdfReaderComponent({
       // Escape leaves the note editor the way clicking outside does: the text
       // typed so far is saved rather than dropped.
       if (contextMenu.mode === "note") {
-        saveContextMenuNote(contextMenu, contextMenu.noteText);
+        saveContextMenuNote(contextMenu, { text: contextMenu.noteText, content: contextMenu.noteContent });
         return;
       }
 
@@ -693,6 +697,7 @@ function PdfReaderComponent({
     let disposed = false;
 
     void listen<string>(pdfViewEvent, (event) => {
+      if (document.querySelector("[data-note-image-preview]")) return;
       const command = event.payload;
       if (command === "fit-width") {
         handleFitWidth();
@@ -845,7 +850,8 @@ function PdfReaderComponent({
         y: event.clientY,
         annotation: existingAnnotation,
         mode: "actions",
-        noteText: existingAnnotation.comment ?? ""
+        noteText: existingAnnotation.comment ?? "",
+        noteContent: existingAnnotation.commentContent
       });
       return;
     }
@@ -859,6 +865,7 @@ function PdfReaderComponent({
     event.preventDefault();
     setContextMenu({
       kind: "new",
+      noteId: createId("annotation"),
       x: event.clientX,
       y: event.clientY,
       selection,
@@ -896,6 +903,7 @@ function PdfReaderComponent({
           annotation: existingAnnotation,
           mode: "actions",
           noteText: existingAnnotation.comment ?? "",
+          noteContent: existingAnnotation.commentContent,
           selectionBased: true
         });
         return;
@@ -903,6 +911,7 @@ function PdfReaderComponent({
 
       setContextMenu({
         kind: "new",
+        noteId: createId("annotation"),
         x: position.x,
         y: position.y,
         selection,
@@ -912,14 +921,14 @@ function PdfReaderComponent({
     }, 0);
   }
 
-  function createAnnotation(kind: Annotation["kind"], selection: PendingSelection, comment?: string) {
+  function createAnnotation(kind: Annotation["kind"], selection: PendingSelection, draft?: NoteDraft, id = createId("annotation")) {
     if (!paper || !fileAsset) {
       return;
     }
 
     const now = new Date().toISOString();
     onCreateAnnotation({
-      id: createId("annotation"),
+      id,
       paperId: paper.id,
       fileId: fileAsset.id,
       pageIndex: selection.pageIndex,
@@ -927,7 +936,8 @@ function PdfReaderComponent({
       color,
       rects: selection.rects,
       quote: selection.quote,
-      comment: kind === "note" ? comment?.trim() : undefined,
+      comment: kind === "note" ? draft?.content ? draft.text : draft?.text.trim() : undefined,
+      commentContent: kind === "note" ? draft?.content : undefined,
       sourceSha256: fileAsset.sha256,
       createdAt: now,
       updatedAt: now
@@ -937,14 +947,14 @@ function PdfReaderComponent({
     setContextMenu(undefined);
   }
 
-  function saveContextMenuNote(menu: AnnotationContextMenu, noteText: string) {
+  function saveContextMenuNote(menu: AnnotationContextMenu, draft: NoteDraft) {
     if (menu.kind === "existing") {
-      updateAnnotationWithNote(menu.annotation, noteText);
+      updateAnnotationWithNote(menu.annotation, draft);
       return;
     }
 
-    if (noteText.trim()) {
-      createAnnotation("note", menu.selection, noteText);
+    if (draft.text.trim() || draft.content) {
+      createAnnotation("note", menu.selection, draft, menu.noteId);
       return;
     }
 
@@ -952,8 +962,8 @@ function PdfReaderComponent({
     setContextMenu(undefined);
   }
 
-  function updateAnnotationWithNote(annotation: Annotation, comment: string) {
-    const updated = resolveNoteDraft(annotation, comment);
+  function updateAnnotationWithNote(annotation: Annotation, draft: NoteDraft) {
+    const updated = resolveNoteDraft(annotation, draft);
     if (updated) {
       onCreateAnnotation(updated);
     }
@@ -966,6 +976,7 @@ function PdfReaderComponent({
       ...annotation,
       kind: "highlight",
       comment: undefined,
+      commentContent: undefined,
       notePosition: undefined,
       updatedAt: new Date().toISOString()
     });
@@ -1391,7 +1402,8 @@ function PdfReaderComponent({
                         y: event.clientY,
                         annotation,
                         mode: "actions",
-                        noteText: annotation.comment ?? ""
+                        noteText: annotation.comment ?? "",
+                        noteContent: annotation.commentContent
                       });
                     }}
                   />
@@ -1463,7 +1475,8 @@ function PdfReaderComponent({
                           y: event.clientY,
                           annotation,
                           mode: "actions",
-                          noteText: annotation.comment ?? ""
+                          noteText: annotation.comment ?? "",
+                          noteContent: annotation.commentContent
                         });
                       }}
                     />
@@ -1503,7 +1516,7 @@ function PdfReaderComponent({
             color={color}
             onColorChange={setColor}
             onClose={() => setContextMenu(undefined)}
-            onChangeNote={(noteText) => setContextMenu((current) => current ? { ...current, noteText } : current)}
+            onChangeNote={(draft) => setContextMenu((current) => current ? { ...current, noteText: draft.text, noteContent: draft.content } : current)}
             onStartNote={() => setContextMenu((current) => current ? { ...current, mode: "note" } : current)}
             onHighlight={() => {
               if (contextMenu.kind === "new") {
@@ -1588,6 +1601,7 @@ function annotationsEqual(previous: Annotation[], next: Annotation[]) {
       && annotation.kind === nextAnnotation.kind
       && annotation.color === nextAnnotation.color
       && annotation.comment === nextAnnotation.comment
+      && annotation.commentContent === nextAnnotation.commentContent
       && annotation.pageIndex === nextAnnotation.pageIndex
       && annotation.rects === nextAnnotation.rects
       && annotation.notePosition === nextAnnotation.notePosition;
@@ -1623,7 +1637,7 @@ function AnnotationOverlay({
   onOpenAnnotationMenu: (annotation: Annotation, event: React.MouseEvent) => void;
 }) {
   const [openNoteId, setOpenNoteId] = useState<string>();
-  const [noteDraft, setNoteDraft] = useState("");
+  const [noteDraft, setNoteDraft] = useState<NoteDraft>({ text: "" });
   // Visual position of the marker being dragged. Kept local so a drag never
   // touches the library state (whose every update re-renders the app and
   // enqueues a whole-library diff + SQLite write); the move is committed once
@@ -1648,7 +1662,6 @@ function AnnotationOverlay({
   const suppressClickRef = useRef<string | undefined>(undefined);
   const overlayRef = useRef<HTMLDivElement>(null);
   const notePopoverRef = useRef<HTMLElement>(null);
-  const noteTextareaRef = useRef<HTMLTextAreaElement>(null);
   const openNote = annotations.find((annotation) => annotation.id === openNoteId && annotation.kind === "note");
   const openNotePosition = openNote
     ? dragPosition?.annotationId === openNote.id ? dragPosition : getNoteMarkerPosition(openNote)
@@ -1678,19 +1691,6 @@ function AnnotationOverlay({
   }, [annotations]);
 
   useEffect(() => () => commitNoteDraftRef.current(), []);
-
-  // Opening a note hands it straight to the keyboard, caret after the existing
-  // text. `preventScroll` matters: the reader is a virtualized scroller, and a
-  // focus-driven scroll would drag the page out from under the click.
-  useEffect(() => {
-    const textarea = noteTextareaRef.current;
-    if (!textarea) {
-      return;
-    }
-
-    textarea.focus({ preventScroll: true });
-    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
-  }, [openNoteId]);
 
   // Remember the size the user drags the editor to. Written through a ref
   // rather than state: a resize must not re-render the page list mid-drag.
@@ -1730,7 +1730,7 @@ function AnnotationOverlay({
     }
 
     commitNoteDraftRef.current();
-    setNoteDraft(annotation.comment ?? "");
+    setNoteDraft({ text: annotation.comment ?? "", content: annotation.commentContent });
     setOpenNoteId(annotation.id);
   }
 
@@ -1894,10 +1894,15 @@ function AnnotationOverlay({
               <X size={13} />
             </button>
           </header>
-          <textarea
-            ref={noteTextareaRef}
-            value={noteDraft}
-            onChange={(event) => setNoteDraft(event.target.value)}
+          <RichNoteEditor
+            key={openNote.id}
+            value={noteDraft.text}
+            content={noteDraft.content}
+            onChange={setNoteDraft}
+            onCommit={(draft) => {
+              const updated = resolveNoteDraft(openNote, draft);
+              if (updated) onUpdateNote(updated);
+            }}
             onKeyDown={(event) => {
               if (event.key === "Escape") {
                 event.preventDefault();
@@ -1905,8 +1910,9 @@ function AnnotationOverlay({
                 closeNoteEditor();
               }
             }}
-            placeholder="Add a note"
-            aria-label="Note text"
+            placeholder="Write a note or paste an image…"
+            ariaLabel="Note text"
+            autoFocus
           />
           <span className="note-popover-hint">Click outside to save</span>
         </aside>
@@ -1956,14 +1962,14 @@ function AnnotationContextMenu({
   color: string;
   onColorChange: (color: string) => void;
   onClose: () => void;
-  onChangeNote: (noteText: string) => void;
+  onChangeNote: (draft: NoteDraft) => void;
   onStartNote: () => void;
   onHighlight: () => void;
   onTranslate: (quote: string) => void;
   onOpenDictionaryPage: (url: string) => void;
   onDeleteAnnotation: (annotation: Annotation) => void;
   onDeleteNote: (annotation: Annotation) => void;
-  onSaveNote: (noteText: string) => void;
+  onSaveNote: (draft: NoteDraft) => void;
 }) {
   const title = getContextMenuTitle(menu);
   const quote = menu.kind === "new" ? menu.selection.quote : menu.annotation.quote;
@@ -2010,11 +2016,13 @@ function AnnotationContextMenu({
         <TranslationView translation={menu.translation} onOpenPage={onOpenDictionaryPage} />
       ) : menu.mode === "note" ? (
         <div className="context-note-editor">
-          <textarea
+          <RichNoteEditor
             value={menu.noteText}
-            onChange={(event) => onChangeNote(event.target.value)}
-            onBlur={(event) => onSaveNote(event.currentTarget.value)}
-            placeholder="Add a note"
+            content={menu.noteContent}
+            onChange={onChangeNote}
+            onCommit={onSaveNote}
+            placeholder="Write a note or paste an image…"
+            ariaLabel="Note text"
             autoFocus
           />
           <span>Click outside to save</span>

@@ -59,6 +59,18 @@ own listed head is always skipped.
 
 ## Files and arXiv
 
+Personal notes and PDF annotation notes support ordered text and image blocks.
+The optional `userContextContent` / `commentContent` fields carry a versioned
+document with embedded PNG, JPEG, GIF or WebP data URLs. Image bytes and layout
+are saved in the same SQLite entity and immutable cloud change as the note, so
+there is no device-local path, temporary URL, or separate attachment transfer
+that can leave a synced note without its image. The text fields remain readable
+fallbacks for search, Mendeley and older clients. Both receiving desktops need
+this feature to display and edit the images. Pasted images are limited to 5 MiB
+each and the encoded note to 20 MiB; remote image URLs and clipboard HTML are
+never rendered as active markup. Mendeley exchanges the text fallback and
+preserves local images when that text is unchanged.
+
 Device-local paths and availability never enter cloud batches. Ordinary files
 are addressed by SHA-256 and mirrored to macOS. A paper with an arXiv ID stores
 the pinned ID including `vN`; its PDF is not uploaded. Qiniu sync never contacts

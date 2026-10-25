@@ -2394,4 +2394,50 @@ mod tests {
         assert_eq!(decoded.batch_seq, 4);
         assert_eq!(decoded.device_id, "device-a");
     }
+
+    #[test]
+    fn mixed_notes_arrive_intact_in_another_device_database() {
+        let content = serde_json::json!({
+            "version": 1,
+            "blocks": [
+                { "type": "text", "text": "Before\n" },
+                { "type": "image", "dataUrl": "data:image/png;base64,YWJj", "alt": "Figure" },
+                { "type": "text", "text": "\nAfter" }
+            ]
+        });
+        let paper = serde_json::json!({
+            "id": "paper-rich", "title": "Paper", "authors": [],
+            "userContext": "Before\n[Figure]\nAfter", "userContextContent": content,
+            "createdAt": "2026-10-25T00:00:00Z", "updatedAt": "2026-10-25T00:00:00Z"
+        });
+        let annotation = serde_json::json!({
+            "id": "note-rich", "paperId": "paper-rich", "fileId": "file-a",
+            "pageIndex": 0, "kind": "note", "color": "#ffee58", "rects": [],
+            "comment": "Before\n[Figure]\nAfter", "commentContent": content,
+            "createdAt": "2026-10-25T00:00:00Z", "updatedAt": "2026-10-25T00:00:00Z"
+        });
+        let batch = CloudBatch {
+            protocol_version: 1, device_id: "device-a".into(), batch_seq: 1, created_at: "now".into(),
+            changes: vec![
+                CloudChange { operation_id: "paper-rich-op".into(), entity: "paper".into(), op: "upsert".into(), data: paper.clone() },
+                CloudChange { operation_id: "note-rich-op".into(), entity: "annotation".into(), op: "upsert".into(), data: annotation.clone() },
+            ],
+        };
+        let decoded: CloudBatch = ungzip_json(&gzip_json(&batch).unwrap()).unwrap();
+        let mut receiver = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_library_schema(&receiver).unwrap();
+        init_sync_schema(&receiver).unwrap();
+        let transaction = receiver.transaction().unwrap();
+        for (index, change) in decoded.changes.iter().enumerate() {
+            assert!(apply_change(&transaction, change, 10, "device-a", 1, index).unwrap());
+        }
+        transaction.commit().unwrap();
+        for (entity_type, id, expected) in [("paper", "paper-rich", paper), ("annotation", "note-rich", annotation)] {
+            let data: String = receiver.query_row(
+                "SELECT data FROM entities WHERE entity_type=?1 AND id=?2",
+                rusqlite::params![entity_type, id], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&data).unwrap(), expected);
+        }
+    }
 }

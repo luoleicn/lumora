@@ -1,6 +1,8 @@
 import { Trash2 } from "lucide-react";
-import type { Annotation, Paper } from "@lumora/shared";
+import { noteDraftsEqual, type Annotation, type NoteDraft, type Paper } from "@lumora/shared";
 import { MeasuredVirtualList } from "./MeasuredVirtualList";
+import { RichNoteEditor } from "./RichNoteEditor";
+import { NoteContent } from "./NoteContent";
 
 type PaperNotesTabProps = {
   paper?: Paper;
@@ -9,11 +11,12 @@ type PaperNotesTabProps = {
   onDeleteAnnotation: (annotation: Annotation) => void;
 };
 
-export function updatePaperPersonalNote(paper: Paper, value: string): Paper {
-  const userContext = value === "" ? undefined : value;
-  return paper.userContext === userContext
+export function updatePaperPersonalNote(paper: Paper, value: string | NoteDraft): Paper {
+  const draft = typeof value === "string" ? { text: value } : value;
+  const userContext = draft.text === "" ? undefined : draft.text;
+  return noteDraftsEqual({ text: paper.userContext ?? "", content: paper.userContextContent }, draft)
     ? paper
-    : { ...paper, userContext };
+    : { ...paper, userContext, userContextContent: draft.content };
 }
 
 export function PaperPersonalNoteEditor({
@@ -25,20 +28,22 @@ export function PaperPersonalNoteEditor({
 }) {
   return (
     <section className="paper-personal-note">
-      <label>
+      <div className="paper-personal-note-field">
         <strong>Personal note</strong>
-        <textarea
+        <RichNoteEditor
+          key={paper.id}
           value={paper.userContext ?? ""}
-          onChange={(event) => {
-            const nextPaper = updatePaperPersonalNote(paper, event.target.value);
+          content={paper.userContextContent}
+          onChange={(draft) => {
+            const nextPaper = updatePaperPersonalNote(paper, draft);
             if (nextPaper !== paper) {
               onUpdatePaper(nextPaper);
             }
           }}
-          placeholder="Add your notes about this paper…"
-          aria-label="Personal note for this paper"
+          placeholder="Write a note or paste an image…"
+          ariaLabel="Personal note for this paper"
         />
-      </label>
+      </div>
     </section>
   );
 }
@@ -78,7 +83,7 @@ export function PaperNotesTab({
                 </button>
               </header>
               {annotation.quote && <p>{annotation.quote}</p>}
-              {annotation.comment && <blockquote>{annotation.comment}</blockquote>}
+              {(annotation.comment || annotation.commentContent) && <blockquote><NoteContent value={annotation.comment ?? ""} content={annotation.commentContent} /></blockquote>}
             </article>
           )}
         />

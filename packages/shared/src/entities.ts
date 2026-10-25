@@ -1,3 +1,5 @@
+import type { NoteContent } from "./notes.js";
+
 export type EntityId = string;
 
 export type SyncEntity =
@@ -66,6 +68,7 @@ export type Paper = {
   code?: string;
   medium?: string;
   userContext?: string;
+  userContextContent?: NoteContent;
   department?: string;
   patentOwner?: string;
   patentApplicationNumber?: string;
@@ -190,6 +193,7 @@ export type Annotation = {
   notePosition?: NormalizedPoint;
   quote?: string;
   comment?: string;
+  commentContent?: NoteContent;
   /** PDF content identity used to prevent drawing coordinates on another revision. */
   sourceSha256?: string;
   mendeleyId?: string;

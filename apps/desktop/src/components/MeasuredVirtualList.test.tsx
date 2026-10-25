@@ -169,12 +169,12 @@ describe("measured virtual list interactions", () => {
   it("keeps the personal editor mounted and deletes a note in the existing inspector scroller", () => {
     const deleted = vi.fn(); const long = { ...annotations[0], comment: "Long note ".repeat(1000) };
     act(() => root.render(<aside className="sync-panel"><PaperNotesTab paper={paper} annotations={[long, ...annotations.slice(1, 440)]} onUpdatePaper={vi.fn()} onDeleteAnnotation={deleted} /></aside>)); settle();
-    const editor = host.querySelector("textarea");
+    const editor = host.querySelector('[role="textbox"]');
     expect(host.textContent).toContain(long.comment);
     act(() => host.querySelector<HTMLButtonElement>("article button")!.click());
     expect(deleted).toHaveBeenCalledWith(long);
     act(() => { const scroll = host.querySelector<HTMLElement>("aside")!; scroll.scrollTop = 20_000; scroll.dispatchEvent(new Event("scroll")); }); settle();
-    expect(host.querySelector("textarea")).toBe(editor);
+    expect(host.querySelector('[role="textbox"]')).toBe(editor);
     expect(host.querySelectorAll("article").length).toBeLessThan(100);
     expect(TestResizeObserver.instances[0].observed.has(host.querySelector(".paper-notes-tab")!)).toBe(true);
     const firstBeforeResize = Number(host.querySelector<HTMLElement>("[data-virtual-item]")!.dataset.virtualItem);

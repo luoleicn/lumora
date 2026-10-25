@@ -2,6 +2,7 @@ import { BookOpen, FileText, Search } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { Annotation, Paper } from "@lumora/shared";
 import { MeasuredVirtualList } from "./MeasuredVirtualList";
+import { NoteContent } from "./NoteContent";
 
 type NotebookPanelProps = {
   papers: Paper[];
@@ -58,7 +59,7 @@ export function NotebookPanel({ papers, annotations, onOpenPaper }: NotebookPane
                   <span className="annotation-dot" style={{ backgroundColor: annotation.color }} />
                   <div>
                     {annotation.quote && <p>{annotation.quote}</p>}
-                    {annotation.comment && <blockquote>{annotation.comment}</blockquote>}
+                    {(annotation.comment || annotation.commentContent) && <blockquote><NoteContent value={annotation.comment ?? ""} content={annotation.commentContent} /></blockquote>}
                   </div>
                 </div>
               </article>

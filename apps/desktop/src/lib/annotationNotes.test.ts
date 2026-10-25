@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Annotation } from "@lumora/shared";
+import { noteDraft, type Annotation } from "@lumora/shared";
 import { resolveNoteDraft } from "./annotationNotes";
 
 const highlight: Annotation = {
@@ -44,5 +44,16 @@ describe("resolveNoteDraft", () => {
   it("keeps the stored text when the draft is emptied", () => {
     expect(resolveNoteDraft(note, "   ")).toBeUndefined();
     expect(resolveNoteDraft(highlight, "")).toBeUndefined();
+  });
+
+  it("saves image-only drafts and changes to image bytes with the same caption", () => {
+    const first = noteDraft([{ type: "image", dataUrl: "data:image/png;base64,YWJj", alt: "Figure" }]);
+    const saved = resolveNoteDraft(highlight, first)!;
+    expect(saved.kind).toBe("note");
+    expect(saved.commentContent).toEqual(first.content);
+    expect(resolveNoteDraft(saved, first)).toBeUndefined();
+    const changed = noteDraft([{ type: "image", dataUrl: "data:image/png;base64,ZGVm", alt: "Figure" }]);
+    expect(resolveNoteDraft(saved, changed)?.commentContent).toEqual(changed.content);
+    expect(resolveNoteDraft(saved, "Plain text")?.commentContent).toBeUndefined();
   });
 });

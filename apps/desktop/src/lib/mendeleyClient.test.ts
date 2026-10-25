@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { LibraryState, Paper } from "@lumora/shared";
+import { noteDraft, type LibraryState, type Paper } from "@lumora/shared";
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 import {
@@ -88,9 +88,29 @@ describe("mendeleyDocumentToPaper", () => {
     expect(paper.userContext).toBe("First line\nSecond line");
     expect(paperToMendeleyDocument(paper).user_context).toBe("First line\nSecond line");
   });
+
+  it("keeps local image bytes when Mendeley returns the text fallback", () => {
+    const draft = noteDraft([{ type: "image", dataUrl: "data:image/png;base64,YWJj", alt: "Figure" }]);
+    const paper = { ...mendeleyDocumentToPaper(remoteDocument), userContext: draft.text, userContextContent: draft.content };
+    const remote = paperToMendeleyDocument(paper);
+    expect(remote.user_context).toBe(draft.text);
+    expect(JSON.stringify(remote)).not.toContain("base64");
+    expect(mendeleyDocumentToPaper(remote, paper).userContextContent).toEqual(draft.content);
+    expect(mendeleyDocumentToPaper({ ...remote, user_context: "Remote edit" }, paper).userContextContent).toBeUndefined();
+  });
 });
 
 describe("Mendeley annotations", () => {
+  it("keeps annotation images on a text round-trip and clears stale layout after a remote edit", () => {
+    const draft = noteDraft([{ type: "image", dataUrl: "data:image/png;base64,YWJj", alt: "Figure" }]);
+    const paper = mendeleyDocumentToPaper(remoteDocument);
+    const original = mendeleyAnnotationToLocal({ type: "note", text: draft.text, document_id: "md-1" }, paper.id, "file-a");
+    const local = { ...original, commentContent: draft.content };
+    const remote = localAnnotationToMendeley(local, paper);
+    expect(JSON.stringify(remote)).not.toContain("base64");
+    expect(mendeleyAnnotationToLocal(remote, paper.id, "file-a", local).commentContent).toEqual(draft.content);
+    expect(mendeleyAnnotationToLocal({ ...remote, text: "Remote edit" }, paper.id, "file-a", local).commentContent).toBeUndefined();
+  });
   it("preserves PDF point positions and maps them to a visible local annotation", () => {
     const annotation = mendeleyAnnotationToLocal({
       id: "ma-1",
