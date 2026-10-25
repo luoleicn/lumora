@@ -40,6 +40,7 @@ docs                # 项目主页与同步协议文档
 
 - **Node.js ≥ 22**
 - **npm ≥ 11**
+- **Git**（获取源码）
 - **Rust 稳定版工具链**（用于 `tauri dev` 与原生打包）——通过 [rustup](https://rustup.rs) 安装
 - **macOS**：安装 Xcode Command Line Tools（`xcode-select --install`），提供 C 工具链与 WebKit；`rusqlite` 使用 bundled 模式，**无需**单独安装 SQLite
 - **Ubuntu / Debian**：安装 WebKitGTK 与 GTK 开发库、Secret Service（密钥存储）以及打包工具。`rusqlite` 使用 bundled 模式，**无需**单独安装 SQLite：
@@ -48,21 +49,35 @@ docs                # 项目主页与同步协议文档
   sudo apt update
   sudo apt install -y \
     libwebkit2gtk-4.1-dev libgtk-3-dev libsecret-1-dev librsvg2-dev \
-    build-essential libssl-dev patchelf file
+    build-essential libssl-dev patchelf file curl wget \
+    libxdo-dev libayatana-appindicator3-dev poppler-utils
   ```
 
   > `libsecret`（配合 GNOME Keyring / KWallet 等 Secret Service 后端）用于安全保存云同步密钥；桌面会话未运行 Secret Service 时，密钥读写会失败。
+
+  `poppler-utils` 提供原生 PDF 阅读使用的 `pdfinfo`、`pdftotext` 等命令；本地开发和直接运行二进制时也需要安装。
+- **Windows**：建议使用 Windows 10/11 x64，安装 [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)，勾选 **Desktop development with C++（使用 C++ 的桌面开发）**，包含 MSVC 编译器和 Windows SDK；同时安装 [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)。Rust 使用 MSVC 工具链：
+
+  ```powershell
+  rustup default stable-msvc
+  ```
+
+  安装完成后重新打开终端。生成 MSI 还需要启用 Windows 的 VBSCRIPT 可选功能；遇到 `failed to run light.exe` 时，按 [Tauri Windows 环境说明](https://v2.tauri.app/start/prerequisites/#windows) 检查该功能。
 - 无需 Docker，无需自建后端
 
 > 当前阶段的主力产品是 **macOS 与 Linux 桌面端**，两端的功能、架构与发布质量需要共同维护；iPhone 作为后续平台推进。
 
 ## 安装依赖
 
-在仓库根目录执行（会安装所有 workspace 的依赖）：
+获取源码并在仓库根目录安装所有 workspace 的依赖（macOS、Linux 终端和 Windows PowerShell 均可执行）：
 
 ```bash
-npm install
+git clone https://github.com/luoleicn/lumora.git
+cd lumora
+npm ci
 ```
+
+已有源码时直接进入仓库根目录执行 `npm ci`。日常新增或调整依赖时使用 `npm install`。
 
 Rust 侧依赖会在首次 `tauri dev` / `tauri build` 时由 Cargo 自动拉取，无需手动安装。
 
@@ -81,23 +96,53 @@ npm run dev:desktop
 npm run tauri:dev --workspace @lumora/desktop
 ```
 
-## 编译打包（macOS）
+## 编译桌面可执行程序
 
-构建原生 macOS 应用：
+先完成上面的环境准备和依赖安装。以下构建命令均在**仓库根目录**执行，默认使用 release 模式，并自动构建共享包、前端和 Rust 原生程序；无需另开 Vite 服务或事先执行 `npm run build`。首次构建需要联网下载 Cargo 依赖及平台打包工具，耗时较长。
+
+| 目标平台 | 构建所在系统 | 构建命令 | 主要产物 |
+| --- | --- | --- | --- |
+| macOS | macOS | `npm run tauri:build --workspace @lumora/desktop` | `lumora.app` |
+| Linux | Linux（Ubuntu / Debian） | `npm run tauri:build:linux --workspace @lumora/desktop` | `.deb`、`.AppImage`、`lumora` 二进制 |
+| Windows | Windows（PowerShell） | `npm run tauri:build:windows --workspace @lumora/desktop` | `.msi`、`-setup.exe`、`lumora.exe` |
+
+这些步骤使用各平台的原生构建环境；仅在 macOS 上添加一个 Rust target 不足以生成 Linux / Windows 分发包。仓库的 [Release 工作流](.github/workflows/release.yml) 也分别使用三个系统的 runner。
+
+### macOS（Apple Silicon / Intel）
+
+构建当前 Mac 架构的应用：
 
 ```bash
 npm run tauri:build --workspace @lumora/desktop
 ```
 
-产物位于：
+产物与启动命令：
 
+```bash
+open apps/desktop/src-tauri/target/release/bundle/macos/lumora.app
 ```
-apps/desktop/src-tauri/target/release/bundle/macos/lumora.app
+
+可以将整个 `lumora.app` 拷贝到 `/Applications`。包内可执行文件位于 `lumora.app/Contents/MacOS/lumora`，分发时保留完整 `.app` 目录。默认构建在 Apple Silicon 上生成 arm64，在 Intel 上生成 x86_64。
+
+在同一台 Mac 上构建同时支持两种架构的 Universal 应用：
+
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+npm run tauri:build --workspace @lumora/desktop -- --target universal-apple-darwin
+open apps/desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/lumora.app
 ```
 
-## 编译打包（Linux / Ubuntu）
+如需本地 DMG 安装镜像，可直接指定打包格式：
 
-在 Ubuntu 上构建原生应用并生成 `.deb` 与 `.AppImage` 分发包：
+```bash
+npm exec --workspace @lumora/desktop -- tauri build --bundles app,dmg
+```
+
+DMG 位于 `apps/desktop/src-tauri/target/release/bundle/dmg/`。普通本地构建无需更新签名密钥；面向其他用户分发时的 Apple 签名与公证要求见 [Tauri macOS 签名说明](https://v2.tauri.app/distribute/sign/macos/)。
+
+### Linux（Ubuntu / Debian）
+
+完成 Linux 系统依赖安装后，在 Linux 上构建应用并生成 `.deb` 与 `.AppImage` 分发包：
 
 ```bash
 npm run tauri:build:linux --workspace @lumora/desktop
@@ -105,9 +150,10 @@ npm run tauri:build:linux --workspace @lumora/desktop
 
 > `tauri:build`（macOS 用）固定 `--bundles app`，而 `app` 不是 Linux 的有效包类型，故 Linux 单独用 `tauri:build:linux` 脚本（`--bundles deb,appimage`）。
 
-产物位于：
+默认面向当前机器架构。下面以 x86_64 / amd64 为例，实际文件名中的版本号、架构以构建输出为准：
 
-```
+```text
+apps/desktop/src-tauri/target/release/lumora
 apps/desktop/src-tauri/target/release/bundle/deb/lumora_<version>_amd64.deb
 apps/desktop/src-tauri/target/release/bundle/appimage/lumora_<version>_amd64.AppImage
 ```
@@ -115,13 +161,57 @@ apps/desktop/src-tauri/target/release/bundle/appimage/lumora_<version>_amd64.App
 安装与运行：
 
 ```bash
-sudo dpkg -i apps/desktop/src-tauri/target/release/bundle/deb/lumora_*_amd64.deb
+sudo apt install ./apps/desktop/src-tauri/target/release/bundle/deb/lumora_*_amd64.deb
+lumora
+
 # 或直接运行 AppImage（需要可执行权限）
 chmod +x apps/desktop/src-tauri/target/release/bundle/appimage/lumora_*_amd64.AppImage
 ./apps/desktop/src-tauri/target/release/bundle/appimage/lumora_*_amd64.AppImage
 ```
 
-一键构建并发布到 GitHub Releases，见 `scripts/release-linux.sh`。
+也可以在已安装上述运行依赖的桌面会话中直接执行 `./apps/desktop/src-tauri/target/release/lumora`。分发到其他机器时优先使用安装包或 AppImage。
+
+Linux 包的兼容性受构建机 glibc 等系统库版本影响；需要兼容较老系统时，应在目标范围内最老、且提供 WebKitGTK 4.1 的系统上构建。当前 Release 工作流使用 Ubuntu 22.04，详见 [Tauri AppImage 兼容性说明](https://v2.tauri.app/distribute/appimage/#limitations)。
+
+### Windows（x64）
+
+在准备好 MSVC、Windows SDK、WebView2 和 Rust 的 Windows PowerShell 中执行：
+
+```powershell
+npm run tauri:build:windows --workspace @lumora/desktop
+```
+
+默认构建当前 Rust 工具链的目标架构。x64 构建的产物位于：
+
+```text
+apps/desktop/src-tauri/target/release/lumora.exe
+apps/desktop/src-tauri/target/release/bundle/msi/*.msi
+apps/desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+```
+
+双击 MSI 或 `-setup.exe` 安装；本机也可直接启动编译出的程序：
+
+```powershell
+.\apps\desktop\src-tauri\target\release\lumora.exe
+```
+
+直接运行仍需系统安装 WebView2。生成 MSI/NSIS 时，Tauri 会下载相应打包工具；MSI 构建须在 Windows 上进行。更多安装包选项见 [Tauri Windows Installer](https://v2.tauri.app/distribute/windows-installer/)。
+
+### 只编译二进制，不生成安装包
+
+在对应平台上执行以下命令，可以跳过 `.app` / `.deb` / `.AppImage` / MSI / NSIS 打包，但仍会构建前端并嵌入桌面程序：
+
+```bash
+npm exec --workspace @lumora/desktop -- tauri build --no-bundle
+```
+
+产物为 `apps/desktop/src-tauri/target/release/lumora`（macOS / Linux）或 `lumora.exe`（Windows）。运行依赖与上面对应平台相同；macOS 日常使用和分发推荐完整 `.app`。
+
+以上路径按默认 Cargo 输出目录列出。显式传入 `--target <triple>` 时，产物改到 `apps/desktop/src-tauri/target/<triple>/release/` 下；设置了 `CARGO_TARGET_DIR` 时，以该目录及构建日志为准。
+
+### 正式发布与自动更新
+
+普通本地构建不需要 GitHub Token 或 `TAURI_SIGNING_PRIVATE_KEY`。正式发布使用 [Release 工作流](.github/workflows/release.yml) 或 [macOS 发布脚本](scripts/release-macos.sh)、[Linux 发布脚本](scripts/release-linux.sh)，需配置更新签名密钥；签名与自动更新配置见 [docs/updater-release.md](docs/updater-release.md)。发布脚本默认会推送版本标签并创建 GitHub Release，不能当作普通本地编译命令使用。
 
 ## 配置云同步
 
