@@ -1,49 +1,51 @@
-# lumora — 桌面研究文献管理
+[简体中文](README.zh-CN.md)
 
-lumora 取意 Lumos + Aurora，是一款**本地优先（local-first）**的桌面文献管理应用，支持 PDF 导入、高亮批注、文献集合管理、私有云同步与 Mendeley 数据迁移。数据默认全部留在你自己的电脑上，云同步直连**你自己的私有对象存储**，没有中间服务器，也没有第三方云数据库。
+# lumora — Desktop Research Literature Manager
 
-## 项目网站
+Named after Lumos + Aurora, lumora is a **local-first** desktop literature manager with PDF import, highlights and annotations, collections, private cloud sync, and Mendeley migration. Your data stays on your computer by default. Cloud sync connects directly to **your own private object storage**, with no intermediary server or third-party cloud database.
 
-- 项目主页（GitHub Pages）：<https://luoleicn.github.io/lumora/>
-- 源码仓库：<https://github.com/luoleicn/lumora>
+## Project Links
 
-## 功能特性
+- Project website (GitHub Pages): <https://luoleicn.github.io/lumora/>
+- Source code: <https://github.com/luoleicn/lumora>
 
-- **现代文献库界面**：左侧集合侧边栏、中间文献列表、右侧 PDF 阅读工作区，多标签页并行阅读。
-- **PDF 导入与本地存储**：元数据存入原生 SQLite，PDF 文件按可配置的命名模板落盘到你指定的目录（File Storage Settings），目录即事实来源。
-- **PDF 批注**：选中文本即可创建高亮/笔记，采用归一化坐标矩形，**不修改原始 PDF**。
-- **集合与整理**：多级集合、收藏、未分类、无 PDF、无 arXiv、回收站等智能视图，支持文件夹范围内检索。
-- **文献内检索（Find in Document）** 与 **库内检索**：`Cmd/Ctrl+F` 在 Documents 页聚焦库检索、在论文标签页聚焦文献内查找。
-- **私有云同步**：原生 Tauri 同步引擎，直连每个用户自己的**七牛 Kodo（Qiniu）私有存储桶**；增量同步、内容寻址存储；arXiv PDF 按锁定版本号重建，无需重复上传。
-- **arXiv 支持**：按标题检索 arXiv、下载 PDF 并归档。
-- **Mendeley 导入**：OAuth 授权连接，增量同步文献元数据、文件夹与附件。
-- **macOS 原生集成**：原生菜单与快捷键、触控板双指缩放 PDF（`allowsMagnification`）等。
+## Features
 
-## 技术栈
+- **Modern library interface**: A collection sidebar, document list, and PDF reading workspace, with multiple reading tabs.
+- **PDF import and local storage**: Metadata lives in native SQLite. PDFs are saved to your chosen directory using configurable filename templates (File Storage Settings), with that directory as the source of truth.
+- **PDF annotations**: Select text to create highlights and notes using normalized rectangle coordinates, **without modifying the original PDF**.
+- **Collections and organization**: Nested collections, favorites, and smart views for unfiled papers, missing PDFs, missing arXiv links, and trash, with search scoped to folders.
+- **Find in Document and library search**: `Cmd/Ctrl+F` focuses library search on the Documents page and document search in a paper tab.
+- **Private cloud sync**: A native Tauri sync engine connects directly to each user's own **private Qiniu Kodo bucket**, with incremental sync and content-addressed storage. arXiv PDFs are reconstructed from pinned versions without uploading duplicate files.
+- **arXiv support**: Search arXiv by title, download PDFs, and add them to your library.
+- **Mendeley import**: Connect through OAuth to incrementally sync document metadata, folders, and attachments.
+- **Native macOS integration**: Native menus and keyboard shortcuts, plus two-finger trackpad zoom for PDFs (`allowsMagnification`).
 
-- **桌面外壳**：Tauri v2（Rust）
-- **前端**：React 19 + TypeScript + Vite 7，PDF 渲染用 `pdfjs-dist` / `react-pdf`
-- **本地存储**：原生 SQLite（`rusqlite`，bundled）+ 文件系统落盘
-- **云同步**：七牛 Kodo（`qiniu-sdk`），密钥通过系统钥匙串（`keyring`）保存
-- **共享领域逻辑**：`@lumora/shared`（实体、几何、同步协议）
+## Technology Stack
 
-代码组织为 npm workspaces monorepo：
+- **Desktop shell**: Tauri v2 (Rust)
+- **Frontend**: React 19 + TypeScript + Vite 7, with `pdfjs-dist` / `react-pdf` for PDF rendering
+- **Local storage**: Native SQLite (`rusqlite`, bundled) and files on disk
+- **Cloud sync**: Qiniu Kodo (`qiniu-sdk`), with credentials stored in the system keychain (`keyring`)
+- **Shared domain logic**: `@lumora/shared` (entities, geometry, and sync protocol)
+
+The codebase is an npm workspaces monorepo:
 
 ```
-apps/desktop        # Tauri + React 桌面应用
-  └─ src-tauri      # Rust 原生层（存储 / 同步 / 菜单 / 快捷键）
-packages/shared     # 跨端共享的类型与领域逻辑
-docs                # 项目主页与同步协议文档
+apps/desktop        # Tauri + React desktop application
+  └─ src-tauri      # Native Rust layer (storage / sync / menus / shortcuts)
+packages/shared     # Shared types and domain logic across platforms
+docs                # Project website and sync protocol documentation
 ```
 
-## 环境要求
+## Prerequisites
 
 - **Node.js ≥ 22**
 - **npm ≥ 11**
-- **Git**（获取源码）
-- **Rust 稳定版工具链**（用于 `tauri dev` 与原生打包）——通过 [rustup](https://rustup.rs) 安装
-- **macOS**：安装 Xcode Command Line Tools（`xcode-select --install`），提供 C 工具链与 WebKit；`rusqlite` 使用 bundled 模式，**无需**单独安装 SQLite
-- **Ubuntu / Debian**：安装 WebKitGTK 与 GTK 开发库、Secret Service（密钥存储）以及打包工具。`rusqlite` 使用 bundled 模式，**无需**单独安装 SQLite：
+- **Git** (to clone the repository)
+- **Stable Rust toolchain** (for `tauri dev` and native packaging) — install with [rustup](https://rustup.rs)
+- **macOS**: Install Xcode Command Line Tools (`xcode-select --install`) for the C toolchain and WebKit. `rusqlite` uses bundled SQLite, so **no separate SQLite installation is required**.
+- **Ubuntu / Debian**: Install WebKitGTK and GTK development libraries, Secret Service support for credential storage, and packaging tools. `rusqlite` uses bundled SQLite, so **no separate SQLite installation is required**:
 
   ```bash
   sudo apt update
@@ -53,23 +55,23 @@ docs                # 项目主页与同步协议文档
     libxdo-dev libayatana-appindicator3-dev poppler-utils
   ```
 
-  > `libsecret`（配合 GNOME Keyring / KWallet 等 Secret Service 后端）用于安全保存云同步密钥；桌面会话未运行 Secret Service 时，密钥读写会失败。
+  > `libsecret`, together with a Secret Service backend such as GNOME Keyring or KWallet, securely stores cloud sync credentials. Credential reads and writes fail if the desktop session has no running Secret Service.
 
-  `poppler-utils` 提供原生 PDF 阅读使用的 `pdfinfo`、`pdftotext` 等命令；本地开发和直接运行二进制时也需要安装。
-- **Windows**：建议使用 Windows 10/11 x64，安装 [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)，勾选 **Desktop development with C++（使用 C++ 的桌面开发）**，包含 MSVC 编译器和 Windows SDK；同时安装 [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)。Rust 使用 MSVC 工具链：
+  `poppler-utils` provides commands such as `pdfinfo` and `pdftotext` for native PDF reading. It is also required for local development and when running the binary directly.
+- **Windows**: Windows 10/11 x64 is recommended. Install [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with **Desktop development with C++**, including the MSVC compiler and Windows SDK, and install [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/). Use the MSVC Rust toolchain:
 
   ```powershell
   rustup default stable-msvc
   ```
 
-  安装完成后重新打开终端。生成 MSI 还需要启用 Windows 的 VBSCRIPT 可选功能；遇到 `failed to run light.exe` 时，按 [Tauri Windows 环境说明](https://v2.tauri.app/start/prerequisites/#windows) 检查该功能。
-- 无需 Docker，无需自建后端
+  Reopen your terminal after installation. Building an MSI also requires the Windows VBSCRIPT optional feature. If you encounter `failed to run light.exe`, check that feature using the [Tauri Windows prerequisites](https://v2.tauri.app/start/prerequisites/#windows).
+- No Docker or self-hosted backend is required.
 
-> 当前阶段的主力产品是 **macOS 与 Linux 桌面端**，两端的功能、架构与发布质量需要共同维护；iPhone 作为后续平台推进。
+> **macOS and Linux desktop** are the primary product platforms at this stage. Features, architecture, and release quality are maintained together on both platforms. iPhone support is planned for a later stage.
 
-## 安装依赖
+## Install Dependencies
 
-获取源码并在仓库根目录安装所有 workspace 的依赖（macOS、Linux 终端和 Windows PowerShell 均可执行）：
+Clone the repository and install dependencies for all workspaces from the repository root. These commands work in macOS and Linux terminals and Windows PowerShell:
 
 ```bash
 git clone https://github.com/luoleicn/lumora.git
@@ -77,54 +79,54 @@ cd lumora
 npm ci
 ```
 
-已有源码时直接进入仓库根目录执行 `npm ci`。日常新增或调整依赖时使用 `npm install`。
+If you already have the source code, run `npm ci` from the repository root. Use `npm install` when adding or updating dependencies during development.
 
-Rust 侧依赖会在首次 `tauri dev` / `tauri build` 时由 Cargo 自动拉取，无需手动安装。
+Cargo downloads Rust dependencies automatically on the first `tauri dev` or `tauri build`; no manual installation is needed.
 
-## 开发运行
+## Development
 
-仅前端（浏览器里跑 Vite，快速调 UI）：
+Run only the frontend in a browser with Vite for quick UI work:
 
 ```bash
 npm run dev:desktop
-# 打开终端里显示的 Vite 地址
+# Open the Vite URL shown in the terminal.
 ```
 
-原生桌面外壳（需要 Rust 环境，功能完整）：
+Run the native desktop application with full functionality (requires Rust):
 
 ```bash
 npm run tauri:dev --workspace @lumora/desktop
 ```
 
-## 编译桌面可执行程序
+## Build Desktop Executables
 
-先完成上面的环境准备和依赖安装。以下构建命令均在**仓库根目录**执行，默认使用 release 模式，并自动构建共享包、前端和 Rust 原生程序；无需另开 Vite 服务或事先执行 `npm run build`。首次构建需要联网下载 Cargo 依赖及平台打包工具，耗时较长。
+Complete the prerequisites and dependency installation first. Run all commands below from the **repository root**. They use release mode by default and build the shared package, frontend, and native Rust application automatically. There is no need to start a separate Vite server or run `npm run build` first. The first build needs network access to download Cargo dependencies and platform packaging tools, and may take longer.
 
-| 目标平台 | 构建所在系统 | 构建命令 | 主要产物 |
+| Target platform | Build host | Build command | Main output |
 | --- | --- | --- | --- |
 | macOS | macOS | `npm run tauri:build --workspace @lumora/desktop` | `lumora.app` |
-| Linux | Linux（Ubuntu / Debian） | `npm run tauri:build:linux --workspace @lumora/desktop` | `.deb`、`.AppImage`、`lumora` 二进制 |
-| Windows | Windows（PowerShell） | `npm run tauri:build:windows --workspace @lumora/desktop` | `.msi`、`-setup.exe`、`lumora.exe` |
+| Linux | Linux (Ubuntu / Debian) | `npm run tauri:build:linux --workspace @lumora/desktop` | `.deb`, `.AppImage`, `lumora` binary |
+| Windows | Windows (PowerShell) | `npm run tauri:build:windows --workspace @lumora/desktop` | `.msi`, `-setup.exe`, `lumora.exe` |
 
-这些步骤使用各平台的原生构建环境；仅在 macOS 上添加一个 Rust target 不足以生成 Linux / Windows 分发包。仓库的 [Release 工作流](.github/workflows/release.yml) 也分别使用三个系统的 runner。
+These steps use each platform's native build environment. Adding a Rust target on macOS alone is not enough to produce Linux or Windows distribution packages. The repository's [Release workflow](.github/workflows/release.yml) also uses separate runners for all three operating systems.
 
-### macOS（Apple Silicon / Intel）
+### macOS (Apple Silicon / Intel)
 
-构建当前 Mac 架构的应用：
+Build the application for your current Mac architecture:
 
 ```bash
 npm run tauri:build --workspace @lumora/desktop
 ```
 
-产物与启动命令：
+Launch the resulting application:
 
 ```bash
 open apps/desktop/src-tauri/target/release/bundle/macos/lumora.app
 ```
 
-可以将整个 `lumora.app` 拷贝到 `/Applications`。包内可执行文件位于 `lumora.app/Contents/MacOS/lumora`，分发时保留完整 `.app` 目录。默认构建在 Apple Silicon 上生成 arm64，在 Intel 上生成 x86_64。
+You can copy the entire `lumora.app` to `/Applications`. The executable is at `lumora.app/Contents/MacOS/lumora`; keep the complete `.app` directory when distributing it. The default build produces arm64 on Apple Silicon and x86_64 on Intel.
 
-在同一台 Mac 上构建同时支持两种架构的 Universal 应用：
+To build a Universal application supporting both architectures on one Mac:
 
 ```bash
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
@@ -132,25 +134,25 @@ npm run tauri:build --workspace @lumora/desktop -- --target universal-apple-darw
 open apps/desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/lumora.app
 ```
 
-如需本地 DMG 安装镜像，可直接指定打包格式：
+To create a local DMG installer image, specify the bundle formats directly:
 
 ```bash
 npm exec --workspace @lumora/desktop -- tauri build --bundles app,dmg
 ```
 
-DMG 位于 `apps/desktop/src-tauri/target/release/bundle/dmg/`。普通本地构建无需更新签名密钥；面向其他用户分发时的 Apple 签名与公证要求见 [Tauri macOS 签名说明](https://v2.tauri.app/distribute/sign/macos/)。
+The DMG is saved to `apps/desktop/src-tauri/target/release/bundle/dmg/`. Ordinary local builds do not need an updater signing key. For Apple signing and notarization requirements when distributing to other users, see [Tauri macOS signing](https://v2.tauri.app/distribute/sign/macos/).
 
-### Linux（Ubuntu / Debian）
+### Linux (Ubuntu / Debian)
 
-完成 Linux 系统依赖安装后，在 Linux 上构建应用并生成 `.deb` 与 `.AppImage` 分发包：
+After installing the Linux system dependencies, build on Linux to produce `.deb` and `.AppImage` distribution packages:
 
 ```bash
 npm run tauri:build:linux --workspace @lumora/desktop
 ```
 
-> `tauri:build`（macOS 用）固定 `--bundles app`，而 `app` 不是 Linux 的有效包类型，故 Linux 单独用 `tauri:build:linux` 脚本（`--bundles deb,appimage`）。
+> `tauri:build` (used on macOS) specifies `--bundles app`, and `app` is not a valid Linux bundle type. Linux therefore uses the separate `tauri:build:linux` script (`--bundles deb,appimage`).
 
-默认面向当前机器架构。下面以 x86_64 / amd64 为例，实际文件名中的版本号、架构以构建输出为准：
+The build targets the current machine's architecture by default. The following paths use x86_64 / amd64 as an example; the actual version and architecture in filenames depend on the build output:
 
 ```text
 apps/desktop/src-tauri/target/release/lumora
@@ -158,30 +160,30 @@ apps/desktop/src-tauri/target/release/bundle/deb/lumora_<version>_amd64.deb
 apps/desktop/src-tauri/target/release/bundle/appimage/lumora_<version>_amd64.AppImage
 ```
 
-安装与运行：
+Install and run:
 
 ```bash
 sudo apt install ./apps/desktop/src-tauri/target/release/bundle/deb/lumora_*_amd64.deb
 lumora
 
-# 或直接运行 AppImage（需要可执行权限）
+# Or run the AppImage directly (requires executable permission).
 chmod +x apps/desktop/src-tauri/target/release/bundle/appimage/lumora_*_amd64.AppImage
 ./apps/desktop/src-tauri/target/release/bundle/appimage/lumora_*_amd64.AppImage
 ```
 
-也可以在已安装上述运行依赖的桌面会话中直接执行 `./apps/desktop/src-tauri/target/release/lumora`。分发到其他机器时优先使用安装包或 AppImage。
+You can also run `./apps/desktop/src-tauri/target/release/lumora` directly in a desktop session with the runtime dependencies above installed. Prefer an installer package or AppImage for distribution to other machines.
 
-Linux 包的兼容性受构建机 glibc 等系统库版本影响；需要兼容较老系统时，应在目标范围内最老、且提供 WebKitGTK 4.1 的系统上构建。当前 Release 工作流使用 Ubuntu 22.04，详见 [Tauri AppImage 兼容性说明](https://v2.tauri.app/distribute/appimage/#limitations)。
+Linux package compatibility depends on system libraries such as glibc on the build host. To support older systems, build on the oldest system in your target range that provides WebKitGTK 4.1. The current Release workflow uses Ubuntu 22.04; see [Tauri AppImage limitations](https://v2.tauri.app/distribute/appimage/#limitations).
 
-### Windows（x64）
+### Windows (x64)
 
-在准备好 MSVC、Windows SDK、WebView2 和 Rust 的 Windows PowerShell 中执行：
+Run in Windows PowerShell after setting up MSVC, the Windows SDK, WebView2, and Rust:
 
 ```powershell
 npm run tauri:build:windows --workspace @lumora/desktop
 ```
 
-默认构建当前 Rust 工具链的目标架构。x64 构建的产物位于：
+By default, the build uses the target architecture of the current Rust toolchain. For x64 builds, outputs are located at:
 
 ```text
 apps/desktop/src-tauri/target/release/lumora.exe
@@ -189,46 +191,46 @@ apps/desktop/src-tauri/target/release/bundle/msi/*.msi
 apps/desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
 ```
 
-双击 MSI 或 `-setup.exe` 安装；本机也可直接启动编译出的程序：
+Double-click the MSI or `-setup.exe` to install. You can also launch the compiled executable directly on the build machine:
 
 ```powershell
 .\apps\desktop\src-tauri\target\release\lumora.exe
 ```
 
-直接运行仍需系统安装 WebView2。生成 MSI/NSIS 时，Tauri 会下载相应打包工具；MSI 构建须在 Windows 上进行。更多安装包选项见 [Tauri Windows Installer](https://v2.tauri.app/distribute/windows-installer/)。
+Running directly still requires WebView2 on the system. Tauri downloads the relevant packaging tools when creating MSI/NSIS installers. MSI builds must run on Windows. See [Tauri Windows Installer](https://v2.tauri.app/distribute/windows-installer/) for more packaging options.
 
-### 只编译二进制，不生成安装包
+### Build Only the Binary
 
-在对应平台上执行以下命令，可以跳过 `.app` / `.deb` / `.AppImage` / MSI / NSIS 打包，但仍会构建前端并嵌入桌面程序：
+Run the following command on the corresponding platform to skip `.app`, `.deb`, `.AppImage`, MSI, and NSIS packaging. It still builds the frontend and embeds it in the desktop executable:
 
 ```bash
 npm exec --workspace @lumora/desktop -- tauri build --no-bundle
 ```
 
-产物为 `apps/desktop/src-tauri/target/release/lumora`（macOS / Linux）或 `lumora.exe`（Windows）。运行依赖与上面对应平台相同；macOS 日常使用和分发推荐完整 `.app`。
+The output is `apps/desktop/src-tauri/target/release/lumora` on macOS / Linux, or `lumora.exe` on Windows. The same platform runtime dependencies apply. A complete `.app` is recommended for everyday use and distribution on macOS.
 
-以上路径按默认 Cargo 输出目录列出。显式传入 `--target <triple>` 时，产物改到 `apps/desktop/src-tauri/target/<triple>/release/` 下；设置了 `CARGO_TARGET_DIR` 时，以该目录及构建日志为准。
+These paths assume the default Cargo output directory. Passing `--target <triple>` moves outputs under `apps/desktop/src-tauri/target/<triple>/release/`. If `CARGO_TARGET_DIR` is set, use that directory and the build logs as the reference.
 
-### 正式发布与自动更新
+### Releases and Automatic Updates
 
-普通本地构建不需要 GitHub Token 或 `TAURI_SIGNING_PRIVATE_KEY`。正式发布使用 [Release 工作流](.github/workflows/release.yml) 或 [macOS 发布脚本](scripts/release-macos.sh)、[Linux 发布脚本](scripts/release-linux.sh)，需配置更新签名密钥；签名与自动更新配置见 [docs/updater-release.md](docs/updater-release.md)。发布脚本默认会推送版本标签并创建 GitHub Release，不能当作普通本地编译命令使用。
+Ordinary local builds do not require a GitHub token or `TAURI_SIGNING_PRIVATE_KEY`. Official releases use the [Release workflow](.github/workflows/release.yml), [macOS release script](scripts/release-macos.sh), or [Linux release script](scripts/release-linux.sh), and require an updater signing key. See [docs/updater-release.md](docs/updater-release.md) for signing and automatic update configuration. Release scripts push version tags and create GitHub Releases by default, so they should not be used as ordinary local build commands.
 
-## 配置云同步
+## Configure Cloud Sync
 
-1. 在七牛云创建一个**私有** Kodo 存储桶专门给文献库使用。
-2. 在应用的 Sync 面板填入该桶的 Access Key、Secret Key、桶名、区域（region）、以及私有下载域名。
-3. Secret Key 只保存在**操作系统钥匙串**里，不会写入浏览器存储或 SQLite。
-4. 每个桶托管一个库，数据位于 `lumora/v1/` 前缀下。
+1. Create a **private** Qiniu Kodo bucket dedicated to your library.
+2. In the application's Sync panel, enter the bucket's Access Key, Secret Key, name, region, and private download domain.
+3. The Secret Key is stored only in the **operating system keychain**, never in browser storage or SQLite.
+4. Each bucket hosts one library, with data under the `lumora/v1/` prefix.
 
-协议、恢复与安全细节见 [docs/qiniu-sync.md](docs/qiniu-sync.md)。
+See [docs/qiniu-sync.md](docs/qiniu-sync.md) for protocol, recovery, and security details.
 
-## Mendeley 导入
+## Mendeley Import
 
-通过 Mendeley Sync 菜单进行 OAuth 授权后，增量同步元数据、文件夹与附件。覆盖范围与分页/媒体类型细节见 [docs/mendeley-sync.md](docs/mendeley-sync.md)。
+Authorize through OAuth in the Mendeley Sync menu to incrementally sync metadata, folders, and attachments. See [docs/mendeley-sync.md](docs/mendeley-sync.md) for coverage and pagination / media type details.
 
-## 开发校验
+## Development Checks
 
-提交前建议跑通以下检查：
+Run these checks before submitting changes:
 
 ```bash
 npm run typecheck
@@ -236,15 +238,14 @@ npm test
 npm run build
 ```
 
-Rust 侧可另行执行：
+For Rust, you can also run:
 
 ```bash
 cd apps/desktop/src-tauri && cargo check
 ```
 
-## 开发约定
+## Development Guidelines
 
-- 随功能演进保持架构自洽：优先做**边界清晰、可复用的领域模块**，而不是一次性的 UI 补丁。
-- 对行为变更保持有意义的测试覆盖，尤其是共享逻辑、数据完整性、同步、批注与跨端集成路径。
-- 本项目目标是跨平台产品，当前主力平台为 macOS + Linux，后续扩展至 iPhone；iPhone 目前仅体现为 Tauri 兼容的前端架构，尚无移动端构建。
-
+- Keep the architecture coherent as features evolve. Prefer **reusable domain modules with clear boundaries** over one-off UI patches.
+- Maintain meaningful test coverage for behavior changes, especially shared logic, data integrity, sync, annotations, and cross-platform integration.
+- lumora is a cross-platform product, with macOS and Linux as the primary platforms and iPhone planned for later. iPhone support currently consists of a Tauri-compatible frontend architecture; no mobile build is available yet.
