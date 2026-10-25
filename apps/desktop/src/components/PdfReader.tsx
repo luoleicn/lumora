@@ -2049,13 +2049,16 @@ function AnnotationContextMenu({
               <Languages size={16} />
             </button>
           )}
-          <button type="button" onClick={onStartNote}>
+          <button type="button" onClick={onStartNote}
+            aria-label={menu.annotation.kind === "note" ? "Edit note" : "Add note"}
+            title={menu.annotation.kind === "note" ? "Edit note" : "Add note"}>
             <MessageSquare size={16} />
-            {menu.annotation.kind === "note" ? "Edit Note" : menu.selectionBased ? "Note" : "Add Note"}
+            {!menu.selectionBased && (menu.annotation.kind === "note" ? "Edit Note" : "Add Note")}
           </button>
-          <button type="button" className="danger" onClick={() => onDeleteAnnotation(menu.annotation)}>
-            <Trash2 size={16} />
-            {menu.selectionBased ? "Delete Highlight" : "Delete Annotation"}
+          <button type="button" className="danger" onClick={() => onDeleteAnnotation(menu.annotation)}
+            aria-label={menu.selectionBased ? "Delete highlight" : "Delete annotation"}
+            title={menu.selectionBased ? "Delete highlight" : "Delete annotation"}>
+            {menu.selectionBased ? <X size={16} /> : <><Trash2 size={16} />Delete Annotation</>}
           </button>
         </div>
       ) : (
