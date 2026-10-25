@@ -5,6 +5,7 @@
 - Keep the architecture coherent as features are added. Prefer scoped modules, clear ownership boundaries, and reusable domain logic over one-off UI fixes.
 - macOS and Linux are the primary product platforms and must be maintained together across features, architecture, verification, and releases. iPhone is a later platform.
 - Maintain meaningful test coverage for behavior changes, especially shared logic, data integrity, sync, annotation, and cross-platform integration paths.
+- Keep `README.md` (English) and `README.zh-CN.md` (Simplified Chinese) consistent. Whenever either README is changed, update the other in the same change so features, prerequisites, commands, links, and platform support stay in sync.
 
 ## Verification
 
