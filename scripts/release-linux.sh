@@ -12,7 +12,8 @@
 #   - Node.js 22+, npm 11+
 #   - System libs for Tauri/WebKitGTK + packaging (see README "Ubuntu / Debian"):
 #       libwebkit2gtk-4.1-dev libgtk-3-dev libsecret-1-dev librsvg2-dev
-#       build-essential libssl-dev patchelf file
+#       build-essential pkg-config libdbus-1-dev libssl-dev patchelf file curl wget
+#       libxdo-dev libayatana-appindicator3-dev poppler-utils
 #   - GITHUB_TOKEN env var (GitHub personal access token with repo scope)
 #
 # What it does:

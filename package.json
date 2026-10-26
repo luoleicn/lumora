@@ -14,7 +14,7 @@
     "build": "npm run build --workspace @lumora/shared && npm run build --workspace @lumora/desktop",
     "typecheck": "npm run build --workspace @lumora/shared && npm run typecheck --workspace @lumora/desktop",
     "test": "npm run test --workspace @lumora/shared && npm run test --workspace @lumora/desktop --if-present && npm run test:release-tools",
-    "test:release-tools": "node --test scripts/release-version.test.mjs scripts/generate-updater-manifest.test.mjs",
+    "test:release-tools": "node --test scripts/release-version.test.mjs scripts/generate-updater-manifest.test.mjs scripts/check-linux-build-deps.test.mjs",
     "test:coverage": "npm run test:coverage --workspace @lumora/desktop"
   },
   "engines": {

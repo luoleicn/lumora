@@ -51,7 +51,7 @@ docs                # 项目主页与同步协议文档
   sudo apt update
   sudo apt install -y \
     libwebkit2gtk-4.1-dev libgtk-3-dev libsecret-1-dev librsvg2-dev \
-    build-essential libssl-dev patchelf file curl wget \
+    build-essential pkg-config libdbus-1-dev libssl-dev patchelf file curl wget \
     libxdo-dev libayatana-appindicator3-dev poppler-utils
   ```
 
@@ -151,6 +151,10 @@ npm run tauri:build:linux --workspace @lumora/desktop
 ```
 
 > `tauri:build`（macOS 用）固定 `--bundles app`，而 `app` 不是 Linux 的有效包类型，故 Linux 单独用 `tauri:build:linux` 脚本（`--bundles deb,appimage`）。
+
+Linux 构建会在编译前检查系统开发库和打包工具。若提示缺少依赖，执行**环境要求**中 Ubuntu / Debian 的安装命令后重试。`unable to find library -lgtk-3` 或 `-lwebkit2gtk-4.1` 等链接错误也说明缺少开发包；仅有运行时库和已有的 Cargo 编译缓存不足以完成构建。
+
+若 AppImage 打包提示 `failed to run linuxdeploy`，追加 `-- --verbose` 重试以查看底层错误。打包工具可能需要从 GitHub 下载 AppImage 运行时；若下载失败，可从[官方运行时发布页](https://github.com/AppImage/type2-runtime/releases)下载匹配架构的文件，并在构建时设置 `LDAI_RUNTIME_FILE=/运行时文件的绝对路径`，这是打包工具[支持的配置项](https://github.com/linuxdeploy/linuxdeploy-plugin-appimage#optional-variables)。
 
 默认面向当前机器架构。下面以 x86_64 / amd64 为例，实际文件名中的版本号、架构以构建输出为准：
 

@@ -51,7 +51,7 @@ docs                # Project website and sync protocol documentation
   sudo apt update
   sudo apt install -y \
     libwebkit2gtk-4.1-dev libgtk-3-dev libsecret-1-dev librsvg2-dev \
-    build-essential libssl-dev patchelf file curl wget \
+    build-essential pkg-config libdbus-1-dev libssl-dev patchelf file curl wget \
     libxdo-dev libayatana-appindicator3-dev poppler-utils
   ```
 
@@ -151,6 +151,10 @@ npm run tauri:build:linux --workspace @lumora/desktop
 ```
 
 > `tauri:build` (used on macOS) specifies `--bundles app`, and `app` is not a valid Linux bundle type. Linux therefore uses the separate `tauri:build:linux` script (`--bundles deb,appimage`).
+
+The Linux build checks system development libraries and packaging tools before compiling. If it reports missing dependencies, run the Ubuntu / Debian installation command under **Prerequisites** and retry. Linker errors such as `unable to find library -lgtk-3` or `-lwebkit2gtk-4.1` also indicate missing development packages; runtime libraries and cached Cargo artifacts are not enough.
+
+If AppImage packaging reports `failed to run linuxdeploy`, rerun with `-- --verbose` to see the underlying error. The packaging tool may need to download an AppImage runtime from GitHub. If that download fails, download the matching architecture from the [official runtime releases](https://github.com/AppImage/type2-runtime/releases) and set `LDAI_RUNTIME_FILE=/absolute/path/to/runtime` when running the build; this is a [supported packaging option](https://github.com/linuxdeploy/linuxdeploy-plugin-appimage#optional-variables).
 
 The build targets the current machine's architecture by default. The following paths use x86_64 / amd64 as an example; the actual version and architecture in filenames depend on the build output:
 
