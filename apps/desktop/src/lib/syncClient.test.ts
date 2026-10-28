@@ -143,6 +143,23 @@ describe("syncLibrary arXiv boundary", () => {
     expect(invokeMock.mock.calls.some(([command]) => command === "qiniu_sync_library")).toBe(true);
   });
 
+  it("reloads only the latest hydrated annotation scope after native sync", async () => {
+    const initial: LibraryState = { papers: [], collections: [], fileAssets: [], paperCollections: [], annotations: [] };
+    loadLibraryFromDbMock.mockResolvedValue({ state: initial, empty: false });
+    const paperIds: string[] = [];
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "qiniu_sync_library") {
+        paperIds.push("opened-during-sync");
+        return summary();
+      }
+    });
+    await syncLibrary(
+      { accessKey: "ak", bucket: "bucket", region: "", privateDomain: "domain", prefix: "lumora/v1", configured: true },
+      initial, undefined, { getAnnotationPaperIds: () => [...paperIds] }
+    );
+    expect(loadLibraryFromDbMock).toHaveBeenCalledWith({ annotationPaperIds: ["opened-during-sync"] });
+  });
+
   it("syncs only metadata and deletes the old blob when a paper has an arXiv ID", async () => {
     const initial: LibraryState = {
       papers: [{ id: "paper-a", title: "Paper", authors: [], arxiv: "2401.12345v2", createdAt: now, updatedAt: now }],

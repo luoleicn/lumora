@@ -6,6 +6,7 @@ import { searchArxivMetadata, type SyncSettings } from "../lib/syncClient";
 import { arxivMetadataToPaperPatch, formatFileSize, type ArxivDownloadProgress } from "../lib/arxivFiles";
 import type { FileStorageSettings } from "../lib/fileStorage";
 import { PaperNotesTab } from "./PaperNotesTab";
+import { AnnotationLoading } from "./AnnotationLoading";
 
 type SyncPanelProps = {
   settings: SyncSettings;
@@ -16,6 +17,9 @@ type SyncPanelProps = {
   onRequestFileData: () => Promise<Uint8Array | undefined>;
   hasLocalPdf: boolean;
   annotations: Annotation[];
+  annotationsLoaded?: boolean;
+  annotationError?: string;
+  onRetryAnnotations?: () => void;
   fileStorageSettings: FileStorageSettings;
   onUpdatePaper: (paper: Paper) => void;
   arxivDownloadBusy: boolean;
@@ -32,6 +36,9 @@ export function SyncPanel({
   onRequestFileData,
   hasLocalPdf,
   annotations,
+  annotationsLoaded = true,
+  annotationError,
+  onRetryAnnotations,
   fileStorageSettings,
   onUpdatePaper,
   arxivDownloadBusy,
@@ -76,12 +83,14 @@ export function SyncPanel({
             )
       )}
       {activeTab === "notes" && (
-        <PaperNotesTab
-          paper={inspectedPaper}
-          annotations={visibleAnnotations}
-          onUpdatePaper={onUpdatePaper}
-          onDeleteAnnotation={onDeleteAnnotation}
-        />
+        inspectedPaper && !annotationsLoaded
+          ? <AnnotationLoading error={annotationError} onRetry={() => onRetryAnnotations?.()} />
+          : <PaperNotesTab
+              paper={inspectedPaper}
+              annotations={visibleAnnotations}
+              onUpdatePaper={onUpdatePaper}
+              onDeleteAnnotation={onDeleteAnnotation}
+            />
       )}
       {activeTab === "deepseek" && <DeepSeekTab paper={inspectedPaper} />}
     </aside>

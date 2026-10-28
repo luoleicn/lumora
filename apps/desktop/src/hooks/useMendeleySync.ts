@@ -84,13 +84,15 @@ export function useMendeleySync({ store, fileStorageSettings, onStatus }: UseMen
       return;
     }
     const syncStartedAt = new Date().toISOString();
-    const baseState = store.libraryRef.current ?? store.library;
-    let mergeBaseState = baseState;
     cancelRequestedRef.current = false;
     setSyncBusy(true);
     setActivity({ state: "running", message: "Starting Mendeley sync…", completed: 0, total: 8 });
     onStatusRef.current("Syncing with Mendeley...");
     try {
+      // Mendeley reconciles remote annotation IDs across the whole library.
+      // Request this full view only when the user starts that operation.
+      const baseState = await store.ensureAnnotationsLoaded();
+      let mergeBaseState = baseState;
       const { state: nextState, summary } = await syncWithMendeley(
         baseState,
         settings,

@@ -13,7 +13,7 @@ Named after Lumos + Aurora, lumora is a **local-first** desktop literature manag
 
 - **Modern library interface**: A collection sidebar, document list, and PDF reading workspace, with multiple reading tabs.
 - **PDF import and local storage**: Metadata lives in native SQLite. PDFs are saved to your chosen directory using configurable filename templates (File Storage Settings), with that directory as the source of truth.
-- **PDF annotations**: Select text to create highlights and notes using normalized rectangle coordinates, **without modifying the original PDF**.
+- **PDF annotations**: Select text to create highlights and notes using normalized rectangle coordinates, **without modifying the original PDF**. Annotations load on demand per paper; Notebook and Mendeley sync request the full annotation view when needed.
 - **Collections and organization**: Nested collections, favorites, and smart views for unfiled papers, missing PDFs, missing arXiv links, and trash, with search scoped to folders.
 - **Find in Document and library search**: `Cmd/Ctrl+F` focuses library search on the Documents page and document search in a paper tab.
 - **Private cloud sync**: A native Tauri sync engine connects directly to each user's own **private Qiniu Kodo bucket**, with incremental sync and content-addressed storage. arXiv PDFs are reconstructed from pinned versions without uploading duplicate files.

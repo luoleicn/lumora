@@ -35,7 +35,7 @@ describe("automatic arXiv import downloads", () => {
 
   function Harness() {
     const [library, setLibrary] = useState(emptyState);
-    const libraryRef = useRef<LibraryState | undefined>(undefined);
+    const libraryRef = useRef<LibraryState>(library);
     useEffect(() => { libraryRef.current = library; }, [library]);
     store = { library, setLibrary, libraryRef };
     downloads = useArxivDownloads({

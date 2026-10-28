@@ -200,7 +200,8 @@ export async function disconnectSync(): Promise<void> {
 export async function syncLibrary(
   _settings: SyncSettings,
   _state: LibraryState,
-  onStage?: (message: string, completed?: number, total?: number) => void
+  onStage?: (message: string, completed?: number, total?: number) => void,
+  options?: { getAnnotationPaperIds: () => string[] | undefined }
 ): Promise<{ state: LibraryState; summary: CloudSyncSummary }> {
   // Native cloud sync discovers outgoing metadata from SQLite. Make the state
   // currently shown by the UI authoritative first: this drains debounced edits
@@ -509,7 +510,7 @@ export async function syncLibrary(
   addNetworkStats(summary, preSyncNetworkStats);
   summary.uploadedFiles += uploadedFileOk;
   summary.errors.push(...uploadErrors);
-  let { state } = await loadLibraryFromDb();
+  let { state } = await loadLibraryFromDb({ annotationPaperIds: options?.getAnnotationPaperIds() });
 
   // macOS keeps a complete local mirror. Device-local path/status changes are
   // persisted as remote-source writes so they never enter the cloud outbox.

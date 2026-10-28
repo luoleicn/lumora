@@ -70,7 +70,7 @@ export function useCloudSync({ store, onStatus, onRequireConfiguration }: UseClo
   // Cloud sync runs in the background: it never sets a global busy flag, so the
   // user can keep working while a live progress indicator tracks each stage.
   async function sync() {
-    if (inFlightRef.current) return;
+    if (inFlightRef.current || !store.loaded) return;
     if (!settings.configured) {
       onRequireConfigurationRef.current();
       return;
@@ -85,7 +85,8 @@ export function useCloudSync({ store, onStatus, onRequireConfiguration }: UseClo
         settings,
         baseState,
         (message, completed = 0, total = 5) =>
-          setActivity({ state: "running", message, completed, total })
+          setActivity({ state: "running", message, completed, total }),
+        { getAnnotationPaperIds: store.getAnnotationPaperIds }
       );
       if (cancelRequestedRef.current) return;
       // syncLibrary reloads its result from SQLite, so every entity has a new
@@ -93,8 +94,9 @@ export function useCloudSync({ store, onStatus, onRequireConfiguration }: UseClo
       // as the persisted baseline before publishing it to React; otherwise the
       // reference-based persistence diff marks the entire library local again.
       // Merge on top any edits made while the background sync was in flight.
+      const mergeBase = store.withHydratedAnnotations(baseState, store.libraryRef.current, result.state);
       store.markPersisted(result.state);
-      store.setLibrary((current) => mergeBackgroundSyncState(baseState, result.state, current, syncStartedAt));
+      store.setLibrary((current) => mergeBackgroundSyncState(mergeBase, result.state, current, syncStartedAt));
       setActivity({
         state: "success",
         message: `${result.summary.uploadedChanges} changes uploaded, ${result.summary.downloadedChanges} downloaded · `
@@ -132,14 +134,14 @@ export function useCloudSync({ store, onStatus, onRequireConfiguration }: UseClo
   // one run after startup, then once per configured interval while the app
   // remains open. The user can disable it or change the interval in Sync Settings.
   useEffect(() => {
-    if (!settings.configured || !autoSyncSettings.enabled) return;
+    if (!store.loaded || !settings.configured || !autoSyncSettings.enabled) return;
     const initial = window.setTimeout(() => void syncRef.current(), 1_000);
     const timer = window.setInterval(() => void syncRef.current(), autoSyncSettings.intervalMinutes * 60 * 1_000);
     return () => {
       window.clearTimeout(initial);
       window.clearInterval(timer);
     };
-  }, [settings.configured, settings.bucket, settings.accessKey, autoSyncSettings.enabled, autoSyncSettings.intervalMinutes]);
+  }, [store.loaded, settings.configured, settings.bucket, settings.accessKey, autoSyncSettings.enabled, autoSyncSettings.intervalMinutes]);
 
   async function saveSettings(nextSettings: SyncSettings) {
     setSettingsBusy(true);

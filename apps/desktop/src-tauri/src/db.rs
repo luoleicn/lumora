@@ -98,6 +98,7 @@ pub(crate) struct LoadedEntity {
 pub(crate) struct LoadedLibrary {
     entities: Vec<LoadedEntity>,
     meta: std::collections::HashMap<String, String>,
+    empty: bool,
 }
 
 fn lock_library_pool() -> Result<std::sync::MutexGuard<'static, LibraryPool>, String> {
@@ -182,37 +183,103 @@ pub(crate) fn init_library_schema(connection: &rusqlite::Connection) -> Result<(
 }
 
 #[tauri::command]
-pub(crate) async fn db_load_library(app: AppHandle) -> Result<LoadedLibrary, String> {
+pub(crate) async fn db_load_library(
+    app: AppHandle,
+    annotation_paper_ids: Option<Vec<String>>,
+) -> Result<LoadedLibrary, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let connection = open_library_db(&app)?;
-
-        let mut statement = connection
-            .prepare("SELECT entity_type, data FROM entities")
-            .map_err(|error| error.to_string())?;
-        let entities = statement
-            .query_map([], |row| {
-                Ok(LoadedEntity {
-                    entity_type: row.get(0)?,
-                    data: row.get(1)?,
-                })
-            })
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-
-        let mut meta_statement = connection
-            .prepare("SELECT key, value FROM meta")
-            .map_err(|error| error.to_string())?;
-        let meta = meta_statement
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-            .map_err(|error| error.to_string())?
-            .collect::<Result<std::collections::HashMap<_, _>, _>>()
-            .map_err(|error| error.to_string())?;
-
-        Ok(LoadedLibrary { entities, meta })
+        let transaction = connection.unchecked_transaction().map_err(|error| error.to_string())?;
+        let loaded = load_library_rows(&transaction, annotation_paper_ids.as_deref())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(loaded)
     })
     .await
     .map_err(|error| format!("Library load task failed: {error}"))?
+}
+
+fn load_library_rows(
+    connection: &rusqlite::Connection,
+    annotation_paper_ids: Option<&[String]>,
+) -> Result<LoadedLibrary, String> {
+    // None retains the complete-snapshot API for explicit full-library work.
+    // An empty scope is the startup path: no annotation payload crosses IPC.
+    let sql = if annotation_paper_ids.is_some() {
+        "SELECT entity_type, data FROM entities WHERE entity_type <> 'annotation'"
+    } else {
+        "SELECT entity_type, data FROM entities"
+    };
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|error| error.to_string())?;
+    let mut entities = statement
+        .query_map([], |row| {
+            Ok(LoadedEntity {
+                entity_type: row.get(0)?,
+                data: row.get(1)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    if let Some(ids) = annotation_paper_ids {
+        entities.extend(load_annotation_rows(connection, Some(ids))?.into_iter().map(|data| LoadedEntity {
+            entity_type: "annotation".to_string(),
+            data,
+        }));
+    }
+
+    let mut meta_statement = connection
+        .prepare("SELECT key, value FROM meta")
+        .map_err(|error| error.to_string())?;
+    let meta = meta_statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<std::collections::HashMap<_, _>, _>>()
+        .map_err(|error| error.to_string())?;
+
+    let empty = connection.query_row("SELECT NOT EXISTS(SELECT 1 FROM entities)", [], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    Ok(LoadedLibrary { entities, meta, empty })
+}
+
+fn load_annotation_rows(
+    connection: &rusqlite::Connection,
+    paper_ids: Option<&[String]>,
+) -> Result<Vec<String>, String> {
+    if paper_ids.is_some_and(|ids| ids.is_empty()) {
+        return Ok(Vec::new());
+    }
+    let (sql, parameters) = if let Some(ids) = paper_ids {
+        ("SELECT data FROM entities WHERE entity_type = 'annotation'
+          AND json_extract(data, '$.paperId') IN (SELECT value FROM json_each(?1))",
+         vec![serde_json::to_string(ids).map_err(|error| error.to_string())?])
+    } else {
+        ("SELECT data FROM entities WHERE entity_type = 'annotation'", Vec::new())
+    };
+    let mut statement = connection.prepare(sql).map_err(|error| error.to_string())?;
+    let rows = statement.query_map(rusqlite::params_from_iter(parameters), |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
+}
+
+fn delete_paper_annotations(connection: &rusqlite::Connection, paper_id: &str) -> Result<(), String> {
+    connection.execute(
+        "DELETE FROM entities WHERE entity_type = 'annotation' AND json_extract(data, '$.paperId') = ?1",
+        [paper_id],
+    ).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn db_load_annotations(app: AppHandle, paper_id: Option<String>) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = open_library_db(&app)?;
+        let ids = paper_id.map(|id| vec![id]);
+        load_annotation_rows(&connection, ids.as_deref())
+    })
+    .await
+    .map_err(|error| format!("Annotation load task failed: {error}"))?
 }
 
 // Incremental-sync groundwork: local writes stamp a monotonically increasing
@@ -327,6 +394,12 @@ pub(crate) async fn db_delete_entities(app: AppHandle, entities: Vec<EntityDelet
                 return Err(format!("Unknown entity type: {}", entity.entity_type));
             }
 
+            // The UI may never have loaded this paper's annotations. Delete
+            // children by paperId rather than relying on a complete UI cache.
+            if entity.entity_type == "paper" {
+                delete_paper_annotations(&transaction, &entity.id)?;
+            }
+
             // The annotation row is gone after the DELETE, so capture its paperId
             // first to re-aggregate that paper's note text afterwards.
             let annotation_paper_id: Option<String> = if entity.entity_type == "annotation" {
@@ -409,7 +482,64 @@ pub(crate) fn set_meta_value(connection: &rusqlite::Connection, key: &str, value
 
 #[cfg(test)]
 mod tests {
-    use super::{configure_library_connection, init_library_schema};
+    use super::{configure_library_connection, init_library_schema, load_library_rows, load_annotation_rows, delete_paper_annotations};
+
+    fn annotation_fixture() -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        init_library_schema(&connection).unwrap();
+        connection.execute_batch(
+            "INSERT INTO entities(entity_type,id,data,updated_at,deleted_at) VALUES
+             ('paper','p1','{\"id\":\"p1\"}','now',NULL),
+             ('paper','p2','{\"id\":\"p2\"}','now',NULL),
+             ('annotation','a1','{\"id\":\"a1\",\"paperId\":\"p1\"}','now',NULL),
+             ('annotation','a2','{\"id\":\"a2\",\"paperId\":\"p1\",\"deletedAt\":\"now\"}','now','now'),
+             ('annotation','a3','{\"id\":\"a3\",\"paperId\":\"p2\"}','now',NULL);"
+        ).unwrap();
+        connection
+    }
+
+    #[test]
+    fn startup_omits_annotations_and_explicit_snapshots_retain_them() {
+        let connection = annotation_fixture();
+        let metadata = load_library_rows(&connection, Some(&[])).unwrap();
+        assert!(!metadata.empty);
+        assert_eq!(metadata.entities.len(), 2);
+        assert!(metadata.entities.iter().all(|entity| entity.entity_type != "annotation"));
+        assert_eq!(load_library_rows(&connection, None).unwrap().entities.len(), 5);
+    }
+
+    #[test]
+    fn paper_scopes_include_tombstones_for_restore_without_other_papers() {
+        let connection = annotation_fixture();
+        let ids = vec!["p1".to_string()];
+        let rows = load_annotation_rows(&connection, Some(&ids)).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|data| data.contains("p1")));
+        assert!(rows.iter().any(|data| data.contains("deletedAt")));
+        assert_eq!(load_library_rows(&connection, Some(&ids)).unwrap().entities.len(), 4);
+        assert!(load_annotation_rows(&connection, Some(&["missing".to_string()])).unwrap().is_empty());
+        assert!(load_annotation_rows(&connection, Some(&[])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn emptiness_is_independent_of_annotation_scope() {
+        let connection = annotation_fixture();
+        connection.execute("DELETE FROM entities WHERE entity_type <> 'annotation'", []).unwrap();
+        let metadata = load_library_rows(&connection, Some(&[])).unwrap();
+        assert!(metadata.entities.is_empty());
+        assert!(!metadata.empty, "unloaded rows must not trigger legacy re-import");
+        connection.execute("DELETE FROM entities", []).unwrap();
+        assert!(load_library_rows(&connection, Some(&[])).unwrap().empty);
+    }
+
+    #[test]
+    fn deleting_a_paper_removes_unloaded_annotations_and_tombstones_only_for_that_paper() {
+        let connection = annotation_fixture();
+        delete_paper_annotations(&connection, "p1").unwrap();
+        let rows = load_annotation_rows(&connection, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains("a3"));
+    }
 
     #[test]
     fn library_connections_use_extended_busy_timeout_and_normal_synchronous() {

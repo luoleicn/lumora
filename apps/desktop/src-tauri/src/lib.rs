@@ -84,6 +84,7 @@ pub fn run() {
             file_storage::move_stored_pdf,
             file_storage::clone_stored_pdf,
             db::db_load_library,
+            db::db_load_annotations,
             db::db_upsert_entities,
             db::db_delete_entities,
             db::db_get_meta,

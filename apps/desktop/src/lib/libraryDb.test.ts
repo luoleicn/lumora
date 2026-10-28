@@ -9,7 +9,11 @@ import {
   diffLibraryStates,
   diffLibraryStateValues,
   enqueueLibraryPersist,
-  flushLibraryPersist
+  flushLibraryPersist,
+  loadAnnotationsFromDb,
+  loadLibraryFromDb,
+  mergeLibraryReload,
+  persistLibraryStateSnapshot
 } from "./libraryDb";
 
 const now = "2026-07-10T00:00:00.000Z";
@@ -118,6 +122,50 @@ describe("diffLibraryStateValues", () => {
     expect(diffLibraryStateValues(persisted, inMemory)).toEqual([
       { entityType: "paperCollection", entity: removedMembership },
       { entityType: "paperCollection", entity: newMembership }
+    ]);
+  });
+});
+
+describe("scoped database snapshots", () => {
+  beforeEach(() => invokeMock.mockReset());
+
+  it("passes annotation scopes and respects database emptiness independently of returned rows", async () => {
+    invokeMock.mockResolvedValue({ entities: [], meta: {}, empty: false });
+    const loaded = await loadLibraryFromDb({ annotationPaperIds: [] });
+    expect(invokeMock).toHaveBeenCalledWith("db_load_library", { annotationPaperIds: [] });
+    expect(loaded.empty).toBe(false);
+    expect(loaded.state.annotations).toEqual([]);
+  });
+
+  it("retains all annotation fields and tombstones in a paper load", async () => {
+    const annotation = { id: "a1", paperId: "paper-a", deletedAt: now, commentContent: { type: "doc" } };
+    invokeMock.mockResolvedValue([JSON.stringify(annotation)]);
+    expect(await loadAnnotationsFromDb("paper-a")).toEqual([annotation]);
+    expect(invokeMock).toHaveBeenCalledWith("db_load_annotations", { paperId: "paper-a" });
+  });
+
+  it("checks sync integrity without loading or writing annotations outside the UI cache", async () => {
+    const current = state();
+    invokeMock.mockResolvedValue({
+      entities: [
+        ...current.papers.map((entity) => ({ entityType: "paper", data: JSON.stringify(entity) })),
+        ...current.collections.map((entity) => ({ entityType: "collection", data: JSON.stringify(entity) }))
+      ],
+      meta: {}, empty: false
+    });
+    await persistLibraryStateSnapshot(current);
+    expect(invokeMock).toHaveBeenCalledWith("db_load_library", { annotationPaperIds: [] });
+    expect(invokeMock.mock.calls.map(([command]) => command)).toEqual(["db_load_library"]);
+  });
+});
+
+describe("mergeLibraryReload", () => {
+  it("preserves concurrent edits and removals while adopting unrelated database changes", () => {
+    const base = state();
+    const current = { ...base, papers: [{ ...base.papers[0], title: "Local" }] };
+    const remote = { ...base, papers: [...base.papers, paper("remote")] };
+    expect(mergeLibraryReload(base, remote, current).papers.map((item) => [item.id, item.title])).toEqual([
+      ["paper-a", "Local"], ["remote", "remote"]
     ]);
   });
 });

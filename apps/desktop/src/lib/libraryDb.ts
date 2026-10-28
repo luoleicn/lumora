@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { LibraryEntity, LibraryState, SyncEntity } from "@lumora/shared";
+import type { Annotation, LibraryEntity, LibraryState, SyncEntity } from "@lumora/shared";
 import { createDefaultState } from "./localStore";
 
 export type EntityChange = {
@@ -43,6 +43,23 @@ export function diffLibraryStates(previous: LibraryState, next: LibraryState): E
   }
 
   return changes;
+}
+
+/** Apply only edits made during a reload on top of the new database snapshot. */
+export function mergeLibraryReload(base: LibraryState, loaded: LibraryState, current: LibraryState): LibraryState {
+  const next = { ...loaded };
+  for (const { key } of entityCollections) {
+    const before = (base[key] as LibraryEntity[] | undefined) ?? [];
+    const after = (current[key] as LibraryEntity[] | undefined) ?? [];
+    if (before === after) continue;
+    const beforeById = new Map(before.map((entity) => [entity.id, entity]));
+    const afterIds = new Set(after.map((entity) => entity.id));
+    const merged = new Map(((loaded[key] as LibraryEntity[] | undefined) ?? []).map((entity) => [entity.id, entity]));
+    for (const entity of before) if (!afterIds.has(entity.id)) merged.delete(entity.id);
+    for (const entity of after) if (beforeById.get(entity.id) !== entity) merged.set(entity.id, entity);
+    (next[key] as LibraryEntity[]) = [...merged.values()];
+  }
+  return next;
 }
 
 function entityValuesEqual(left: unknown, right: unknown): boolean {
@@ -117,11 +134,22 @@ export async function persistSyncCursor(cursor: number): Promise<void> {
   await invoke("db_set_meta", { key: lastSyncCursorMetaKey, value: String(cursor) });
 }
 
-export async function loadLibraryFromDb(): Promise<{ state: LibraryState; empty: boolean }> {
+export type LibraryLoadOptions = {
+  /** Omit for a complete snapshot; [] loads metadata only. */
+  annotationPaperIds?: readonly string[];
+};
+
+export async function loadAnnotationsFromDb(paperId?: string): Promise<Annotation[]> {
+  const rows = await invoke<string[]>("db_load_annotations", { paperId });
+  return rows.map((data) => JSON.parse(data) as Annotation);
+}
+
+export async function loadLibraryFromDb(options: LibraryLoadOptions = {}): Promise<{ state: LibraryState; empty: boolean }> {
   const loaded = await invoke<{
     entities: Array<{ entityType: string; data: string }>;
     meta: Record<string, string>;
-  }>("db_load_library");
+    empty?: boolean;
+  }>("db_load_library", { annotationPaperIds: options.annotationPaperIds });
 
   const byType = new Map<string, LibraryEntity[]>(entityCollections.map(({ entityType }) => [entityType, []]));
   for (const row of loaded.entities) {
@@ -150,7 +178,7 @@ export async function loadLibraryFromDb(): Promise<{ state: LibraryState; empty:
     state.lastSyncCursor = cursor;
   }
 
-  return { state, empty: loaded.entities.length === 0 };
+  return { state, empty: loaded.empty ?? loaded.entities.length === 0 };
 }
 
 export async function importStateToDb(state: LibraryState): Promise<void> {
@@ -175,7 +203,11 @@ export async function importStateToDb(state: LibraryState): Promise<void> {
  */
 export async function persistLibraryStateSnapshot(state: LibraryState): Promise<void> {
   await flushLibraryPersist();
-  const persisted = await loadLibraryFromDb();
+  // Only compare annotations represented in this UI snapshot. Unloaded rows
+  // remain authoritative in SQLite and must not be copied into the WebView.
+  const persisted = await loadLibraryFromDb({
+    annotationPaperIds: [...new Set(state.annotations.map((annotation) => annotation.paperId))]
+  });
   if (persisted.empty) {
     await importStateToDb(state);
     return;

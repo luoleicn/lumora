@@ -80,6 +80,7 @@ import { fetchArxivMetadataById } from "./lib/syncClient";
 import { defaultProxySettings, loadProxySettings, saveProxySettings, type ProxySettings } from "./lib/proxySettings";
 import { AppUpdater, initialAppUpdateState, type AppUpdateState } from "./lib/appUpdater";
 import { useLibraryStore } from "./hooks/useLibraryStore";
+import { AnnotationLoading } from "./components/AnnotationLoading";
 import { useCloudSync } from "./hooks/useCloudSync";
 import { useMendeleySync } from "./hooks/useMendeleySync";
 import { useArxivDownloads } from "./hooks/useArxivDownloads";
@@ -224,7 +225,10 @@ export default function App() {
     onError: setStatus,
     reconcile: (state) => reconcileFileStorage(state, fileStorageSettings)
   });
-  const { library, setLibrary, libraryRef, loadedRef: libraryLoadedRef, loaded: libraryLoaded, adoptFromDb } = libraryStore;
+  const {
+    library, setLibrary, libraryRef, loadedRef: libraryLoadedRef, loaded: libraryLoaded, adoptFromDb,
+    ensureAnnotationsLoaded, areAnnotationsLoaded, annotationGeneration, annotationErrors
+  } = libraryStore;
   const { papers: paperIndex, files: fileIndex, annotations: annotationsByPaperId, memberships: membershipIndex } = getLibraryIndexes(library);
   const cloudSync = useCloudSync({
     store: libraryStore,
@@ -763,6 +767,14 @@ export default function App() {
   const selectedAnnotations = selectedPaper
     ? annotationsByPaperId.get(selectedPaper.id) ?? emptyAnnotations
     : emptyAnnotations;
+
+  useEffect(() => {
+    if (!libraryLoaded) return;
+    const activeTab = workspaceTabs.find((tab) => tab.id === activeWorkspaceTabId);
+    if (activeTab?.kind === "notebook") void ensureAnnotationsLoaded().catch(() => {});
+    else if (activeTab?.kind === "paper") void ensureAnnotationsLoaded(activeTab.paperId).catch(() => {});
+    if (selectedPaperId) void ensureAnnotationsLoaded(selectedPaperId).catch(() => {});
+  }, [libraryLoaded, selectedPaperId, activeWorkspaceTabId, workspaceTabs, annotationGeneration, ensureAnnotationsLoaded]);
   const selectedFileData = selectedFile ? fileDataById[selectedFile.id] : undefined;
   const selectedHasLocalPdf = selectedPaper
     ? selectedFiles.some((fileAsset) =>
@@ -1305,12 +1317,13 @@ export default function App() {
     );
   }
 
-  function handleDeletePaper(paperId: string) {
+  async function handleDeletePaper(paperId: string) {
     const paper = library.papers.find((item) => item.id === paperId && !item.deletedAt);
     if (!paper) {
       return;
     }
 
+    try { await ensureAnnotationsLoaded(paperId); } catch { return; }
     setLibrary((current) => deletePaperFromLibrary(current, paperId));
     removePaperIdsFromSelection(new Set([paperId]));
     const deletedFileIds = library.fileAssets.filter((file) => file.paperId === paperId).map((file) => file.id);
@@ -1324,12 +1337,13 @@ export default function App() {
     setStatus(`Deleted ${paper.title}.`);
   }
 
-  function handleRestorePaper(paperId: string) {
+  async function handleRestorePaper(paperId: string) {
     const paper = library.papers.find((item) => item.id === paperId && item.deletedAt);
     if (!paper) {
       return;
     }
 
+    try { await ensureAnnotationsLoaded(paperId); } catch { return; }
     setLibrary((current) => restorePaperFromTrash(current, paperId));
     setStatus(`Restored ${paper.title} to Unsorted.`);
   }
@@ -1762,6 +1776,8 @@ export default function App() {
     }));
   }
 
+  if (!libraryLoaded) return <div className="reader-empty" role="status"><p>Loading library…</p></div>;
+
   return (
     <main className="app-frame">
       <AppToolbar
@@ -1850,6 +1866,9 @@ export default function App() {
                       <WorkspaceTabContent
                         active={tabActive}
                         tab={tab}
+                        annotationsLoaded={areAnnotationsLoaded(tab.kind === "paper" ? tab.paperId : undefined)}
+                        annotationError={annotationErrors[tab.kind === "paper" ? tab.paperId : "*"] || annotationErrors["*"]}
+                        onRetryAnnotations={() => void ensureAnnotationsLoaded(tab.kind === "paper" ? tab.paperId : undefined).catch(() => {})}
                         library={library}
                         filteredPapers={displayedPapers}
                         searchMeta={searchMetaByPaperId}
@@ -1895,6 +1914,9 @@ export default function App() {
               onRequestFileData={requestSelectedFileData}
               hasLocalPdf={selectedHasLocalPdf}
               annotations={selectedAnnotations}
+              annotationsLoaded={selectedPaper ? areAnnotationsLoaded(selectedPaper.id) : true}
+              annotationError={selectedPaper ? annotationErrors[selectedPaper.id] || annotationErrors["*"] : undefined}
+              onRetryAnnotations={() => void ensureAnnotationsLoaded(selectedPaper?.id).catch(() => {})}
               fileStorageSettings={fileStorageSettings}
               onUpdatePaper={handleUpdatePaper}
               arxivDownloadBusy={arxivDownloads.downloadBusy}
@@ -2294,6 +2316,9 @@ type WorkspaceTabPointerDrag = {
 function WorkspaceTabContent({
   active,
   tab,
+  annotationsLoaded,
+  annotationError,
+  onRetryAnnotations,
   library,
   filteredPapers,
   searchMeta,
@@ -2325,6 +2350,9 @@ function WorkspaceTabContent({
 }: {
   active: boolean;
   tab: WorkspaceTab;
+  annotationsLoaded: boolean;
+  annotationError?: string;
+  onRetryAnnotations: () => void;
   library: LibraryState;
   filteredPapers: Paper[];
   searchMeta?: Map<string, PaperSearchMeta>;
@@ -2382,6 +2410,7 @@ function WorkspaceTabContent({
   }
 
   if (tab.kind === "notebook") {
+    if (!annotationsLoaded) return <AnnotationLoading error={annotationError} onRetry={onRetryAnnotations} />;
     return (
       <NotebookPanel
         papers={indexes.papers.active}
@@ -2392,6 +2421,7 @@ function WorkspaceTabContent({
   }
 
   const paper = indexes.papers.activeById.get(tab.paperId);
+  if (paper && !annotationsLoaded) return <AnnotationLoading error={annotationError} onRetry={onRetryAnnotations} />;
   const fileAsset = paper ? selectReaderFile(indexes.files.byPaperId.get(paper.id) ?? emptyFileAssets) : undefined;
   const fileData = fileAsset ? fileDataById[fileAsset.id] : undefined;
   const annotations = paper
