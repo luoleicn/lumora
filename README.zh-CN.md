@@ -17,7 +17,7 @@ lumora 取意 Lumos + Aurora，是一款**本地优先（local-first）**的桌�
 - **集合与整理**：多级集合、收藏、未分类、无 PDF、无 arXiv、回收站等智能视图，支持文件夹范围内检索。
 - **文献内检索（Find in Document）** 与 **库内检索**：`Cmd/Ctrl+F` 在 Documents 页聚焦库检索、在论文标签页聚焦文献内查找。
 - **私有云同步**：原生 Tauri 同步引擎，直连每个用户自己的**七牛 Kodo（Qiniu）私有存储桶**；增量同步、内容寻址存储；arXiv PDF 按锁定版本号重建，无需重复上传。
-- **arXiv 支持**：按标题检索 arXiv、下载 PDF 并归档。
+- **arXiv 支持**：通过 arXiv ID 或链接导入并自动下载 PDF，也可按标题检索 arXiv。
 - **Mendeley 导入**：OAuth 授权连接，增量同步文献元数据、文件夹与附件。
 - **macOS 原生集成**：原生菜单与快捷键、触控板双指缩放 PDF（`allowsMagnification`）等。
 

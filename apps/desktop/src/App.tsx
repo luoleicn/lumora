@@ -1097,6 +1097,7 @@ export default function App() {
       setArxivImportCollectionId(undefined);
       setSelectedPaperId(existing.id);
       setStatus(`arXiv:${arxivId} is already in your library.`);
+      void arxivDownloads.downloadImportedPaper(existing);
       return;
     }
 
@@ -1134,6 +1135,7 @@ export default function App() {
       setSelectedTag(undefined);
       setSelectedPaperId(paper.id);
       setStatus(`Added arXiv:${arxivId} — ${paper.title}.`);
+      void arxivDownloads.downloadImportedPaper(paper);
     } catch (error) {
       setArxivImportError(error instanceof Error ? error.message : String(error));
     } finally {

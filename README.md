@@ -17,7 +17,7 @@ Named after Lumos + Aurora, lumora is a **local-first** desktop literature manag
 - **Collections and organization**: Nested collections, favorites, and smart views for unfiled papers, missing PDFs, missing arXiv links, and trash, with search scoped to folders.
 - **Find in Document and library search**: `Cmd/Ctrl+F` focuses library search on the Documents page and document search in a paper tab.
 - **Private cloud sync**: A native Tauri sync engine connects directly to each user's own **private Qiniu Kodo bucket**, with incremental sync and content-addressed storage. arXiv PDFs are reconstructed from pinned versions without uploading duplicate files.
-- **arXiv support**: Search arXiv by title, download PDFs, and add them to your library.
+- **arXiv support**: Import by arXiv ID or URL with automatic PDF downloads, or search arXiv by title.
 - **Mendeley import**: Connect through OAuth to incrementally sync document metadata, folders, and attachments.
 - **Native macOS integration**: Native menus and keyboard shortcuts, plus two-finger trackpad zoom for PDFs (`allowsMagnification`).
 

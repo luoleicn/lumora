@@ -128,6 +128,32 @@ describe("downloadMissingArxivFiles", () => {
     expect(result.alreadyPresent).toBe(1);
   });
 
+  it("saves the downloaded PDF to the configured storage directory", async () => {
+    mocks.invoke.mockResolvedValue(new TextEncoder().encode("%PDF-1.7 test").buffer);
+    mocks.storePdfToDisk.mockResolvedValue("paper-2.pdf");
+
+    const result = await downloadMissingArxivFiles(state(), { directory: "/papers", nameTemplate: "{title}" });
+
+    expect(mocks.storePdfToDisk).toHaveBeenCalledWith("/papers", "paper.pdf", expect.any(Uint8Array));
+    expect(mocks.putFileBlob).not.toHaveBeenCalled();
+    expect(result.state.fileAssets[0]).toEqual(expect.objectContaining({
+      paperId: "paper-1", fileName: "paper-2.pdf", localPath: "paper-2.pdf", downloadState: "local",
+      contentRef: { kind: "arxiv", arxivId: "1706.03762v5" }
+    }));
+  });
+
+  it("retains paper metadata without attaching a file when PDF download fails", async () => {
+    const current = state();
+    mocks.invoke.mockRejectedValue(new Error("Network unavailable"));
+
+    const result = await downloadMissingArxivFiles(current, { nameTemplate: "{title}" });
+
+    expect(result.state).toBe(current);
+    expect(result.state.fileAssets).toEqual([]);
+    expect(result.failed).toEqual([{ arxivId: "1706.03762v5", error: "Network unavailable" }]);
+    expect(mocks.putFileBlob).not.toHaveBeenCalled();
+  });
+
   it("can restrict a Details-page download to the selected paper", async () => {
     const current = state();
     current.papers.push({
