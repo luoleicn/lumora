@@ -8,6 +8,7 @@ import { collapseCjkSpaces, splitSnippet, type PaperSearchMeta, type SearchMatch
 import { emptyFileAssets, getFileIndex } from "../lib/libraryIndexes";
 
 const matchedFieldLabels: Record<SearchMatchedField, string> = {
+  arxiv: "arXiv ID",
   title: "Title",
   body: "Full text",
   authors: "Author",

@@ -8,7 +8,7 @@ import { getFileIndex } from "./libraryIndexes";
 // single-character tokens by injecting spaces, so snippets come back with those
 // spaces and are collapsed again before display (collapseCjkSpaces).
 
-export type SearchMatchedField = "title" | "body" | "authors" | "notes";
+export type SearchMatchedField = "arxiv" | "title" | "body" | "authors" | "notes";
 
 export type SearchHit = {
   paperId: string;

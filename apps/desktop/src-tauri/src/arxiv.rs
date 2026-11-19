@@ -335,7 +335,7 @@ fn decode_xml_entities(value: &str) -> String {
 
 // Drops the version suffix so a request for 1706.03762 matches the 1706.03762v7
 // entry arXiv answers with.
-fn arxiv_id_base(value: &str) -> &str {
+pub(crate) fn arxiv_id_base(value: &str) -> &str {
     match value.rfind('v') {
         Some(index) if value[index + 1..].chars().all(|char| char.is_ascii_digit())
             && index + 1 < value.len() => &value[..index],
@@ -347,28 +347,28 @@ fn arxiv_id_base(value: &str) -> &str {
 // arXiv identifier, so a typo fails before any network round trip.
 fn validate_arxiv_id(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
-    let modern = regex::Regex::new(r"^\d{4}\.\d{4,5}(v\d+)?$").map_err(|error| error.to_string())?;
-    let legacy = regex::Regex::new(r"^[A-Za-z-]+(?:\.[A-Za-z-]+)?/\d{7}(v\d+)?$")
-        .map_err(|error| error.to_string())?;
-    if !modern.is_match(trimmed) && !legacy.is_match(trimmed) {
+    if parse_arxiv_reference(trimmed) != Some(trimmed) {
         return Err(format!("Invalid arXiv identifier: {trimmed}"));
     }
 
     Ok(trimmed.to_string())
 }
 
+pub(crate) fn parse_arxiv_reference(value: &str) -> Option<&str> {
+    static REFERENCE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"^(?i:arxiv:\s*|(?:https?://)?(?:www\.)?arxiv\.org/(?:abs|pdf)/)?",
+            r"((?:[0-9]{4}\.[0-9]{4,5}|[A-Za-z-]+(?:\.[A-Za-z-]+)?/[0-9]{7})(?:v[0-9]+)?)",
+            r"(?i:\.pdf)?(?:[?#]\S*)?$"
+        )).unwrap()
+    });
+    Some(REFERENCE.captures(value.trim())?.get(1)?.as_str())
+}
+
 // Keeps the version suffix (2301.12345v2): the versioned id links to the exact
 // revision the metadata describes, and the PDF-extraction path keeps it too.
 fn normalize_arxiv_id(value: &str) -> String {
-    value
-        .split("arxiv.org/abs/")
-        .nth(1)
-        .unwrap_or(value)
-        .split(['?', '#', ' '])
-        .next()
-        .unwrap_or(value)
-        .trim_start_matches("arXiv:")
-        .to_string()
+    parse_arxiv_reference(value).unwrap_or_default().to_string()
 }
 
 fn score_title_match(query_title: &str, candidate_title: &str) -> f64 {

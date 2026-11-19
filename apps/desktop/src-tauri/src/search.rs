@@ -6,7 +6,7 @@ use tauri::AppHandle;
 
 // --- Library full-text search ------------------------------------------------
 // Two content-storing FTS5 tables hold one row per paper: `search_index` for
-// the metadata columns (title, authors, notes, deleted flag) that change on
+// the metadata columns (title, authors, notes, arXiv ID, deleted flag) that change on
 // every entity write, and `search_body` for the large extracted PDF body. The
 // split matters because an FTS5 UPDATE reindexes the whole row — with the body
 // inline, every title keystroke re-tokenized up to 1 MB of text. Body rows are
@@ -18,7 +18,7 @@ use tauri::AppHandle;
 // keep their rows (flagged `deleted` in search_index; search_body untouched)
 // so a trashed paper's expensive body survives a restore.
 
-const SEARCH_INDEX_VERSION: &str = "2";
+const SEARCH_INDEX_VERSION: &str = "3";
 const SEARCH_INDEX_VERSION_META_KEY: &str = "searchIndexVersion";
 const SEARCH_RESULT_LIMIT: u32 = 200;
 const SEARCH_BODY_MAX_CHARS: usize = 1_000_000;
@@ -49,8 +49,7 @@ pub(crate) fn ensure_search_index(connection: &rusqlite::Connection) -> Result<(
     let transaction = connection.unchecked_transaction().map_err(|error| error.to_string())?;
     transaction
         .execute_batch(
-            "DROP TABLE IF EXISTS search_body;
-             CREATE VIRTUAL TABLE search_body USING fts5(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS search_body USING fts5(
                paper_id UNINDEXED,
                body,
                body_sha UNINDEXED,
@@ -78,6 +77,7 @@ pub(crate) fn ensure_search_index(connection: &rusqlite::Connection) -> Result<(
                title,
                authors,
                notes,
+               arxiv,
                deleted UNINDEXED,
                tokenize = \"unicode61 remove_diacritics 2\"
              );",
@@ -114,13 +114,7 @@ fn rebuild_search_index_rows(connection: &rusqlite::Connection) -> Result<(), St
             .get(&id)
             .map(|parts| cjk_segment(&parts.join("\n")))
             .unwrap_or_default();
-        connection
-            .execute(
-                "INSERT INTO search_index (paper_id, title, authors, notes, deleted)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![id, fields.title, fields.authors, notes, i64::from(deleted_at.is_some())],
-            )
-            .map_err(|error| error.to_string())?;
+        insert_search_index_row(connection, &id, &fields, &notes, deleted_at.is_some())?;
     }
     Ok(())
 }
@@ -163,6 +157,7 @@ fn push_annotation_note_parts(value: &serde_json::Value, parts: &mut Vec<String>
 struct PaperIndexFields {
     title: String,
     authors: String,
+    arxiv: String,
 }
 
 fn parse_paper_index_fields(data: &str) -> Option<PaperIndexFields> {
@@ -182,7 +177,20 @@ fn parse_paper_index_fields(data: &str) -> Option<PaperIndexFields> {
     Some(PaperIndexFields {
         title: cjk_segment(title),
         authors: cjk_segment(&authors),
+        arxiv: value.get("arxiv").and_then(|item| item.as_str())
+            .and_then(crate::arxiv::parse_arxiv_reference).unwrap_or_default().to_string(),
     })
+}
+
+fn insert_search_index_row(
+    connection: &rusqlite::Connection, id: &str, fields: &PaperIndexFields, notes: &str, deleted: bool,
+) -> Result<(), String> {
+    connection.execute(
+        "INSERT INTO search_index (paper_id, title, authors, notes, arxiv, deleted)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![id, fields.title, fields.authors, notes, fields.arxiv, deleted],
+    ).map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn aggregate_notes(connection: &rusqlite::Connection, paper_id: &str) -> Result<String, String> {
@@ -257,15 +265,26 @@ fn build_fts_column_query(user_query: &str, column: &str) -> Option<String> {
 }
 
 fn decode_matched_mask(mask: i64) -> Vec<String> {
-    [(1, "title"), (2, "body"), (3, "authors"), (4, "notes")]
+    [(0, "arxiv"), (1, "title"), (2, "body"), (3, "authors"), (4, "notes")]
         .into_iter()
         .filter(|(tier, _)| mask & (1_i64 << tier) != 0)
         .map(|(_, name)| name.to_string())
         .collect()
 }
 
+fn build_arxiv_query(query: &str) -> Option<String> {
+    match crate::arxiv::parse_arxiv_reference(query) {
+        Some(id) if crate::arxiv::arxiv_id_base(id) == id => {
+            Some(format!(r#"{{arxiv}} : ( ^"{id}" OR ^"{id}v"* )"#))
+        }
+        Some(id) => Some(format!(r#"{{arxiv}} : ^"{id}""#)),
+        None => build_fts_column_query(query, "arxiv"),
+    }
+}
+
 fn search_library_rows(connection: &rusqlite::Connection, query: &str, limit: u32) -> Result<Vec<SearchHit>, String> {
-    let (Some(q_title), Some(q_body), Some(q_authors), Some(q_notes)) = (
+    let (Some(q_arxiv), Some(q_title), Some(q_body), Some(q_authors), Some(q_notes)) = (
+        build_arxiv_query(query),
         build_fts_column_query(query, "title"),
         build_fts_column_query(query, "body"),
         build_fts_column_query(query, "authors"),
@@ -275,7 +294,7 @@ fn search_library_rows(connection: &rusqlite::Connection, query: &str, limit: u3
     };
 
     // Strict tiering: a paper's tier is its highest-priority matching column
-    // (title > body > authors > notes); bm25 only orders within a tier. The
+    // (arXiv ID > title > body > authors > notes); bm25 only orders within a tier. The
     // bare `score`/`fts_rowid` columns follow the MIN(tier) row per SQLite's
     // documented bare-column-with-MIN semantics. Defer expensive snippets until
     // after LIMIT: common terms otherwise generate snippets for the entire
@@ -283,6 +302,9 @@ fn search_library_rows(connection: &rusqlite::Connection, query: &str, limit: u3
     // Body hits live in search_body, which has no deleted flag of its own; the
     // IN-subquery (materialized once per query) scopes them to live papers.
     let sql = "WITH hits(paper_id, tier, score, fts_rowid) AS (
+         SELECT paper_id, 0, bm25(search_index), rowid
+           FROM search_index WHERE search_index MATCH :q_arxiv AND deleted = 0
+         UNION ALL
          SELECT paper_id, 1, bm25(search_index), rowid
            FROM search_index WHERE search_index MATCH :q_title AND deleted = 0
          UNION ALL
@@ -309,6 +331,7 @@ fn search_library_rows(connection: &rusqlite::Connection, query: &str, limit: u3
     let ranked = statement
         .query_map(
             rusqlite::named_params! {
+                ":q_arxiv": q_arxiv,
                 ":q_title": q_title,
                 ":q_body": q_body,
                 ":q_authors": q_authors,
@@ -333,6 +356,8 @@ fn search_library_rows(connection: &rusqlite::Connection, query: &str, limit: u3
     let mut hits = Vec::with_capacity(ranked.len());
     for (paper_id, tier, score, rowid, matched_mask) in ranked {
         let (snippet_sql, column_query) = match tier {
+            0 => ("SELECT snippet(search_index, 4, char(1), char(2), '…', 14)
+                   FROM search_index WHERE rowid = ?1 AND search_index MATCH ?2", &q_arxiv),
             1 => ("SELECT snippet(search_index, 1, char(1), char(2), '…', 14)
                    FROM search_index WHERE rowid = ?1 AND search_index MATCH ?2", &q_title),
             2 => ("SELECT snippet(search_body, 1, char(1), char(2), '…', 14)
@@ -371,22 +396,16 @@ pub(crate) fn sync_search_index_for_change(
             let Some(fields) = parse_paper_index_fields(data) else {
                 return Ok(());
             };
-            let deleted = i64::from(deleted_at.is_some());
+            let deleted = deleted_at.is_some();
             let updated = connection
                 .execute(
-                    "UPDATE search_index SET title = ?2, authors = ?3, deleted = ?4 WHERE paper_id = ?1",
-                    rusqlite::params![id, fields.title, fields.authors, deleted],
+                    "UPDATE search_index SET title = ?2, authors = ?3, arxiv = ?4, deleted = ?5 WHERE paper_id = ?1",
+                    rusqlite::params![id, fields.title, fields.authors, fields.arxiv, deleted],
                 )
                 .map_err(|error| error.to_string())?;
             if updated == 0 {
                 let notes = aggregate_notes(connection, id)?;
-                connection
-                    .execute(
-                        "INSERT INTO search_index (paper_id, title, authors, notes, deleted)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        rusqlite::params![id, fields.title, fields.authors, notes, deleted],
-                    )
-                    .map_err(|error| error.to_string())?;
+                insert_search_index_row(connection, id, &fields, &notes, deleted)?;
             }
             Ok(())
         }
@@ -432,14 +451,7 @@ pub(crate) fn refresh_paper_notes(connection: &rusqlite::Connection, paper_id: &
     let Some(fields) = parse_paper_index_fields(&data) else {
         return Ok(());
     };
-    connection
-        .execute(
-            "INSERT INTO search_index (paper_id, title, authors, notes, deleted)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![paper_id, fields.title, fields.authors, notes, i64::from(deleted_at.is_some())],
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(())
+    insert_search_index_row(connection, paper_id, &fields, &notes, deleted_at.is_some())
 }
 
 fn index_paper_body(connection: &rusqlite::Connection, paper_id: &str, sha256: &str, text: &str) -> Result<(), String> {
@@ -490,14 +502,7 @@ fn ensure_search_index_row(connection: &rusqlite::Connection, paper_id: &str) ->
         return Ok(());
     };
     let notes = aggregate_notes(connection, paper_id)?;
-    connection
-        .execute(
-            "INSERT INTO search_index (paper_id, title, authors, notes, deleted)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![paper_id, fields.title, fields.authors, notes, i64::from(deleted_at.is_some())],
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(())
+    insert_search_index_row(connection, paper_id, &fields, &notes, deleted_at.is_some())
 }
 
 #[tauri::command]
@@ -601,6 +606,9 @@ mod tests {
             .iter().map(|column| build_fts_column_query(query, column)).collect();
         let Some(queries) = queries else { return Vec::new(); };
         let sql = "WITH hits(paper_id, tier, score, snip) AS (
+             SELECT paper_id, 0, bm25(search_index), snippet(search_index, 4, char(1), char(2), '…', 14)
+               FROM search_index WHERE search_index MATCH :q_arxiv AND deleted = 0
+             UNION ALL
              SELECT paper_id, 1, bm25(search_index), snippet(search_index, 1, char(1), char(2), '…', 14)
                FROM search_index WHERE search_index MATCH :q_title AND deleted = 0
              UNION ALL
@@ -618,6 +626,7 @@ mod tests {
            FROM hits GROUP BY paper_id ORDER BY tier ASC, score ASC LIMIT :limit";
         let mut statement = connection.prepare(sql).unwrap();
         let hits = statement.query_map(rusqlite::named_params! {
+            ":q_arxiv": super::build_arxiv_query(query).unwrap(),
             ":q_title": queries[0], ":q_body": queries[1],
             ":q_authors": queries[2], ":q_notes": queries[3], ":limit": limit,
         }, |row| Ok(super::SearchHit {
@@ -758,6 +767,58 @@ mod tests {
             rows
         };
         assert_eq!(shas, [("p1".into(), "sha-1".into()), ("p2".into(), "sha-2".into())]);
+    }
+
+    #[test]
+    fn indexes_arxiv_ids_and_ranks_them_above_citations() {
+        let connection = test_connection();
+        let paper = r#"{"arxiv":"arXiv:2301.1234v1"}"#;
+        upsert_entity(&connection, "paper", "paper", paper, None);
+        upsert_entity(&connection, "paper", "citation", &paper_json("citation", "Survey", &[]), None);
+        index_paper_body(&connection, "citation", "sha", "see 2301.1234v1").unwrap();
+        upsert_entity(&connection, "paper", "longer", r#"{"arxiv":"2301.12345v1"}"#, None);
+        upsert_entity(&connection, "paper", "revision", r#"{"arxiv":"2301.1234v10"}"#, None);
+
+        let hits = search_library_rows(&connection, "2301.1234v1", SEARCH_RESULT_LIMIT).unwrap();
+        assert_eq!(hits.iter().map(|hit| hit.paper_id.as_str()).collect::<Vec<_>>(), ["paper", "citation"]);
+        assert_eq!(hits[0].matched_fields, ["arxiv"]);
+        assert_eq!(hits[0].snippet, "\u{1}2301.1234v1\u{2}");
+        for query in ["arXiv:2301.1234", "https://arxiv.org/pdf/2301.1234.pdf?download=1"] {
+            let mut ids = search_ids(&connection, query);
+            ids.sort();
+            assert_eq!(ids, ["paper", "revision"]);
+        }
+        let legacy = r#"{"arxiv":"https://arxiv.org/abs/hep-th/9901001v2"}"#;
+        upsert_entity(&connection, "paper", "paper", legacy, None);
+        assert!(search_ids(&connection, "arxiv:2301.1234v1").is_empty());
+        assert_eq!(search_ids(&connection, "hep-th/9901001"), ["paper"]);
+        upsert_entity(&connection, "paper", "paper", legacy, Some("2026-01-02"));
+        assert!(search_ids(&connection, "hep-th/9901001").is_empty());
+        upsert_entity(&connection, "paper", "paper", legacy, None);
+        assert_eq!(search_ids(&connection, "hep-th/9901001v2"), ["paper"]);
+        upsert_entity(&connection, "paper", "paper", "{}", None);
+        assert!(search_ids(&connection, "hep-th/9901001").is_empty());
+    }
+
+    #[test]
+    fn upgrades_v2_metadata_without_discarding_extracted_bodies() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        init_library_schema(&connection).unwrap();
+        connection.execute_batch(
+            "CREATE VIRTUAL TABLE search_body USING fts5(paper_id UNINDEXED, body, body_sha UNINDEXED);
+             INSERT INTO search_body VALUES ('old', 'cached content', 'old-sha');
+             CREATE VIRTUAL TABLE search_index USING fts5(paper_id UNINDEXED, title, authors, notes, deleted UNINDEXED);"
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO entities (entity_type, id, data, updated_at, local_seq) VALUES ('paper','old',?1,'2026-01-01',0)",
+            [r#"{"arxiv":"1706.03762"}"#],
+        ).unwrap();
+        set_meta_value(&connection, SEARCH_INDEX_VERSION_META_KEY, "2").unwrap();
+        ensure_search_index(&connection).unwrap();
+        assert_eq!(search_ids(&connection, "1706.03762"), ["old"]);
+        assert_eq!(search_ids(&connection, "cached"), ["old"]);
+        let sha: String = connection.query_row("SELECT body_sha FROM search_body", [], |row| row.get(0)).unwrap();
+        assert_eq!(sha, "old-sha");
     }
 
     #[test]
